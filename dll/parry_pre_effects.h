@@ -28,6 +28,7 @@ struct WrapperToken {
     WrapperToken* previous=nullptr;
     uint32_t attack=0,current=0,old=0,caller=0,thread=0;
     uint32_t producer_frame=0,producer_owner=0; // Native entry values, not validated actor identity.
+    uint32_t producer_esi=0;                    // ESI at entry: em10CsawHitCk's Ganado (unvalidated value).
     unsigned depth=0;
     bool tainted=false;
 };
@@ -41,6 +42,7 @@ struct ClassifierToken {
 struct Candidate {
     uint32_t body_part=0,attack=0,current=0,old=0,outer_caller=0;
     uint32_t producer_frame=0,producer_owner=0; // Valid only within the current wrapper invocation.
+    uint32_t producer_esi=0;
 };
 inline __declspec(thread) WrapperToken* wrapper_token=nullptr;
 inline __declspec(thread) ClassifierToken* classifier_token=nullptr;
@@ -74,7 +76,7 @@ inline Invocation CurrentInvocation(const Candidate& c,bool sample=false) {
        uint64_t(ta)+sizeof(*t)>wa||(sample?(c.body_part||!t->sample_scope||!t->sampled):(!c.body_part||!t->attempted))||!t->structural||t->tainted||t->previous||t->wrapper!=w||
        w->previous||w->depth!=1||w->tainted||w->thread!=thread||t->thread!=thread||t->caller!=classifier_return||
        c.attack!=w->attack||c.current!=w->current||c.old!=w->old||c.outer_caller!=w->caller||
-       c.producer_frame!=w->producer_frame||c.producer_owner!=w->producer_owner)return {};
+       c.producer_frame!=w->producer_frame||c.producer_owner!=w->producer_owner||c.producer_esi!=w->producer_esi)return {};
     return {w,t,low,high};
 }
 #ifdef LINK_PARRY_FIXTURE
@@ -94,14 +96,14 @@ inline void RestoreFP(void* state) {__asm {mov eax,state
     fxrstor [eax]}}
 using Wrapper=int(__cdecl*)(void*,void*,void*,int);
 using Classifier=int(__cdecl*)(void*,void*,void*);
-__declspec(noinline) inline int CallWrapper(Wrapper original,void* attack,void* current,void* old,int filter,uint32_t caller,uint32_t producer_frame=0,uint32_t producer_owner=0) {
+__declspec(noinline) inline int CallWrapper(Wrapper original,void* attack,void* current,void* old,int filter,uint32_t caller,uint32_t producer_frame=0,uint32_t producer_owner=0,uint32_t producer_esi=0) {
     if(!Enabled())return original(attack,current,old,filter);
     __declspec(align(16)) unsigned char fp[512];SaveFP(fp);const DWORD error=GetLastError();
     WrapperToken token;token.previous=wrapper_token;token.depth=token.previous?token.previous->depth+1:1;
     if(token.previous)token.previous->tainted=true;
     token.attack=reinterpret_cast<uint32_t>(attack);token.current=reinterpret_cast<uint32_t>(current);token.old=reinterpret_cast<uint32_t>(old);
     token.caller=caller;token.thread=GetCurrentThreadId();
-    token.producer_frame=producer_frame;token.producer_owner=producer_owner;wrapper_token=&token;
+    token.producer_frame=producer_frame;token.producer_owner=producer_owner;token.producer_esi=producer_esi;wrapper_token=&token;
     RestoreFP(fp);SetLastError(error);int result=0;
     __try {result=original(attack,current,old,filter);}
     __finally {wrapper_token=token.previous;}
@@ -130,7 +132,7 @@ __declspec(noinline) inline void __cdecl Record(MachineFrame* frame) {
             if(Range(frame->ebp,20)&&frame->ebx==w->attack&&frame->esi==w->current&&frame->edi==w->old) {
                 const auto* args=reinterpret_cast<const uint32_t*>(frame->ebp);
                 if(args[2]==w->attack&&args[3]==w->current&&args[4]==w->old) {
-                    const Candidate candidate{frame->eax,w->attack,w->current,w->old,w->caller,w->producer_frame,w->producer_owner};
+                    const Candidate candidate{frame->eax,w->attack,w->current,w->old,w->caller,w->producer_frame,w->producer_owner,w->producer_esi};
                     if(!frame->eax){
                         t->sampled=true;t->sample_scope=true;
                         __try {sample_observer(candidate);}

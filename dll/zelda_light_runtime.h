@@ -15,7 +15,6 @@ static zl::Cast g_cast;                    // the cast: hand glow, the deferred 
 static ::sword_trail::Vec3 g_cast_hand{};    // where the hand was at the last frame of the cast
 static link_runtime::ztarget::voice::Voice g_voice;   // Bin32/link_zelda_light.wav, SHA-pinned
 static std::atomic<bool> g_sound{false};  // game thread raises, the poll thread plays
-static unsigned g_rays=0,g_hits=0,g_kills=0;
 inline constexpr const char* kSoundSha="32468ee94e73a4118838e77c3b7f9aa49f7cd96a6a62ff3c5292a061d324ae6b";
 
 static ::sword_trail::Style Style(){::sword_trail::Style s{};s.length_ms=zl::kFadeMs;s.inner=0.5;s.rgb=zl::kGold;s.alpha=255;return s;}
@@ -96,7 +95,6 @@ static bool Fire(double now_ms,uint32_t player,const float* feet,float yaw,uint3
     const auto seg=BulletWall(hand,end,stop);
     const bool clear=seg==BulletSeg::Clear;
     if(!clear)end=stop;
-    ++g_rays;
     if(seg==BulletSeg::Fault){CmbLog("zelda_ray fault (line of sight)");return false;}   // never a hit or a beam through an unseen wall
     impact=end;
     g_beam.Fire(now_ms,hand,end,room,player);
@@ -113,7 +111,6 @@ static bool Fire(double now_ms,uint32_t player,const float* feet,float yaw,uint3
         g_cmb_mortal_same=true;g_cmb_mortal_identity=t.identity;g_cmb_caller=CmbCaller::Sword;
         const auto st=g_cmb_adapter.NativeHit(hit,int(g_cfg.ganado),mdmg::Kind::Fixed,g_cmb_adapter.Issue());
         g_cmb_caller=CmbCaller::None;
-        if(st==mdmg::Status::Published){++g_hits;if(hp<=int(g_cfg.ganado))++g_kills;}
         CmbLog("zelda_ray target=ganado ptr=0x%08X hp=%d amount=%u status=%s",t.pointer,hp,g_cfg.ganado,mdr::StatusName(st));
         return true;
     }
@@ -121,14 +118,12 @@ static bool Fire(double now_ms,uint32_t player,const float* feet,float yaw,uint3
     // The record first (it refuses a protected, dying or busy knight), then the drain: em3cDmCk reads both later this frame.
     const int16_t left=int16_t(zl::Drain(k.hp,int(g_cfg.knight),zl::kKnightNativeHit));
     const bool struck=zl::StrikeKnight(m,k.pointer,from,k.pointer+zl::layout::hit_info)&&(left==k.hp||m.Write(k.pointer+zl::layout::hp,&left,2));
-    if(struck){++g_hits;if(left<=zl::kKnightNativeHit)++g_kills;}
     uint8_t routine=0;m.Read(k.pointer+zl::layout::routine,&routine,1);
     CmbLog("zelda_ray target=knight ptr=0x%08X hp=%d->%d struck=%u r0=%u",k.pointer,k.hp,struck?left:k.hp,struck?1U:0U,routine);
     return true;
 }
 // The golden sparks along the ray and the flash where it lands (TP's KAITENGIRIL_D sparkles tinted gold, SORD_FLUSH), on
 // the shared TP particle system; Link's ParticlesFrame never draws it while the player is Ashley (not his gameplay).
-static unsigned g_sparks=0;
 static void Sparks(double now_ms,uint32_t room,uint32_t player,const ::sword_trail::Vec3& from,const ::sword_trail::Vec3& to){
     if(!g_part_on.load(std::memory_order_acquire)||!g_part_cfg.on)return;
     g_part.Advance(now_ms,room,player);
@@ -136,7 +131,7 @@ static void Sparks(double now_ms,uint32_t room,uint32_t player,const ::sword_tra
     for(unsigned i=0;i<n;++i){
         spt::Placement p;p.origin={at[i].x,at[i].y,at[i].z};p.paint={spt::Tint::Toward,zl::kGold,0};
         p.size=i+1==n?1.8:1.1;   // live 23-oct: at 0.7 they read as small white dots
-        if(g_part.Emit(spt::Effect::SpinSparkle,p))++g_sparks;
+        g_part.Emit(spt::Effect::SpinSparkle,p);
     }
     spt::Placement flash;flash.origin={to.x,to.y,to.z};flash.paint={spt::Tint::Toward,zl::kGold,0};
     g_part.Emit(spt::kFlash,flash);
@@ -218,6 +213,7 @@ static void Prepare(const wchar_t* directory,bool dispatch_up){
         Log("ZeldaLight disabled: dispatch=%u adapter=%u line_of_sight=%u",dispatch_up?1U:0U,g_cmb_adapter_on?1U:0U,g_bullet_los_ok?1U:0U);return;}
     // The cast pose (zelda_cast_pose_runtime.h): its hooks or no ray at all (an armless cast would fire from nowhere).
     if(!link_runtime::zelda_cast::Install(g_cmb_base,&Log)){Log("ZeldaLight disabled: cast pose hooks failed");return;}
+    link_runtime::zelda_cast::detail::log=&CmbLog;   // its begin/end/applied lines come from the game thread: the combat ring
     wchar_t wav[MAX_PATH]{};
     const bool sound=link_runtime::paths::Format(wav,L"%slink_zelda_light.wav",directory)>0&&g_voice.Load(wav,100,kSoundSha);
     g_on=true;

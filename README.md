@@ -36,8 +36,8 @@ the game. Timestamps and build paths are embedded, so a rebuild is not byte-iden
 
 ## Version
 
-This source corresponds to Hyrule Evil 4 **3.2.0** (shipped `dinput8.dll` SHA-256
-`4eae540a598aac4d6a2d30c6411b19199d4b90b97fd757878fd4734a98eea7a6`); later commits only changed source comments.
+This source corresponds to Hyrule Evil 4 **3.2.1** (shipped `dinput8.dll` SHA-256
+`53462d3e2396e59bd204e39b50774d7f11f270a95a5ca910a3e519e18de96443`).
 
 ## Disclaimer
 

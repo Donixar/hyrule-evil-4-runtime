@@ -118,7 +118,7 @@ inline bool ApplyRearPreClamp(PreClampFrame& frame,Scope& scope,const rear_shiel
     // clamp. No ATK power, HP, reaction, caller arguments or other actor changes.
     frame.edi=static_cast<uint32_t>(value);QueueRearSound(scope);return true;
 }
-struct WrapperEntry {uint32_t stack=0,ebp=0,edi=0;};
+struct WrapperEntry {uint32_t stack=0,ebp=0,edi=0,esi=0;};
 inline __declspec(thread) WrapperEntry wrapper_entry;
 // One-shot handoff to the immediately tail-entered cdecl wrapper. It contains
 // no live object references beyond copied pointer VALUES. Stack identity prevents
@@ -127,7 +127,7 @@ __declspec(noinline) inline void __cdecl RecordWrapperEntry(const PreClampFrame*
     const DWORD error=GetLastError();wrapper_entry={};
     __try {
         if(frame&&(parry::Enabled()||(Enabled()&&owner_code.verified&&CaptureBudget())))
-            wrapper_entry={reinterpret_cast<uint32_t>(frame)+sizeof(PreClampFrame),frame->ebp,frame->edi};
+            wrapper_entry={reinterpret_cast<uint32_t>(frame)+sizeof(PreClampFrame),frame->ebp,frame->edi,frame->esi};
     } __except(EXCEPTION_EXECUTE_HANDLER) {wrapper_entry={};InterlockedIncrement(&failed);}
     SetLastError(error);
 }
@@ -220,7 +220,7 @@ __declspec(noinline) inline int __cdecl WrapperDetour(void* attack,void* positio
     if(rear_seen_generation!=generation){rear_history.Reset();rear_seen_generation=generation;}
     if(!Enabled()||!CaptureBudget())
         return parry::CallWrapper(original_wrapper,attack,position,previous,companion_filter,reinterpret_cast<uint32_t>(_ReturnAddress()),
-            entry_matches?entry.ebp:0,entry_matches?entry.edi:0);
+            entry_matches?entry.ebp:0,entry_matches?entry.edi:0,entry_matches?entry.esi:0);
     const uint32_t caller=reinterpret_cast<uint32_t>(_ReturnAddress());
     const DWORD initial_error=GetLastError();
     __declspec(align(16)) unsigned char fp[512];SaveFP(fp);
@@ -256,7 +256,7 @@ __declspec(noinline) inline int __cdecl WrapperDetour(void* attack,void* positio
     // Scope is trivially destructible; no C++ allocation or destructor enters this boundary.
     __try {
         result=parry::CallWrapper(original_wrapper,attack,position,previous,companion_filter,caller,
-            entry_matches?entry.ebp:0,entry_matches?entry.edi:0);
+            entry_matches?entry.ebp:0,entry_matches?entry.edi:0,entry_matches?entry.esi:0);
     } __finally {
         if(AbnormalTermination())rear_history.Reset();
         current_scope=scope.previous;

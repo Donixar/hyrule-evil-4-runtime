@@ -6,7 +6,7 @@
 // RS) and TAP the usual knife button (KEY_KAMAE_KNIFE 0x800): pressed and let go within kTapFrames game frames
 // (250 ms) with no attack (KEY_FIRE) in between. The bash fires on the release. Holding the knife longer is not a
 // bash (the spin charge, the knife slash and the Ending Blow keep their inputs), and without the Z key held the
-// knife button is native. The tap is still a knife press for the parry (its 450 ms window opens as before).
+// knife button is native. The tap is still a knife press for the parry (its ParryWindowMs window, 750 ms by default, opens as before).
 // One bash per kCooldownFrames (0.75 s).
 //
 // Effect, as TP's procGuardAttack (d_a_alink_guard.inc): the shield hits what is in front.

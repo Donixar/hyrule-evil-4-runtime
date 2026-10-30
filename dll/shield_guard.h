@@ -128,7 +128,7 @@ struct Outcome {
 };
 // Sources: bool Invocation(c); uint32_t ImageBase(); bool Live(size_t); bool Descriptor(uint32_t, Descriptor&);
 // bool Front(c, Front&, float forward[3]); uint32_t Owner(c); bool OwnerPosition(uint32_t owner, float out[3]);
-// uint64_t Now() (ms, follow-up timing).
+// bool Routine(uint32_t owner, uint8_t (&)[2]) (cEm r0/r1, general::Follow chain/flail bounds); uint64_t Now() (ms, follow-up timing).
 // up: the guard pose is up (GuardLayer::Up); game_now: Clock::Now. A cancel with !follow consumed one block.
 template <class S> Outcome Decide(S& s, const parry::Candidate& c, const parry::general::Settings& set,
                                   parry::general::Follow& follow, Durability& durability, bool enabled, bool up, double game_now) {
@@ -151,11 +151,13 @@ template <class S> Outcome Decide(S& s, const parry::Candidate& c, const parry::
     o.reason = Reason::Front;
     if (!s.Front(c, o.front, forward)) return o;
     o.owner = s.Owner(c);
+    g::Swing swing{};   // the attacker's routine: chain/flail returns keep the longer follow-up (as tier 2)
+    if (o.owner) swing.known = s.Routine(o.owner, swing.routine);
     const uint64_t now = s.Now();
     follow.Expire(now);
     // A later sample of a swing this guard already stopped: cancelled silently, free, even if the guard dropped or
     // the shield broke on that swing (it must not hit Link a frame later).
-    if (follow.Matches(o.function, o.owner, o.front.sample, now)) {
+    if (follow.Matches(o.function, o.owner, o.front.sample, now, false, &swing)) {
         follow.Touch(o.front.sample, now);
         o.follow = o.cancel = true; o.reason = Reason::Blocked; o.left = durability.Left();
         return o;
@@ -171,7 +173,7 @@ template <class S> Outcome Decide(S& s, const parry::Candidate& c, const parry::
     if (!InCone(o.front.player, forward, source, o.cos)) return o;
     const Hit hit = durability.Block(game_now);
     if (hit == Hit::Ignored) { o.reason = Reason::Broken; return o; }
-    follow.Arm(o.function, o.owner, o.front.sample, now);
+    follow.Arm(o.function, o.owner, o.front.sample, now, swing);
     o.broke = hit == Hit::Broke; o.left = durability.Left();
     o.cancel = true; o.reason = Reason::Blocked;
     return o;

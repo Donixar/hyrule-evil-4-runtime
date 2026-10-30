@@ -19,7 +19,7 @@ enum Flag:uint32_t {EpochCurrent=1U<<0,InputFresh=1U<<1,InputAligned=1U<<2,Windo
 struct Record {
     Kind kind=Kind::Tick;uint32_t reasons=0,flags=0,thread=0;
     uint32_t frame=0,input_frame=0,owner_frame=0,profile=0,epoch_depth=0,completed_frame=0;
-    uint32_t epoch_ready=0,epoch_poisoned=0,epoch_sampling=0;
+    uint32_t epoch_ready=0,epoch_poisoned=0,epoch_sampling=0,epoch_failure=0,epoch_reader_failure=0;
     uint64_t epoch_serial=0,on=0,trg=0,window_age_ms=0;
     uint32_t window_remaining_ms=0,window_duration_ms=0,window_down=0,window_released=0;
     uint32_t room=0,weapon=0,character=0,producer_return_rva=0,owner_weapon_type=0;
@@ -76,6 +76,7 @@ struct NativeSources {
         if(e.lifecycle&&e.state.ready&&!e.state.depth&&!e.state.sampling&&!e.state.poisoned){
             sword::reader::Observation current;epoch::Stamp sampled{};
             e.current=(kind==Kind::Candidate||kind==Kind::AttackSample)?epoch::AtContact(current,sampled):epoch::Current(current);
+            e.state.failure=epoch::state.failure;e.state.reader_failure=epoch::state.reader_failure;
             if(e.current){e.state.pose=current;if((kind==Kind::Candidate||kind==Kind::AttackSample))e.state.stamp=sampled;}
         }
         return e;
@@ -99,6 +100,7 @@ template<class Sources> Record Build(Sources& source,Kind kind,const Candidate* 
     r.frame=e.state.stamp.frame;r.epoch_serial=e.state.serial;r.epoch_depth=e.state.depth;
     r.completed_frame=e.completed_frame;
     r.epoch_ready=e.state.ready;r.epoch_poisoned=e.state.poisoned;r.epoch_sampling=e.state.sampling;
+    r.epoch_failure=static_cast<uint32_t>(e.state.failure);r.epoch_reader_failure=static_cast<uint32_t>(e.state.reader_failure);
     if(!e.enabled)r.reasons|=EpochOff;if(!e.thread)r.reasons|=EpochThread;if(!e.lifecycle)r.reasons|=EpochLifecycle;
     if(e.state.depth||e.state.sampling)r.reasons|=EpochOpen;if(e.state.poisoned)r.reasons|=EpochPoisoned;
     if(!e.state.ready)r.reasons|=EpochNoPose;else if(!e.current)r.reasons|=EpochCurrentRejected;

@@ -29,6 +29,8 @@
 #include "parry_audio.h"
 #include "parry_spark_runtime.h"
 #include "parry_general_runtime.h"
+#include "parry_line.h"
+#include "parry_direct_runtime.h"
 #include "ocarina_session.h"
 #include "ocarina_voice.h"
 #include "ocarina_freeze.h"
@@ -282,9 +284,9 @@ static bool StartDamageHook(unsigned char* base, unsigned image_size, unsigned l
     Log("Damage hook knife caller_rva=0x%X slots=%u", static_cast<unsigned>(caller_rva), player_slot && global_slot ? 1U : 0U);
     if (!trace && !adapter) { Log("no valid damage feature/trace; no damage hook installed"); return false; }
     MH_STATUS status = MH_Initialize();
-    // The combat adapter also accepts a MinHook already initialised by an earlier feature.
+    // The trace and the combat adapter both accept a MinHook already initialised by an earlier feature (e.g. CaseKeyDebounce).
     const bool own_minhook = status == MH_OK;
-    if (status != MH_OK && !(adapter && status == MH_ERROR_ALREADY_INITIALIZED)) { Log("TraceKnife disabled: MinHook init %s", MH_StatusToString(status)); return false; }
+    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) { Log("TraceKnife disabled: MinHook init %s", MH_StatusToString(status)); return false; }
     status = MH_CreateHook(target, reinterpret_cast<void*>(&TraceDamage), reinterpret_cast<void**>(&g_damage_original));
     if (status != MH_OK) {
         Log("TraceKnife disabled: MinHook create %s", MH_StatusToString(status)); if (own_minhook) MH_Uninitialize(); return false;
@@ -345,6 +347,13 @@ static volatile LONG g_parry_spark_submitted=0;
 static volatile LONG g_parry_defense_active=0,g_parry_attempts=0,g_parry_committed=0,g_parry_partial=0;
 // Tier 2 (general block, docs/parry-two-tier-2026-10-12.md): settings fixed before the resolver.
 static link_runtime::parry::general::Runtime g_gen;
+static void __cdecl ParryDirectAudio(){g_parry_audio.Publish(true,GetTickCount64());}
+static bool g_parry_line_requested=true;
+static bool __cdecl ResolveParryLine(const link_runtime::parry::Candidate& candidate){
+    if(!link_runtime::parry::line::Resolve(candidate))return false;
+    g_parry_audio.Publish(true,GetTickCount64());
+    return true;
+}
 static uint32_t g_parry_window_ms=link_runtime::defense::kParryWindowDefault;   // ParryWindowMs, read before the transport starts
 static void CombatCommitted(const link_runtime::parry::Candidate& candidate,LONG serial);
 static void CombatGeneralBlocked(uint32_t serial,uint32_t owner_id);
@@ -378,6 +387,7 @@ static bool __cdecl ResolveParry(const link_runtime::parry::Candidate& candidate
     bool handoff=false;
     if(g_gen.settings.mode!=g::Mode::Off&&g::TierTwoRuns(tier_one,handoff)){
         const auto applied=g::Resolve(g_gen,candidate,handoff);
+        link_runtime::parry::direct::ShareTierTwo(g_gen,candidate,applied);
         if(applied.cancel&&applied.effects&&!applied.grace){   // a grace block is the same parry: sparks only
             g_parry_audio.Publish(true,GetTickCount64());
             CombatGeneralBlocked(applied.serial,applied.owner_id);   // Link's reaction only; no riposte, no stagger
@@ -389,6 +399,8 @@ static bool __cdecl ResolveParry(const link_runtime::parry::Candidate& candidate
     return GuardResolve(candidate);
 }
 static void StopParryObservation() {
+    link_runtime::parry::direct::Stop();
+    link_runtime::parry::line::Stop();
     InterlockedExchange(&g_parry_defense_active,0);
     link_runtime::parry::observation::Stop();
     const auto pose=link_runtime::parry::sword::epoch::Stop();
@@ -480,6 +492,18 @@ static bool StartParryObservation(const link_runtime::shield::NativeAccess& nati
     if(status!=MH_OK) {
         StopParryObservation();Log("ParryObserve disabled: hook startup %s",MH_StatusToString(status));return false;
     }
+    p::direct::on_block=ParryDirectAudio;
+    for(unsigned i=0;i<p::direct::kCount;++i){
+        const auto route=static_cast<p::direct::Route>(i);
+        const auto direct_status=p::direct::Start(g_gen,route);
+        Log("ParryDirect ready route=%s ok=%u enabled=%u status=%s",p::direct::kSpecs[i].name,
+            direct_status==MH_OK?1U:0U,p::direct::requested[i]?1U:0U,MH_StatusToString(direct_status));
+    }
+    if(g_parry_line_requested){
+        const auto line_status=p::line::Start(g_gen,ResolveParryLine);
+        Log("ParryLine ready=%u site=0x3007FE deflect=%u status=%s (needs active tier 2, thrown and exact native pins)",
+            line_status==MH_OK?1U:0U,p::line::deflect?1U:0U,MH_StatusToString(line_status));
+    }else Log("ParryLine ready=0 reason=config");
     Log("Parry transport ready; input_window_ms=%u active_requested=%u routes=axe%s",trial_window_ms,defense_requested?1U:0U,owner.suki?",suki":"");return true;
 }
 static void PollParryObservation(DWORD& previous) {
@@ -489,11 +513,11 @@ static void PollParryObservation(DWORD& previous) {
     if(const unsigned lost=link_runtime::parry::general::dropped.exchange(0))Log("parry general records dropped=%u",lost);
     for(unsigned i=0;i<32&&o::Pop(r);++i){
         LogV("parry observe kind=%u reasons=0x%X flags=0x%X thread=%u frame=%u input_frame=%u owner_frame=%u completed_frame=%u "
-            "pose_ready=%u pose_poisoned=%u depth=%u serial=%llu profile=%u room=0x%X weapon=%u character=%u "
+            "pose_ready=%u pose_poisoned=%u depth=%u serial=%llu profile=%u room=0x%X weapon=%u character=%u pose_failure=%u pose_reader_failure=%u "
             "input_on=0x%llX input_trg=0x%llX window_age_ms=%llu remaining_ms=%u "
             "producer_return_rva=0x%X owner_weapon=%u owner_r1=0x%X blade_base=%.3f,%.3f,%.3f blade_tip=%.3f,%.3f,%.3f observer_only=1",
             static_cast<unsigned>(r.kind),r.reasons,r.flags,r.thread,r.frame,r.input_frame,r.owner_frame,r.completed_frame,
-            r.epoch_ready,r.epoch_poisoned,r.epoch_depth,r.epoch_serial,r.profile,r.room,r.weapon,r.character,
+            r.epoch_ready,r.epoch_poisoned,r.epoch_depth,r.epoch_serial,r.profile,r.room,r.weapon,r.character,r.epoch_failure,r.epoch_reader_failure,
             r.on,r.trg,r.window_age_ms,r.window_remaining_ms,r.producer_return_rva,r.owner_weapon_type,static_cast<unsigned>(r.owner_routines[1]),
             r.blade_base[0],r.blade_base[1],r.blade_base[2],r.blade_tip[0],r.blade_tip[1],r.blade_tip[2]);
         if(r.kind==o::Kind::Candidate||r.kind==o::Kind::AttackSample){
@@ -696,6 +720,9 @@ static wchar_t g_crash_dir[MAX_PATH]{};
 static link_runtime::crash_dump::Range g_crash_winmm{},g_crash_bio4{};
 static uint32_t g_crash_winmm_base=0,g_crash_winmm_size=0,g_crash_bio4_base=0,g_crash_bio4_size=0;
 static volatile LONG g_crash_taken=0;
+// XAudio2_7.dll code: filled once by the worker (CrashDumpPollAudio) when the game has loaded it; size last.
+static link_runtime::crash_dump::Range g_crash_xaudio{};static uint32_t g_crash_xaudio_base=0;
+static volatile LONG g_crash_xaudio_size=0;
 static link_runtime::crash_dump::Range CrashCodeRange(HMODULE m,uint32_t& image_size){
     link_runtime::crash_dump::Range r{};image_size=0;if(!m)return r;
     const auto* p=reinterpret_cast<const unsigned char*>(m);
@@ -713,6 +740,8 @@ static void CrashWhere(uint32_t a,char* out,size_t n){
         _snprintf_s(out,n,_TRUNCATE,"winmm+0x%X",a-g_crash_winmm_base);
     else if(g_crash_bio4_base&&a>=g_crash_bio4_base&&a-g_crash_bio4_base<g_crash_bio4_size)
         _snprintf_s(out,n,_TRUNCATE,"bio4+0x%X",a-g_crash_bio4_base);
+    else if(g_crash_xaudio_size&&a>=g_crash_xaudio_base&&a-g_crash_xaudio_base<static_cast<uint32_t>(g_crash_xaudio_size))
+        _snprintf_s(out,n,_TRUNCATE,"xaudio+0x%X",a-g_crash_xaudio_base);
     else _snprintf_s(out,n,_TRUNCATE,"0x%08X",a);
 }
 static LONG CALLBACK CrashDumpHandler(EXCEPTION_POINTERS* info){
@@ -720,7 +749,8 @@ static LONG CALLBACK CrashDumpHandler(EXCEPTION_POINTERS* info){
     if(!info||!info->ExceptionRecord||!info->ContextRecord)return EXCEPTION_CONTINUE_SEARCH;
     const uint32_t code=info->ExceptionRecord->ExceptionCode;
     const uint32_t at=static_cast<uint32_t>(reinterpret_cast<uintptr_t>(info->ExceptionRecord->ExceptionAddress));
-    const c::Kind kind=c::Classify(code,at,g_crash_winmm,g_crash_bio4);
+    const c::Range xaudio=g_crash_xaudio_size?g_crash_xaudio:c::Range{};
+    const c::Kind kind=c::Classify(code,at,g_crash_winmm,g_crash_bio4,xaudio);
     // One dump per process; the flag also stops recursion if anything below faults.
     if(kind==c::Kind::None||InterlockedCompareExchange(&g_crash_taken,1,0)!=0)return EXCEPTION_CONTINUE_SEARCH;
     const CONTEXT& x=*info->ContextRecord;uint32_t top=0;const bool top_ok=CrashReadStack(x.Esp,top);
@@ -761,6 +791,16 @@ static void CrashDumpInstall(const wchar_t* ini){
     const bool added=AddVectoredExceptionHandler(0,&CrashDumpHandler)!=nullptr;
     Log("crash_dump on handler=%u dbghelp=%u winmm_code=0x%08X+0x%X bio4_code=0x%08X+0x%X",added?1U:0U,g_crash_write?1U:0U,
         g_crash_winmm.base,g_crash_winmm.size,g_crash_bio4.base,g_crash_bio4.size);
+}
+// XAudio2_7.dll arrives after CrashDumpInstall: look for it every 2 s until found (worker thread, never in the handler).
+static void CrashDumpPollAudio(){
+    static uint64_t next=0;if(!g_crash_write||g_crash_xaudio_size)return;
+    const uint64_t now=GetTickCount64();if(now<next)return;next=now+2000;
+    const HMODULE xa=GetModuleHandleW(L"XAudio2_7.dll");if(!xa)return;
+    uint32_t image=0;const link_runtime::crash_dump::Range r=CrashCodeRange(xa,image);if(!r.size)return;
+    g_crash_xaudio=r;g_crash_xaudio_base=static_cast<uint32_t>(reinterpret_cast<uintptr_t>(xa));
+    InterlockedExchange(&g_crash_xaudio_size,static_cast<LONG>(image));
+    Log("crash_dump xaudio_code=0x%08X+0x%X",r.base,r.size);
 }
 // FpsProbe: logic ticks per real second (+0x530C) and simulation speed (sum of deltaTime/30 per
 // real second; 1.00 = real time, below 1 the PC cannot hold the fixed step and the game slows).
@@ -1481,6 +1521,11 @@ static int __cdecl FairyLifeDownDetour(void* em,int damage,int rnd,int flag){
         ret_rva+g_fairy_base,link_runtime::shield::runtime::current_scope);
     const DWORD after=GetLastError();
     const int out=g_fairy.Leave(host,entry,result);
+    // Every life-down on Link with its caller: a live check attributes damage (which attack landed after a parry)
+    // instead of guessing from lock or HUD side effects. LifeDownSet2 also takes enemies' damage (em10DmCk, the
+    // riposte): only Link's own entries are logged.
+    if(entry.player)Log("life_down ret=0x%X damage=%d rnd=%d flag=0x%X hp=%d out=%d em=0x%08X player=1",
+        ret_rva,damage,rnd,flag,result,out,reinterpret_cast<uint32_t>(em));
     SetLastError(after);
     return out;
 }
@@ -2524,10 +2569,13 @@ struct GuardSources {
         if(!pp::front_native::Evaluate(g_gen.front,g_gen.access,o,pa,pa+3,res,forward))return false;
         std::memcpy(f.sample,o.current.data(),12);std::memcpy(f.player,pa,12);
         f.frontal=res.frontal;f.dot=res.dot;
-        f.half=forward[0]*(f.sample[0]-pa[0])+forward[2]*(f.sample[2]-pa[2]);
+        // Unit length along Link's horizontal forward, as general::NativeSources::Front (the cone reads forward, not half).
+        const float flat=std::sqrt(forward[0]*forward[0]+forward[2]*forward[2]);
+        f.half=(forward[0]*(f.sample[0]-pa[0])+forward[2]*(f.sample[2]-pa[2]))/(flat>1e-3f?flat:1.f);
         return std::isfinite(f.half);
     }
     uint32_t Owner(const link_runtime::parry::Candidate& c){return base.Owner(c);}
+    bool Routine(uint32_t owner,uint8_t (&out)[2]){return base.Routine(owner,out);}
     bool OwnerPosition(uint32_t owner,float (&out)[3]){link_runtime::parry::general::Memory m;return m.Read(owner+0x94,out,12)&&std::isfinite(out[0])&&std::isfinite(out[2]);}
     uint64_t Now(){return GetTickCount64();}
 };
@@ -2544,8 +2592,8 @@ static bool GuardResolve(const link_runtime::parry::Candidate& c){
         const unsigned key=static_cast<unsigned>(o.reason);const uint64_t now=GetTickCount64();
         if((up||o.reason==sg::Reason::Broken)&&o.reason!=sg::Reason::Structure&&key<16&&now-g_sg_last_pass[key]>=1000){
             g_sg_last_pass[key]=now;
-            CmbLog("shield_guard pass reason=%s producer=0x%X class=%c verdict=%s cos=%.3f owner_source=%u left=%u",sg::ReasonName(o.reason),
-                o.ret_rva,o.cls,g::VerdictName(o.verdict),o.cos,o.owner_source?1U:0U,g_sg_dur.Left());
+            CmbLog("shield_guard pass reason=%s producer=0x%X class=%c verdict=%s cos=%.3f owner_source=%u left=%u owner=0x%08X",sg::ReasonName(o.reason),
+                o.ret_rva,o.cls,g::VerdictName(o.verdict),o.cos,o.owner_source?1U:0U,g_sg_dur.Left(),o.owner);
         }
         return false;
     }
@@ -2560,8 +2608,8 @@ static bool GuardResolve(const link_runtime::parry::Candidate& c){
         g_sg_layer->OnBroken();GuardSound(wood?3:4);
         CmbLog("shield_guard break costume=%u regen_s=%.0f",costume,g_sg_dur.RegenFrames()/60.0);
     }else{g_sg_layer->OnBlocked();GuardSound(wood?1:2);}
-    CmbLog("shield_guard block producer=0x%X class=%c power=%u cos=%.3f owner_source=%u left=%u/%u broke=%u sparks=%u deflect=%d",
-        o.ret_rva,o.cls,o.descriptor.power,o.cos,o.owner_source?1U:0U,o.left,g_sg_dur.Max(),o.broke?1U:0U,sparks,deflected);
+    CmbLog("shield_guard block producer=0x%X class=%c power=%u cos=%.3f owner_source=%u left=%u/%u broke=%u sparks=%u deflect=%d owner=0x%08X",
+        o.ret_rva,o.cls,o.descriptor.power,o.cos,o.owner_source?1U:0U,o.left,g_sg_dur.Max(),o.broke?1U:0U,sparks,deflected,o.owner);
     return true;
 }
 // Worker: the block reuses the rear shield's TP hit sounds; break and return are their own files.
@@ -3127,7 +3175,7 @@ static void CombatPrepare(unsigned char* base,uint32_t player_slot,uint32_t glob
 static bool CmbHook(uint32_t rva,void* detour,void** original,const char* name){
     void* target=reinterpret_cast<void*>(g_cmb_base+rva);
     MH_STATUS s=MH_CreateHook(target,detour,original);
-    if(s==MH_OK)s=MH_EnableHook(target);
+    if(s==MH_OK&&(s=MH_EnableHook(target))!=MH_OK)MH_RemoveHook(target);
     if(s!=MH_OK){Log("Combat hook %s 0x%X failed: %s",name,rva,MH_StatusToString(s));return false;}
     return true;
 }
@@ -3301,7 +3349,7 @@ static void UserIniPoll(){
 }
 // --- end user-ini-01
 static void __cdecl CombinedDecide(mortal::dispatch::Runtime& run,void* player){
-    UserIniApply();   // user-ini-01: a new cosmetic snapshot from the worker, before any of its readers this frame
+    UserIniApply();   // user-ini-01: a new cosmetic snapshot from the worker, before this dispatch's readers (the arbiter and the lifecycle may read the previous one for one frame: same thread, cosmetic)
     zlr::Frame();   // Zelda's light ray: shares the freshly applied particle switch and gain
     link_runtime::sword_trail::probe::runtime::Frame();   // Task 3b probe: no-op unless SwordTrailProbe=1 started it
     if(g_oca_on.load(std::memory_order_acquire))OcarinaDecide(run,player);
@@ -3980,6 +4028,9 @@ static DWORD WINAPI Worker(LPVOID) {
     const unsigned shield_switch=GetPrivateProfileIntW(L"LinkRuntime",L"ShieldObserve",0,path);
     const bool defense_requested=ChapterIniSwitch(path,L"ParryActive");
     const bool parry_requested=defense_requested||ChapterIniSwitch(path,L"ParryObserve");
+    for(unsigned i=0;i<link_runtime::parry::direct::kCount;++i)
+        link_runtime::parry::direct::requested[i]=GetPrivateProfileIntW(L"LinkRuntime",link_runtime::parry::direct::kSpecs[i].key,link_runtime::parry::direct::kSpecs[i].on?1:0,path)==1;
+    g_parry_line_requested=GetPrivateProfileIntW(L"LinkRuntime",L"ParryLineBlock",0,path)==1;   // 3.2.1: off until checked live
     unsigned general_problems=0;
     g_gen.settings=link_runtime::parry::general::ReadSettings([&](const wchar_t* key,wchar_t* out,size_t count){
         GetPrivateProfileStringW(L"LinkRuntime",key,L"",out,static_cast<DWORD>(count),path);},defense_requested,parry_requested,general_problems);
@@ -4021,7 +4072,7 @@ static DWORD WINAPI Worker(LPVOID) {
     g_oca_manual_on=GetPrivateProfileIntW(L"Ocarina",L"Manual",1,path)==1;   // default on; needs Item=1
     g_cmb=cmb::ReadConfig([&](const wchar_t* key,wchar_t* out,size_t count){
         GetPrivateProfileStringW(L"LinkRuntime",key,L"",out,static_cast<DWORD>(count),path);},defense_requested);
-    if(g_cmb.problems)Log("Combat: %u invalid values or unmet dependencies (Damage needs Contextual, parry keys need ParryActive); those stay off",g_cmb.problems);
+    if(g_cmb.problems)Log("Combat: %u invalid values or unmet dependencies (Damage needs Contextual, parry keys need ParryActive); switches, unmet dependencies and a bad ParryRiposteMilli stay off, other numbers keep their defaults",g_cmb.problems);
     if(g_cmb.leap_problems)Log("EndingBlowLeap: %u invalid values; their defaults kept",g_cmb.leap_problems);
     if(g_cmb.lift_problems)Log("EndingBlowCameraLift: %u invalid values; their defaults kept",g_cmb.lift_problems);
     // E1 sword trail log (spin_attack_runtime.h SwordTrail*): exact 1, with SpinAttack=1 and LogLevel=2 (lines every frame).
@@ -4180,6 +4231,7 @@ static DWORD WINAPI Worker(LPVOID) {
     StartSwordTrail(base,slot,global_slot,dispatch_up);
     StartSwordCharge(base,slot,global_slot,dispatch_up,mortal_name?mortal_directory:nullptr);
     StartSwordParticles(base,slot,global_slot,dispatch_up);   // sword-particles-01: after the trail (it reads its samples)
+    if(zlr::g_on&&!g_trail_on.load(std::memory_order_acquire))Log("ZeldaLight inert: sword_trail is off (its reason above); the ray is drawn with the trail's node");
     UserIniStart(user_ini,user_file_problems);   // user-ini-01: after the three: what started, then live reloads
     StartZTargetArrow(base,slot,global_slot,dispatch_up,path);   // before ztarget Start: it mutes the 2D cursor
     if(combat)GuardLoadAudio(mortal_directory);
@@ -4228,6 +4280,7 @@ static DWORD WINAPI Worker(LPVOID) {
     uint64_t camera_interp_next = GetTickCount64() + 5000;
     for (;;) {
         fps_probe.Poll();
+        CrashDumpPollAudio();
         if (camera_interp && GetTickCount64() >= camera_interp_next) {
             camera_interp_next = GetTickCount64() + 5000;
             const auto& cs = link_runtime::camera_interp::install::g_stats;

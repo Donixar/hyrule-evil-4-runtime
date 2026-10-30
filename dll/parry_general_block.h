@@ -63,12 +63,14 @@ inline const char* VerdictName(Verdict v) {
 // contact in between. Under the 100 ms gap that second contact was a new, unpressed hit: the parry
 // showed (sparks, voice) and the damage landed anyway. When the owner is known and its routine
 // (cEm r0/r1, [em+0xFC]/[em+0xFD]) is still the one it had at the block, the attacker is still in
-// that attack: the follow-up then allows kSwingGapMs between contacts, up to kSwingMaxMs.
+// that attack: the follow-up then allows kSwingGapMs between contacts, up to kSwingMaxMs. 28-oct
+// (play-20261028/tests/05-flail.log): the chain came back behind Link 453 ms after the block, past the
+// old 400 ms gap, and landed; the routine check still ends the follow on a new swing.
 struct Swing {bool known = false; uint8_t routine[2]{};};
 inline bool SameSwing(const Swing& a, const Swing& b) {return a.known && b.known && a.routine[0] == b.routine[0] && a.routine[1] == b.routine[1];}
 struct Follow {
     static constexpr uint64_t kGapMs = 100, kMaxMs = 500;
-    static constexpr uint64_t kSwingGapMs = 400, kSwingMaxMs = 1500;
+    static constexpr uint64_t kSwingGapMs = 700, kSwingMaxMs = 1500;
     static constexpr float kNear = 2500.f;
     bool armed = false;
     uint32_t function = 0, owner = 0;
@@ -110,7 +112,7 @@ struct Follow {
 // of the same parry (sparks, no second voice or reaction). Not spammable: only Open() starts a window, the
 // caller calls it only after a successful parry/block, it never renews or extends an open window, and a
 // grace block never opens one (no chaining). Later samples of a grace-blocked swing are followed silently
-// in `swings` (own Follow slots, so the opener's follow-up is kept).
+// in `swings` (own Follow slots, so the opener's follow-up is kept), as is a follow-up a later press block displaced.
 inline unsigned GraceMs(unsigned raw) {return raw <= 1000 ? raw : 0;}   // ParryGraceMs: 0..1000, else off
 struct Grace {
     static constexpr unsigned kSlots = 4;
@@ -134,15 +136,18 @@ struct Grace {
         open = true; opened = now; until = now + window; serial = by; blocked = 0;
         return true;
     }
-    void ArmSwing(uint32_t fn, uint32_t who, const float* p, uint64_t now_ms, const Swing& sw = Swing{}) {
+    unsigned Free(uint64_t now_ms) {   // an expired slot, else the oldest
         unsigned slot = 0;
         for (unsigned i = 0; i < kSlots; ++i) {
             swings[i].Expire(now_ms);
             if (!swings[i].armed) {slot = i; break;}
             if (swings[i].start < swings[slot].start) slot = i;
         }
-        swings[slot].Arm(fn, who, p, now_ms, sw);
+        return slot;
     }
+    void ArmSwing(uint32_t fn, uint32_t who, const float* p, uint64_t now_ms, const Swing& sw = Swing{}) {swings[Free(now_ms)].Arm(fn, who, p, now_ms, sw);}
+    // A press block re-arms the single Follow: a still-live follow-up of another swing (two chain/flail attackers) moves here.
+    void Park(const Follow& f, uint64_t now_ms) {if (f.armed && f.Within(now_ms, f.owner && f.swing.known)) swings[Free(now_ms)] = f;}
     bool FollowSwing(uint32_t fn, uint32_t who, const float* p, uint64_t now_ms, bool by_owner = false, const Swing* sw = nullptr,
                      bool* long_follow = nullptr) {
         for (auto& s : swings) {
@@ -183,9 +188,11 @@ inline bool Parryable(const Front& f) {
 struct Outcome {
     bool cancel = false;     // Active only: the decision returned to the transport
     bool consumed = false, follow = false, handoff = false;
+    bool pose_fallback = false; // fresh held press plus a stable known sword resource, without blade geometry
     bool long_follow = false; // a follow-up only the chain/flail bounds (same owner, same routine) kept
+    uint64_t follow_gap_ms = 0, follow_age_ms = 0; // follow-up of the main Follow: gap since its last contact, age since the block (log only)
     bool would_block = false; // Observe only: every gate passed and a press was armed (not consumed)
-    bool grace = false;       // blocked by the post-parry grace window (or a follow-up of such a block)
+    bool grace = false;       // blocked by the post-parry grace window (or a follow-up kept in Grace::swings)
     bool grace_opened = false, grace_expired = false;
     Reason reason = Reason::Off;
     Verdict verdict = Verdict::Unlisted;
@@ -194,10 +201,20 @@ struct Outcome {
     Descriptor descriptor{};
     Front front{};
 };
+// em10CsawHitCk (0x2C0D0) reads its Ganado from ESI ([esi+0x610] chainsaw model, [esi+0x98]) and keeps it there
+// across its three EmAtkHitCk calls, so ESI at the wrapper entry is the swing's owner. Accepted only when that
+// actor carries the chainsaw (+0x7F0 == 4, mortal_draw_target.h). Without it the swing's later checks had no
+// owner: a block at 0x2C249 and the next check 31 ms later at Link's side passed as `rear` (power 9999, Donald
+// 28-oct). With the owner they are the blocked swing's follow-ups.
+inline bool ChainsawProducer(uint32_t ret) {return ret == 0x2C178 || ret == 0x2C249 || ret == 0x2C2CA;}
+template <class Mem> uint32_t ChainsawOwner(Mem& m, uint32_t ret, uint32_t esi) {
+    uint8_t weapon = 0;
+    return ChainsawProducer(ret) && esi && m.Read(esi + 0x7F0, &weapon, 1) && weapon == 4 ? esi : 0;
+}
 // Gate order (§2.6), cheapest to irreversible. `handoff`: tier 1 consumed this very press in this
 // invocation and wrote nothing (Approved + NotCommitted), so tier 2 uses it without consuming again.
 // Sources: bool Invocation(c); uint32_t ImageBase(); bool Live(size_t); bool Descriptor(uint32_t,
-// Descriptor&); bool Blocked(); bool Pose(); bool Front(c, Front&); uint32_t Owner(c);
+// Descriptor&); bool Blocked(); bool Pose(); bool Guard(bool refresh_input); bool Front(c, Front&); uint32_t Owner(c);
 // bool Routine(owner, uint8_t (&)[2]); uint64_t Now(); bool Refresh(); bool Consume(); bool Peek().
 template <class S> Outcome Decide(S& s, const Candidate& c, const Settings& set, Follow& follow, bool handoff,
                                    Grace* grace = nullptr, double game_now = 0) {
@@ -230,6 +247,7 @@ template <class S> Outcome Decide(S& s, const Candidate& c, const Settings& set,
         follow.Expire(now);
         if (follow.Matches(o.function, o.owner, o.front.sample, now, by_owner, &swing)) {
             o.follow = true; o.reason = Reason::Blocked; o.long_follow = follow.Long(now);
+            o.follow_gap_ms = now - follow.last; o.follow_age_ms = now - follow.start;
             if (set.mode == Mode::Active) {follow.Touch(o.front.sample, now); o.cancel = true;}
             return true;
         }
@@ -245,13 +263,18 @@ template <class S> Outcome Decide(S& s, const Candidate& c, const Settings& set,
         if (follow_up(true)) return o;
     }
     o.reason = Reason::Pose;
-    if (!posed) return o;
+    if (!posed) {
+        // A hidden/non-rigid draw pose is not blade geometry. Admit only a new held press,
+        // with the same stable player/model/resource guards; never borrow grace or a handoff.
+        if (!located || !Parryable(o.front) || handoff || !s.Guard(set.mode == Mode::Active)) return o;
+        o.pose_fallback = true;
+    }
     o.reason = Reason::Front;
     if (!located) return o;
     o.reason = Reason::Rear;
     if (!Parryable(o.front)) return o;
-    if (follow_up(false)) return o;
-    if (grace && set.mode == Mode::Active) {
+    if (!o.pose_fallback && follow_up(false)) return o;
+    if (!o.pose_fallback && grace && set.mode == Mode::Active) {
         o.grace_expired = grace->Expire(game_now);
         if (grace->Covers(game_now)) {   // no press read or consumed; never reopens the window
             grace->ArmSwing(o.function, o.owner, o.front.sample, now, swing);
@@ -267,6 +290,7 @@ template <class S> Outcome Decide(S& s, const Candidate& c, const Settings& set,
     }
     o.reason = Reason::Window;
     if (!handoff && !(s.Refresh() && s.Consume())) return o;
+    if (grace) grace->Park(follow, now);
     follow.Arm(o.function, o.owner, o.front.sample, now, swing);
     o.cancel = true; o.consumed = !handoff; o.handoff = handoff; o.reason = Reason::Blocked;
     if (grace) o.grace_opened = grace->Open(game_now, 0);

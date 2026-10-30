@@ -73,8 +73,8 @@ template<class Mem> bool ReadFrame(Mem& m,uint32_t base,Frame& f){
 inline bool SameScene(const Frame& a,const Frame& b){return a.player==b.player&&a.global==b.global&&a.room==b.room&&a.costume==b.costume;}
 inline bool Adjust(Controller& c,const Input& i,const Matrix& m,const Offset& in,float desired,float tau,Offset& out){
     Offset checked;
+    if(!c.Active())return false;   // an Idle controller is never suspended here (a press must not be lost)
     if(!i.safe||!ValidDt(i.dt)||!std::isfinite(desired)||!Rotate(m,in,0,checked)){c.Suspend();return false;}
-    if(!c.Active())return false;
     const Vec diff{in.target.x-in.campos[0].x,in.target.y-in.campos[0].y,in.target.z-in.campos[0].z};
     const Vec world=World(m,diff);
     if(!Finite(world)||world.x*world.x+world.z*world.z<1.f){c.Suspend();return false;}

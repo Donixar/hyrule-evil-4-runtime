@@ -59,7 +59,7 @@ function Expand-UpdateArchive([string]$Archive, [string]$Destination) {
             }
             if ($seen.ContainsKey($rel)) { throw "Archivo duplicado en el ZIP: $rel" }
             $seen[$rel] = $true
-            if ((($entry.ExternalAttributes -shr 16) -band 0xF000) -eq 0xA000) { throw "Enlace dentro del ZIP: $rel" }
+            if ($entry.PSObject.Properties['ExternalAttributes'] -and ((($entry.ExternalAttributes -shr 16) -band 0xF000) -eq 0xA000)) { throw "Enlace dentro del ZIP: $rel" }
             $total += $entry.Length
             if ($total -gt 4GB) { throw 'El parche supera el límite de extracción de 4 GB.' }
         }
@@ -404,8 +404,18 @@ function Invoke-LinkUpdate($Options, [string]$RunDir) {
         if (Test-File $journal) {
             $old=Read-Json $journal
             if ($old.status -eq 'active') {
-                Restore-UpdateSnapshot $game $transaction
-                return @{ status='recovered'; version=''; detected_version=''; applied=@(); message='Se recuperó la instalación anterior después de una interrupción. Ejecuta el actualizador otra vez para aplicar el parche.'; backup_path=$transaction }
+                # A snapshot fits only the install it was taken from. After an uninstall its backup folder is gone; after a
+                # fresh full install installed.json names another one. Restoring it then would break the current install.
+                # An unreadable installed.json (the same crash) still recovers: the snapshot is the only way back.
+                $snapDir=@($old.rows | ForEach-Object { if ($_.path -match '^LinkInRE4_Backup/([^/]+)/journal\.tsv$') { $Matches[1] } })
+                $liveDir=$null
+                try { $liveDir=(Read-Json (Get-UpdatePath $game 'LinkInRE4_Backup/installed.json')).backup_dir } catch { }
+                if ($snapDir.Count -eq 1 -and [IO.Directory]::Exists((Get-UpdatePath $game ('LinkInRE4_Backup/' + $snapDir[0]))) -and
+                    ($null -eq $liveDir -or $liveDir -eq $snapDir[0])) {
+                    Restore-UpdateSnapshot $game $transaction
+                    return @{ status='recovered'; version=''; detected_version=''; applied=@(); message='Se recuperó la instalación anterior después de una interrupción. Ejecuta el actualizador otra vez para aplicar el parche.'; backup_path=$transaction }
+                }
+                $old.status='stale'; Write-JsonFile $journal $old
             }
         }
         $stateFile=Get-UpdatePath $game 'LinkInRE4_Backup/installed.json'

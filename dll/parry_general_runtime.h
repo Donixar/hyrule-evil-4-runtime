@@ -48,6 +48,18 @@ struct NativeSources {
     bool Descriptor(uint32_t attack, general::Descriptor& d) {Memory m; return m.Read(attack, &d, sizeof(d));}
     bool Blocked() {return input::Blocks();}
     bool Pose() {sword::epoch::Stamp stamp{}; pose_ok = sword::epoch::AtContact(pose, stamp); return pose_ok;}
+    bool Guard(bool refresh_input) {
+        // Observe never refreshes or consumes real input. Active still consumes through the
+        // ordinary fresh-read gate after every geometric/producer gate has passed.
+        if ((refresh_input && !input::RefreshAtContact()) || !input::PeekCurrent()) return false;
+        const auto before = input::state.sample;
+        sword::reader::ProcessMemory m; sword::reader::Guard guard;
+        const sword::reader::Slots slots{r.access.image_base + static_cast<uint32_t>(r.access.code.player_slot_rva),
+                                         r.access.image_base + static_cast<uint32_t>(r.access.code.global_slot_rva)};
+        if (!sword::reader::ReadGuard(m, slots, guard) || guard.player != before.player || guard.global != before.global) return false;
+        const auto& after = input::state.sample;
+        return input::Context(before, after) && before.frame == after.frame && before.on == after.on && before.trg == after.trg && input::PeekCurrent();
+    }
     bool Front(const Candidate& c, general::Front& f) {
         Memory m; uint32_t player = 0; float pa[6]{};
         owner::Observation o;
@@ -68,6 +80,7 @@ struct NativeSources {
         const uint32_t ret = c.outer_caller - r.access.image_base;
         if (ret == 0x55CE2) return c.producer_owner;   // em10AtkCk: EDI at the wrapper entry
         Memory m; uint32_t object = 0;
+        if (ChainsawProducer(ret)) return ChainsawOwner(m, ret, c.producer_esi);   // em10CsawHitCk: ESI
         return thrown::Identify(m, r.access.image_base, c, ret, object) ? object : 0;
     }
     // The owner's cEm routine r0/r1 ([em+0xFC], [em+0xFD]; the r1 dispatch byte, gigante_tree_guard.h): same
@@ -116,7 +129,9 @@ inline Applied Resolve(Runtime& r, const Candidate& c, bool handoff) {
     const bool grace_on = GraceOn(r);
     const double game_now = grace_on ? r.game_now() : 0;
     const uint32_t grace_serial = r.grace.serial; const unsigned grace_blocked = r.grace.blocked;
-    a.cancel = Run(s, c, r.settings, r.follow, handoff, o, grace_on ? &r.grace : nullptr, game_now);
+    // A window-0 Grace never opens (Open refuses window 0) but still holds parked follow-ups (Grace::Park).
+    Grace* const grace = (grace_on || (r.settings.mode == Mode::Active && r.grace.window <= 0)) ? &r.grace : nullptr;
+    a.cancel = Run(s, c, r.settings, r.follow, handoff, o, grace, game_now);
     const uint64_t now = GetTickCount64();
     if (o.grace_expired) Log("parry grace expired serial=0x%08X blocked=%u", grace_serial, grace_blocked);
     if (o.reason == Reason::Fault || o.reason == Reason::Reentry) InterlockedIncrement(&r.counters.faults);
@@ -128,8 +143,13 @@ inline Applied Resolve(Runtime& r, const Candidate& c, bool handoff) {
     if (o.follow) {
         if (a.cancel) InterlockedIncrement(&r.counters.follows);
         if (a.cancel && o.long_follow) InterlockedIncrement(&r.counters.follow_long);
+        // A chain/flail coming back after a pause (gap past the short bound): one line per return, so a live check sees
+        // the return itself and its owner, not only the follow_long counter.
+        if (a.cancel && o.long_follow && o.follow_gap_ms > Follow::kGapMs)
+            Log("parry general follow_long owner=0x%08X producer=0x%X owner_id=0x%X gap_ms=%llu since_block_ms=%llu",
+                o.owner, o.ret_rva, owner_id, o.follow_gap_ms, o.follow_age_ms);
         a.grace = o.grace;
-        return a;   // same swing: silent, no effects, no log line
+        return a;   // same swing: silent, no effects; a log line only for a long return (above)
     }
     if (r.settings.mode == Mode::Observe) {
         if (o.would_block) {
@@ -146,9 +166,9 @@ inline Applied Resolve(Runtime& r, const Candidate& c, bool handoff) {
             r.last_pass[key] = now;
             const defense::PressAge press = defense::PressAt(input::state.window, now);
             Log("parry general pass reason=%s producer=0x%X class=%c owner_id=0x%X power=%u flag=0x%X front_dot=%.3f half=%.0f "
-                "press_down=%u press_age_ms=%llu",
+                "press_down=%u press_age_ms=%llu owner=0x%08X",
                 o.reason == Reason::Producer ? VerdictName(o.verdict) : ReasonName(o.reason), o.ret_rva, o.cls, owner_id,
-                o.descriptor.power, o.descriptor.flag, o.front.dot, o.front.half, press.down, press.age_ms);
+                o.descriptor.power, o.descriptor.flag, o.front.dot, o.front.half, press.down, press.age_ms, o.owner);
         }
         return a;
     }
@@ -180,13 +200,13 @@ inline Applied Resolve(Runtime& r, const Candidate& c, bool handoff) {
     }
     if (o.grace)
         Log("parry grace blocked serial=0x%08X n=%u at=%.1f until=%.1f producer=0x%X class=%c owner_id=0x%X power=%u front_dot=%.3f "
-            "half=%.0f sparks=%u deflect=%d", a.serial, r.grace.blocked, game_now, r.grace.until, o.ret_rva, o.cls, owner_id,
-            o.descriptor.power, o.front.dot, o.front.half, sparks, deflected);
+            "half=%.0f sparks=%u deflect=%d owner=0x%08X", a.serial, r.grace.blocked, game_now, r.grace.until, o.ret_rva, o.cls, owner_id,
+            o.descriptor.power, o.front.dot, o.front.half, sparks, deflected, o.owner);
     else
     Log("parry general block serial=0x%08X producer=0x%X class=%c owner_id=0x%X power=%u radius=%.0f front_dot=%.3f half=%.0f "
-        "follow=0 handoff=%u spark_on_blade=%u sparks=%u deflect=%d deflect_route=%u press_age_ms=%llu",
+        "follow=0 handoff=%u pose_fallback=%u spark_on_blade=%u sparks=%u deflect=%d deflect_route=%u press_age_ms=%llu owner=0x%08X",
         a.serial, o.ret_rva, o.cls, owner_id, o.descriptor.power, o.descriptor.radius, o.front.dot, o.front.half,
-        handoff ? 1U : 0U, on_blade ? 1U : 0U, sparks, deflected, r.deflect ? 1U : 0U, defense::PressAt(input::state.window, now).age_ms);
+        handoff ? 1U : 0U, o.pose_fallback ? 1U : 0U, on_blade ? 1U : 0U, sparks, deflected, r.deflect ? 1U : 0U, defense::PressAt(input::state.window, now).age_ms, o.owner);
     return a;
 }
 }  // namespace link_runtime::parry::general
