@@ -29,7 +29,7 @@
 //    unchanged: bit-identical there (tests/native/test_camera_interp_fix.cpp).
 //  Mode 2 "scaled": like mode 1 but r = deltaTime / counter (the rate the 30 FPS design implies);
 //    identical to native at 30 FPS only. Reserved for fidelity work; mode 1 is the proposal.
-//  INI: [LinkRuntime] CameraInterpFix=0 (missing or 0: off, nothing hooked). Not wired yet.
+//  INI: [LinkRuntime] CameraInterpFix=0 (missing or 0: off, nothing hooked). Installed from the worker (link_runtime.cpp).
 // Pure part first (no Windows headers); the detour/installer is under
 // LINK_RUNTIME_CAMERA_INTERP_INSTALL (needs MinHook, as the other runtime hooks).
 #include <atomic>

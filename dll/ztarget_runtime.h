@@ -145,8 +145,9 @@ inline void RecordNeutral(NeutralEvent e,const char* reason){
 //   zt frame_gap delta=%d snapshot=%u frame=%u epoch_changed=%u phase=%s   Controller::Begin's frame-gap/epoch suspend
 //   zt same_frame frame=%u phase=%s                    Begin returned early on a repeated frame with the lock input held
 //   zt hit_skew delta=%d snapshot=%u frame=%u admitted=%u                  hitCheck's frame differs from Begin's snapshot
-enum class Diag:uint8_t {Unsafe,Gap,Same,Skew};
-inline UnsafeLog unsafe_log;inline DiagLog gap_log,same_log,skew_log;
+//   zt hit_unsafe reason=%s frame=%u suspended=%u      hitCheck's fresh read not safe after a safe Begin (28-oct)
+enum class Diag:uint8_t {Unsafe,Gap,Same,Skew,HitUnsafe};
+inline UnsafeLog unsafe_log,hit_unsafe_log;inline DiagLog gap_log,same_log,skew_log;
 struct DiagRecord {Diag kind;const char* reason;uint32_t a,b;int32_t delta;uint8_t flag;Phase phase;};
 inline DiagRecord diag_records[16];inline std::atomic<unsigned> diag_read{0},diag_write{0};
 inline void RecordDiag(const DiagRecord& d){
@@ -168,6 +169,7 @@ inline void LogDiag(Logger log,const DiagRecord& d){
     case Diag::Gap:log("zt frame_gap delta=%d snapshot=%u frame=%u epoch_changed=%u phase=%s",d.delta,d.a,d.b,unsigned(d.flag),Name(d.phase));break;
     case Diag::Same:log("zt same_frame frame=%u phase=%s",d.a,Name(d.phase));break;
     case Diag::Skew:log("zt hit_skew delta=%d snapshot=%u frame=%u admitted=%u",d.delta,d.a,d.b,unsigned(d.flag));break;
+    case Diag::HitUnsafe:log("zt hit_unsafe reason=%s frame=%u suspended=%u",d.reason?d.reason:"-",d.a,unsigned(d.flag));break;
     }
 }
 inline bool NeutralNow(){return neutral.active&&controller.phase==Phase::Recenter&&controller.held;}
@@ -476,7 +478,9 @@ inline void Begin(){
     }
     controller.Begin(input,locked.identity!=0);NoteGap(f.frame);
     if(controller.phase!=Phase::Locked){locked={};los_hold.Reset();}
-    RecordNeutral(neutral.Step(controller.phase,controller.held,f.yaw,epoch,false,false),
+    // Safe frame: a frame gap or a hit-side suspend (no_shoulder_call, a non-rigid matrix) is soft, as for a lock; a
+    // scene is hard (the lock's resume is cleared on it too).
+    RecordNeutral(neutral.Step(controller.phase,controller.held,f.yaw,epoch,!scene,false),
         controller.phase==Phase::Locked?"acquire":!key.hold?"input_up":why?why:"no_target");
     // This frame's pool read of the lock (its HP now, not at acquisition) when it is still that slot's identity.
     if(controller.phase==Phase::Locked&&locked.identity)resume=ResumeOf(locked.index<pool.count&&
@@ -921,9 +925,10 @@ template<class Mem,class FocusFn> bool PrepareHitWith(Mem& m,FocusFn focused,voi
     if(unsafe)hit_unsafe.fetch_add(1);if(busy_now)hit_busy.fetch_add(1);
     if(unfocused)hit_unfocused.fetch_add(1);if(latch)hit_latch.fetch_add(1);
     // The frame counter one ahead of Begin's snapshot is admitted, as FaceWith admits it (the snapshot can be the
-    // preceding frame): every gate below and every write still use this fresh read. bad-session.log (20-oct) had
-    // why=4 on 100% of hits from the session start; why the counter moves between Begin and hitCheck inside one
-    // CameraMove call is not established. Any other difference is still why 4.
+    // preceding frame): every gate below and every write still use this fresh read. No log has shown that skew (why4=0
+    // and skew1=0 in every stats line on disk, 27-oct): the 20-oct bad session was why=5, the stats line's fifth slot
+    // read then as why=4 (!Safe right after `zt suspend reason=prompt`, fixed on 24-oct by CameraSafe). Any other
+    // difference is still why 4.
     const int32_t skew=read?int32_t(f.frame-snapshot.frame):0;
     if(!have_snapshot)why=1;else if(!read)why=2;else if(!SameScene(snapshot,f))why=3;
     else if(skew!=0&&skew!=1)why=4;else if(unsafe)why=5;else if(busy_now)why=6;else if(unfocused)why=7;
@@ -936,12 +941,23 @@ template<class Mem,class FocusFn> bool PrepareHitWith(Mem& m,FocusFn focused,voi
     }else if(read)skew_log.Rearm();
     if(why){
         reject_why[why].fetch_add(1);rejected.fetch_add(1);
-        // 20-oct (bad-session.log): why 4 hits ~30% of hits even in healthy sessions; suspending on it left the lock
-        // Suspended until a key release, every press. A stale snapshot/frame (1-4) only skips this hit's write, as
-        // FaceWith's frame gap does; unsafe, busy, unfocused or the focus latch still suspend, as does why 9.
-        if(why>=5||unsafe||busy_now||unfocused||latch)Suspend();
+        // A stale snapshot/frame (1-4) only skips this hit's write, as FaceWith's frame gap does (a suspend there drops
+        // the lock until Resume brings it back); unsafe, busy, unfocused or the focus latch still suspend, as does
+        // why 9. Idle is left Idle: Begin re-checks safety itself, and a suspended Idle swallowed a press made on the
+        // next frame.
+        // A soft reason on the fresh read (not aim, fire, an event, health or damage) right after a safe Begin skips this
+        // write only (28-oct, two Ganados: Begin safe, this read not, every frame; each suspend was resumed on the next
+        // Begin, 1593 `zt locked reason=resume` and the lock flickering). Begin re-checks the next frame itself.
+        Frame g=f;g.action=0;const Unsafe hit_why=unsafe?WhyUnsafe(g):Unsafe::None;   // CameraSafe's reason
+        const bool soft=why==5&&input.safe&&!busy_now&&!unfocused&&!latch&&hit_why!=Unsafe::None&&
+            !HardRelease(hit_why)&&hit_why!=Unsafe::Damage;
+        const bool suspend=!soft&&(why>=5||unsafe||busy_now||unfocused||latch)&&controller.phase!=Phase::Idle;
+        if(unsafe&&controller.phase!=Phase::Idle&&hit_unsafe_log.Step(UnsafeName(hit_why),GetTickCount()))
+            RecordDiag({Diag::HitUnsafe,UnsafeName(hit_why),f.frame,0,0,uint8_t(suspend?1:0),controller.phase});
+        if(suspend)Suspend();
         return false;
     }
+    hit_unsafe_log.Step(nullptr,0);
     float desired=f.yaw;
     if(controller.phase==Phase::Locked){
         Vec target;

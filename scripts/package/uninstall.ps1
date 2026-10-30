@@ -10,7 +10,8 @@
     Reads <game>\LinkInRE4_Backup\installed.json and the backup's backup.json and journal.tsv (so an interrupted
     install or uninstall can be undone too). Before changing anything it checks every backed-up original against
     its sha256. Then it deletes each mod file whose hash is still the mod's (a file changed since the install is
-    left in place with a warning), moves every original back (.lfs files and loose originals), checks each one
+    left in place with a warning; an edited Bin32\link_runtime.ini moves to LinkInRE4_Backup as
+    link_runtime.ini.<hash>-user), moves every original back (.lfs files and loose originals), checks each one
     against backup.json, removes the folders the installer created and, when everything is back, the backup.
 
     Exit codes: 0 ok (or nothing installed), 1 unexpected error, 3 game folder not found, 7 game running,
@@ -267,7 +268,7 @@ function Invoke-Uninstall {
     } catch { Fail $EXIT_STATE $_.Exception.Message 'Unsafe game or backup path. Nothing was changed.' }
     if (-not (Test-File $statePath)) {
         $sets = @()
-        if ([System.IO.Directory]::Exists($backupRoot)) { $sets = @([System.IO.Directory]::GetDirectories($backupRoot)) }
+        if ([System.IO.Directory]::Exists($backupRoot)) { $sets = @([System.IO.Directory]::GetDirectories($backupRoot) | Where-Object { [IO.Path]::GetFileName($_) -notlike 'updater-*' }) }
         if ($sets.Count -gt 0) {
             Fail $EXIT_STATE ('Falta installed.json pero hay respaldos en ' + $backupRoot + '. No se cambió nada; revisa esa carpeta a mano.') `
                 ('installed.json is missing but ' + $backupRoot + ' holds backups. Nothing was changed; check that folder by hand.')
@@ -353,6 +354,15 @@ function Invoke-Uninstall {
             ('' + $broken.Count + ' backed-up originals are missing or damaged (e.g. ' + $broken[0] + '). Nothing was changed. Fallback: delete Bin32\dinput8.dll and Bin32\link_* and run Verify integrity in Steam.')
     }
 
+    # An interrupted updater snapshot fits only this install: a later updater must never restore it.
+    # An unreadable record cannot be restored either, so it never blocks the uninstall.
+    $transactionJson = Join-Path $backupRoot 'updater-transaction\transaction.json'
+    try { $transaction = Read-Json $transactionJson } catch { $transaction = $null }
+    if ($null -ne $transaction -and $transaction.PSObject.Properties['status'] -and $transaction.status -eq 'active') {
+        $transaction.status = 'uninstalled'
+        try { Write-JsonFile $transactionJson $transaction } catch { Warn 'No pude cerrar el registro del actualizador.' 'Could not retire the updater record.' }
+    }
+
     Say 'Quitando los archivos del mod...' 'Removing the mod files...'
     $kept = @{}
     $removed = 0
@@ -374,6 +384,13 @@ function Invoke-Uninstall {
         } elseif ($entries.ContainsKey($p) -and $current -eq $entries[$p].sha256) {
             continue
         } elseif (-not $placed.ContainsKey($p)) {
+            continue
+        } elseif ($p -eq 'Bin32/link_runtime.ini') {
+            # The player's settings (README section 2) leave the game folder so the uninstall can finish.
+            $copy = Join-Path $backupRoot ('link_runtime.ini.' + $current.Substring(0, 12) + '-user')
+            for ($n = 2; (Test-File $copy) -and (Get-Sha256 $copy) -ne $current; $n++) { $copy = Join-Path $backupRoot ('link_runtime.ini.' + $current.Substring(0, 12) + '.' + $n + '-user') }
+            if (Test-File $copy) { Remove-FileIfPresent $target } else { [System.IO.File]::Move($target, $copy) }
+            Say ('Tus ajustes de ' + $p + ' quedan en ' + $copy + '.') ('Your ' + $p + ' settings are kept as ' + $copy + '.') 'Yellow'
             continue
         } else {
             Warn ('Cambió desde la instalación; lo dejo como está: ' + $p) ('Changed since the install; left as it is: ' + $p)
@@ -450,7 +467,7 @@ function Invoke-Uninstall {
     Remove-FileIfPresent $statePath
     foreach ($name in @('installed.json.writing', 'uninstall.ps1', 'Uninstall-LinkInRE4.bat')) { Remove-FileIfPresent (Join-Path $backupRoot $name) }
     if ([System.IO.Directory]::Exists($backupRoot) -and @([System.IO.Directory]::GetFileSystemEntries($backupRoot)).Count -eq 0) {
-        [System.IO.Directory]::Delete($backupRoot)
+        try { [System.IO.Directory]::Delete($backupRoot) } catch { Warn ('Puedes borrar la carpeta vacía ' + $backupRoot + '.') ('You can delete the empty folder ' + $backupRoot + '.') }
     }
     Write-Host ''
     Say ('Listo: se quitaron ' + $removed + ' archivos del mod y se devolvieron ' + $entries.Count + ' originales. El juego quedó como antes de instalar Link in RE4.') `

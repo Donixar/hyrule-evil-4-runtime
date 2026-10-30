@@ -85,7 +85,9 @@ public:
         Decision d;
         if (!s.readable) { d.block = Block::Unreadable; return d; }
         if (!s.after_arbiter) { d.block = Block::WrongSamplePoint; return d; }
-        if (started_ && s.frame <= last_frame_) { d.block = Block::StaleFrame; return d; }
+        // A save load rewinds the counter (zt frame_gap delta=-3576): that frame still fails closed, then the
+        // trigger follows the new timeline instead of staying stale until the old value comes back.
+        if (started_ && s.frame <= last_frame_) { if (s.frame < last_frame_) last_frame_ = s.frame; d.block = Block::StaleFrame; return d; }
         started_ = true; last_frame_ = s.frame;
         const bool held = (s.on & layout::key_action) != 0;
         const bool pressed = (s.trg & layout::key_action) != 0;

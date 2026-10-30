@@ -78,7 +78,32 @@ function Test-NoLinks([string]$Path) {
     $current = [IO.Path]::GetFullPath($Path)
     while ($current) {
         if (Test-Path -LiteralPath $current) {
-            if ((Get-Item -LiteralPath $current -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+            $item = Get-Item -LiteralPath $current -Force
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                # OneDrive placeholders are reparse points, not links. PS 5.1 LinkType is also empty when a
+                # link denies read or listing (C:\Documents and Settings), so the tag is read from the parent
+                # listing: name surrogates (junction, symlink, mount point) and any unreadable reparse point fail.
+                if (@('Junction', 'SymbolicLink') -contains $item.LinkType) { return $false }
+                try {
+                    if (-not ('LinkInRE4Diag.ReparseTag' -as [type])) {
+                        Add-Type -Namespace LinkInRE4Diag -Name ReparseTag -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr FindFirstFileW(string name, IntPtr data);
+[DllImport("kernel32.dll")] static extern bool FindClose(IntPtr handle);
+// WIN32_FIND_DATAW: dwFileAttributes at 0, dwReserved0 (the reparse tag) at 36, 592 bytes in all.
+public static long Get(string path) {
+    IntPtr data = Marshal.AllocHGlobal(592);
+    try {
+        IntPtr handle = FindFirstFileW(path, data); if (handle == new IntPtr(-1)) return -1; FindClose(handle);
+        return (Marshal.ReadInt32(data, 0) & 0x400) != 0 ? (long)(uint)Marshal.ReadInt32(data, 36) : -1;
+    } finally { Marshal.FreeHGlobal(data); }
+}
+'@
+                    }
+                    $tag = [LinkInRE4Diag.ReparseTag]::Get($current.TrimEnd('\', '/'))
+                } catch { return $false }
+                if ($tag -lt 0 -or ($tag -band 0x20000000)) { return $false }
+                try { [void][IO.Directory]::EnumerateFileSystemEntries($current).GetEnumerator().MoveNext() } catch { return $false }
+            }
         }
         $parent = [IO.Path]::GetDirectoryName($current.TrimEnd('\', '/'))
         if ($parent -eq $current) { break }

@@ -13,6 +13,10 @@ namespace link_runtime::parry::sword::reader {
 inline uint32_t U32(const unsigned char* p) {uint32_t v;std::memcpy(&v,p,4);return v;}
 inline bool Range(uint32_t p,size_t n) {return p>=0x10000&&n&&uint64_t(p)+n<0x7fff0000;}
 inline bool Pointer(uint32_t p) {return Range(p,4)&&!(p&3);}
+// First rejected reader stage; diagnostics only, never an acceptance override.
+enum class ReadFailure:uint32_t {None,Slots,Character,Parts,ModelFlags,ModelChain,InfoFlags,Header,Resource,PartChain,
+    BodyMatrix,BoneMatrix,BindMatrix,InfoMatrix,Blade,ResourceChanged,Unstable,Identity};
+inline bool Reject(ReadFailure* failure,ReadFailure reason){if(failure)*failure=reason;return false;}
 struct Slots {uint32_t player,global;}; // Resolved by the existing native finder.
 struct Observation {
     uint32_t player=0,global=0,info=0,resource=0,part0=0,part10=0;
@@ -118,7 +122,7 @@ public:
     bool Matrix(uint32_t p,Mat34& out){
         float native[12]{};if(!Read(p,native,48))return false;
         for(unsigned i=0;i<3;++i)for(unsigned j=0;j<4;++j)out.v[i][j]=native[i*4+j];
-        return Rigid(out);
+        return Rigid(out,kPoseRigidTolerance);
     }
     bool Unchanged(){
         unsigned char now[80]{};
@@ -133,63 +137,83 @@ inline Identity IdentityOf(const Observation& o) {return {o.player,o.resource,o.
 // The walk both reads share, every word through Watched: owners, model resource header, part chain and the four
 // pose matrices. identify(header,found,manifest) names found.profile; a non-null manifest is hashed again after
 // BuildBlade (ReadObservation), a null one is not (ReadPose).
-template<class Memory,class Identify> bool Walk(Memory& memory,Slots slots,Observation& out,Identify&& identify) {
+template<class Memory,class Identify> bool Walk(Memory& memory,Slots slots,Observation& out,Identify&& identify,ReadFailure* failure=nullptr,bool guard_only=false) {
+    if(failure)*failure=ReadFailure::None;
     out={};Observation found;Watched<Memory> watch(memory);
     if(!Pointer(slots.player)||!Pointer(slots.global)||!watch.Word(slots.player,found.player)||!Pointer(found.player)||
-       !watch.Word(slots.global,found.global)||!Pointer(found.global))return false;
+       !watch.Word(slots.global,found.global)||!Pointer(found.global))return Reject(failure,ReadFailure::Slots);
     uint32_t character=0,model_flags=0;unsigned char parts=0;
-    if(!watch.Word(found.global+0x4fc8,character)||(character&255)!=0||((character>>8)&255)>3||
-       !watch.Read(found.player+0x102,&parts,1)||parts!=119||!watch.Word(found.player+4,model_flags)||(model_flags&0x4000))return false;
+    if(!watch.Word(found.global+0x4fc8,character)||(character&255)!=0||((character>>8)&255)>3)return Reject(failure,ReadFailure::Character);
+    if(!watch.Read(found.player+0x102,&parts,1)||parts!=119)return Reject(failure,ReadFailure::Parts);
+    if(!watch.Word(found.player+4,model_flags)||(model_flags&0x4000))return Reject(failure,ReadFailure::ModelFlags);
     uint32_t nodes[16]{},node=0;unsigned count=0;
-    if(!watch.Word(found.player+0x15c,node))return false;
+    if(!watch.Word(found.player+0x15c,node))return Reject(failure,ReadFailure::ModelChain);
     while(node){
-        if(count==16||!Pointer(node))return false;
-        for(unsigned i=0;i<count;++i)if(nodes[i]==node)return false;
-        nodes[count++]=node;if(!watch.Word(node+0x14,node))return false;
+        if(count==16||!Pointer(node))return Reject(failure,ReadFailure::ModelChain);
+        for(unsigned i=0;i<count;++i)if(nodes[i]==node)return Reject(failure,ReadFailure::ModelChain);
+        nodes[count++]=node;if(!watch.Word(node+0x14,node))return Reject(failure,ReadFailure::ModelChain);
     }
-    if(count<3)return false;found.info=nodes[2];uint32_t info_flags=0;
+    if(count<3)return Reject(failure,ReadFailure::ModelChain);found.info=nodes[2];uint32_t info_flags=0;
     unsigned char header[80]{};
-    if(!watch.Word(found.info+4,info_flags)||(info_flags&2)||!(info_flags&8)||
-       !watch.Word(found.info+0xc,found.resource)||!Pointer(found.resource)||!watch.Read(found.resource,header,80)||
-       header[0x18]!=1||header[0x19]!=119||(header[0x1a]!=1&&header[0x1a]!=2)||header[0x1b]!=0||header[0x2a]!=1||header[0x2b]!=0)return false;
+    if(!watch.Word(found.info+4,info_flags)||(info_flags&2)||(!guard_only&&!(info_flags&8)))return Reject(failure,ReadFailure::InfoFlags);
+    if(!watch.Word(found.info+0xc,found.resource)||!Pointer(found.resource)||!watch.Read(found.resource,header,80)||
+       header[0x18]!=1||header[0x19]!=119||(header[0x1a]!=1&&header[0x1a]!=2)||header[0x1b]!=0||header[0x2a]!=1||header[0x2b]!=0)return Reject(failure,ReadFailure::Header);
     const DigestRange* manifest=nullptr;
-    if(!identify(header,found,manifest))return false;
+    if(!identify(header,found,manifest))return Reject(failure,ReadFailure::Resource);
     uint32_t part=0,visited[11]{};
-    if(!watch.Word(found.player+0xf4,part))return false;
+    if(!watch.Word(found.player+0xf4,part))return Reject(failure,ReadFailure::PartChain);
     for(unsigned i=0;i<11;++i){
-        if(!Pointer(part))return false;
-        for(unsigned j=0;j<i;++j)if(visited[j]==part)return false;
+        if(!Pointer(part))return Reject(failure,ReadFailure::PartChain);
+        for(unsigned j=0;j<i;++j)if(visited[j]==part)return Reject(failure,ReadFailure::PartChain);
         visited[i]=part;
-        if(i<10&&!watch.Word(part+0xf4,part))return false;
+        if(i<10&&!watch.Word(part+0xf4,part))return Reject(failure,ReadFailure::PartChain);
     }
     found.part0=visited[0];found.part10=visited[10];
-    if(!watch.Matrix(found.part0+0xc,found.pose.body0)||!watch.Matrix(found.part10+0xc,found.pose.bone10)||
-       !watch.Matrix(found.part10+0xf8,found.pose.inverse_bind10)||!watch.Matrix(found.info+0x5c,found.pose.info))return false;
-    const Binding binding{119,1,1,10,100,true,model_flags,info_flags};
-    if(!BuildBlade(found.profile,found.pose,binding,found.blade)||(manifest&&!MatchResource(memory,header,manifest))||
-       !watch.Unchanged())return false;
+    if(!guard_only) {
+        if(!watch.Matrix(found.part0+0xc,found.pose.body0))return Reject(failure,ReadFailure::BodyMatrix);
+        if(!watch.Matrix(found.part10+0xc,found.pose.bone10))return Reject(failure,ReadFailure::BoneMatrix);
+        if(!watch.Matrix(found.part10+0xf8,found.pose.inverse_bind10))return Reject(failure,ReadFailure::BindMatrix);
+        if(!watch.Matrix(found.info+0x5c,found.pose.info))return Reject(failure,ReadFailure::InfoMatrix);
+        const Binding binding{119,1,1,10,100,true,model_flags,info_flags};
+        if(!BuildBlade(found.profile,found.pose,binding,found.blade))return Reject(failure,ReadFailure::Blade);
+    }
+    if(manifest&&!MatchResource(memory,header,manifest))return Reject(failure,ReadFailure::ResourceChanged);
+    if(!watch.Unchanged())return Reject(failure,ReadFailure::Unstable);
     out=found;return true; // Stable read only; no pose/attack synchronization claim.
 }
-template<class Memory> bool ReadObservation(Memory& memory,Slots slots,Observation& out) {
+template<class Memory> bool ReadIdentified(Memory& memory,Slots slots,Observation& out,ReadFailure* failure,bool guard_only) {
     return Walk(memory,slots,out,[&](const unsigned char* header,Observation& found,const DigestRange*& manifest) {
         if(header[0x1a]==1&&MatchResource(memory,header,kCampaignPl00)){found.profile=Profile::CampaignPl00;manifest=kCampaignPl00;}
         else if(header[0x1a]==2&&MatchResource(memory,header,kOrdon)){found.profile=Profile::Ordon;manifest=kOrdon;}
         else if(header[0x1a]==2&&MatchResource(memory,header,kMaster)){found.profile=Profile::MasterSword;manifest=kMaster;}
         else return false;
         return true;
-    });
+    },failure,guard_only);
+}
+template<class Memory> bool ReadObservation(Memory& memory,Slots slots,Observation& out,ReadFailure* failure=nullptr) {
+    return ReadIdentified(memory,slots,out,failure,false);
+}
+// Geometry-free guard for a fresh held tier-2 press during draw. Retains all owner/model,
+// resource hashes and stable-read checks; only visibility and matrices are not required.
+// This type cannot be used as blade geometry or as a completed epoch observation.
+struct Guard {uint32_t player=0,global=0,resource=0;Profile profile=Profile::Unknown;};
+template<class Memory> bool ReadGuard(Memory& memory,Slots slots,Guard& out) {
+    out={};Observation found;
+    if(!ReadIdentified(memory,slots,found,nullptr,true))return false;
+    out={found.player,found.global,found.resource,found.profile};return true;
 }
 // Per-frame re-read after a full ReadObservation (the sword trail samples every frame of a spin): the same walk,
 // matrices and Watched re-check, but the resource is accepted by identity (same player, resource address and
 // material count as `known`) instead of hashed again. No bcrypt call.
-template<class Memory> bool ReadPose(Memory& memory,Slots slots,const Identity& known,Observation& out) {
+template<class Memory> bool ReadPose(Memory& memory,Slots slots,const Identity& known,Observation& out,ReadFailure* failure=nullptr) {
+    if(failure)*failure=ReadFailure::None;
     out={};
-    if(known.profile==Profile::Unknown||!known.player||!known.resource)return false;
+    if(known.profile==Profile::Unknown||!known.player||!known.resource)return Reject(failure,ReadFailure::Identity);
     const unsigned char materials=known.profile==Profile::CampaignPl00?1:2;
     return Walk(memory,slots,out,[&](const unsigned char* header,Observation& found,const DigestRange*&) {
         if(found.player!=known.player||found.resource!=known.resource||header[0x1a]!=materials)return false;
         found.profile=known.profile;return true;
-    });
+    },failure);
 }
 // Callable in-process adapter. Does not install itself, call native code or write.
 struct ProcessMemory {
@@ -197,5 +221,5 @@ struct ProcessMemory {
         SIZE_T read=0;return Range(at,n)&&ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<const void*>(at),out,n,&read)&&read==n;
     }
 };
-inline bool ObserveCurrent(Slots slots,Observation& out){ProcessMemory memory;return ReadObservation(memory,slots,out);}
+inline bool ObserveCurrent(Slots slots,Observation& out,ReadFailure* failure=nullptr){ProcessMemory memory;return ReadObservation(memory,slots,out,failure);}
 } // namespace link_runtime::parry::sword::reader

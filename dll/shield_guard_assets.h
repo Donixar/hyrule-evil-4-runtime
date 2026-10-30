@@ -17,6 +17,15 @@ inline constexpr ClipFiles kClips[3]={
     {{L"link_shield_guard_break.fcv",353632u,"ea5312a2214074d517470bd78f99558d61d98d57c331c0f19e0d6f37f9595d3e"},
      {L"link_shield_guard_break.seq",160u,"99a8714b6adaf711d507112a107abc11cdb103feaea25f39df40f8253c295d4c"}},
 };
+// shield-fk-guard-01: the same clips with part 16 parent-relative, for primaries without the left-arm IK chain.
+inline constexpr ClipFiles kClipsFk[3]={
+    {{L"link_shield_guard_fk.fcv",66656u,"ecc6f93d8f64a7eba1abe89f12e39af3db7a0deaeb3b6f569d5b157e3377ed61"},
+     {L"link_shield_guard_fk.seq",64u,"e34c5442db0e8be8307f95d2b62c8286b810c6a8731dd398035eb4e3b98b54dd"}},
+    {{L"link_shield_guard_hit_fk.fcv",104288u,"35001e69dbd5b1187fc2c572cb26c9362dd79fbc1e9791a6885c7fb43c658d52"},
+     {L"link_shield_guard_hit_fk.seq",64u,"b993c4a35148f508b3f9c932afcbb881872128909e284908de38911836cf4ee4"}},
+    {{L"link_shield_guard_break_fk.fcv",330080u,"0fcd18b67cd3b27147eb012e4480f174a4cb9c58b34614e4997b20c409ce7dd8"},
+     {L"link_shield_guard_break_fk.seq",160u,"99a8714b6adaf711d507112a107abc11cdb103feaea25f39df40f8253c295d4c"}},
+};
 // Per costume 0..3: the installed body print (shield_guard.h FingerprintParts: combined, the five header words with
 // 0x40 as an offset, the positions FNV; the parts name the differing field in the refusal log), the hand and none
 // variants. shield-guard-02: hand variants rebuilt with the TP weaponR guard placement (scripts/shield_guard_assets.py).

@@ -29,8 +29,11 @@
 #include "parry_audio.h"
 #include "parry_spark_runtime.h"
 #include "parry_general_runtime.h"
+#include "parry_line.h"
+#include "parry_direct_runtime.h"
 #include "ocarina_session.h"
 #include "ocarina_voice.h"
+#include "ocarina_pitch_assets.h"
 #include "ocarina_freeze.h"
 #include "ocarina_mount.h"
 #include "ocarina_weapon.h"
@@ -282,9 +285,9 @@ static bool StartDamageHook(unsigned char* base, unsigned image_size, unsigned l
     Log("Damage hook knife caller_rva=0x%X slots=%u", static_cast<unsigned>(caller_rva), player_slot && global_slot ? 1U : 0U);
     if (!trace && !adapter) { Log("no valid damage feature/trace; no damage hook installed"); return false; }
     MH_STATUS status = MH_Initialize();
-    // The combat adapter also accepts a MinHook already initialised by an earlier feature.
+    // The trace and the combat adapter both accept a MinHook already initialised by an earlier feature (e.g. CaseKeyDebounce).
     const bool own_minhook = status == MH_OK;
-    if (status != MH_OK && !(adapter && status == MH_ERROR_ALREADY_INITIALIZED)) { Log("TraceKnife disabled: MinHook init %s", MH_StatusToString(status)); return false; }
+    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) { Log("TraceKnife disabled: MinHook init %s", MH_StatusToString(status)); return false; }
     status = MH_CreateHook(target, reinterpret_cast<void*>(&TraceDamage), reinterpret_cast<void**>(&g_damage_original));
     if (status != MH_OK) {
         Log("TraceKnife disabled: MinHook create %s", MH_StatusToString(status)); if (own_minhook) MH_Uninitialize(); return false;
@@ -345,6 +348,13 @@ static volatile LONG g_parry_spark_submitted=0;
 static volatile LONG g_parry_defense_active=0,g_parry_attempts=0,g_parry_committed=0,g_parry_partial=0;
 // Tier 2 (general block, docs/parry-two-tier-2026-10-12.md): settings fixed before the resolver.
 static link_runtime::parry::general::Runtime g_gen;
+static void __cdecl ParryDirectAudio(){g_parry_audio.Publish(true,GetTickCount64());}
+static bool g_parry_line_requested=true;
+static bool __cdecl ResolveParryLine(const link_runtime::parry::Candidate& candidate){
+    if(!link_runtime::parry::line::Resolve(candidate))return false;
+    g_parry_audio.Publish(true,GetTickCount64());
+    return true;
+}
 static uint32_t g_parry_window_ms=link_runtime::defense::kParryWindowDefault;   // ParryWindowMs, read before the transport starts
 static void CombatCommitted(const link_runtime::parry::Candidate& candidate,LONG serial);
 static void CombatGeneralBlocked(uint32_t serial,uint32_t owner_id);
@@ -378,6 +388,7 @@ static bool __cdecl ResolveParry(const link_runtime::parry::Candidate& candidate
     bool handoff=false;
     if(g_gen.settings.mode!=g::Mode::Off&&g::TierTwoRuns(tier_one,handoff)){
         const auto applied=g::Resolve(g_gen,candidate,handoff);
+        link_runtime::parry::direct::ShareTierTwo(g_gen,candidate,applied);
         if(applied.cancel&&applied.effects&&!applied.grace){   // a grace block is the same parry: sparks only
             g_parry_audio.Publish(true,GetTickCount64());
             CombatGeneralBlocked(applied.serial,applied.owner_id);   // Link's reaction only; no riposte, no stagger
@@ -389,6 +400,8 @@ static bool __cdecl ResolveParry(const link_runtime::parry::Candidate& candidate
     return GuardResolve(candidate);
 }
 static void StopParryObservation() {
+    link_runtime::parry::direct::Stop();
+    link_runtime::parry::line::Stop();
     InterlockedExchange(&g_parry_defense_active,0);
     link_runtime::parry::observation::Stop();
     const auto pose=link_runtime::parry::sword::epoch::Stop();
@@ -480,6 +493,18 @@ static bool StartParryObservation(const link_runtime::shield::NativeAccess& nati
     if(status!=MH_OK) {
         StopParryObservation();Log("ParryObserve disabled: hook startup %s",MH_StatusToString(status));return false;
     }
+    p::direct::on_block=ParryDirectAudio;
+    for(unsigned i=0;i<p::direct::kCount;++i){
+        const auto route=static_cast<p::direct::Route>(i);
+        const auto direct_status=p::direct::Start(g_gen,route);
+        Log("ParryDirect ready route=%s ok=%u enabled=%u status=%s",p::direct::kSpecs[i].name,
+            direct_status==MH_OK?1U:0U,p::direct::requested[i]?1U:0U,MH_StatusToString(direct_status));
+    }
+    if(g_parry_line_requested){
+        const auto line_status=p::line::Start(g_gen,ResolveParryLine);
+        Log("ParryLine ready=%u site=0x3007FE deflect=%u status=%s (needs active tier 2, thrown and exact native pins)",
+            line_status==MH_OK?1U:0U,p::line::deflect?1U:0U,MH_StatusToString(line_status));
+    }else Log("ParryLine ready=0 reason=config");
     Log("Parry transport ready; input_window_ms=%u active_requested=%u routes=axe%s",trial_window_ms,defense_requested?1U:0U,owner.suki?",suki":"");return true;
 }
 static void PollParryObservation(DWORD& previous) {
@@ -489,11 +514,11 @@ static void PollParryObservation(DWORD& previous) {
     if(const unsigned lost=link_runtime::parry::general::dropped.exchange(0))Log("parry general records dropped=%u",lost);
     for(unsigned i=0;i<32&&o::Pop(r);++i){
         LogV("parry observe kind=%u reasons=0x%X flags=0x%X thread=%u frame=%u input_frame=%u owner_frame=%u completed_frame=%u "
-            "pose_ready=%u pose_poisoned=%u depth=%u serial=%llu profile=%u room=0x%X weapon=%u character=%u "
+            "pose_ready=%u pose_poisoned=%u depth=%u serial=%llu profile=%u room=0x%X weapon=%u character=%u pose_failure=%u pose_reader_failure=%u "
             "input_on=0x%llX input_trg=0x%llX window_age_ms=%llu remaining_ms=%u "
             "producer_return_rva=0x%X owner_weapon=%u owner_r1=0x%X blade_base=%.3f,%.3f,%.3f blade_tip=%.3f,%.3f,%.3f observer_only=1",
             static_cast<unsigned>(r.kind),r.reasons,r.flags,r.thread,r.frame,r.input_frame,r.owner_frame,r.completed_frame,
-            r.epoch_ready,r.epoch_poisoned,r.epoch_depth,r.epoch_serial,r.profile,r.room,r.weapon,r.character,
+            r.epoch_ready,r.epoch_poisoned,r.epoch_depth,r.epoch_serial,r.profile,r.room,r.weapon,r.character,r.epoch_failure,r.epoch_reader_failure,
             r.on,r.trg,r.window_age_ms,r.window_remaining_ms,r.producer_return_rva,r.owner_weapon_type,static_cast<unsigned>(r.owner_routines[1]),
             r.blade_base[0],r.blade_base[1],r.blade_base[2],r.blade_tip[0],r.blade_tip[1],r.blade_tip[2]);
         if(r.kind==o::Kind::Candidate||r.kind==o::Kind::AttackSample){
@@ -696,6 +721,9 @@ static wchar_t g_crash_dir[MAX_PATH]{};
 static link_runtime::crash_dump::Range g_crash_winmm{},g_crash_bio4{};
 static uint32_t g_crash_winmm_base=0,g_crash_winmm_size=0,g_crash_bio4_base=0,g_crash_bio4_size=0;
 static volatile LONG g_crash_taken=0;
+// XAudio2_7.dll code: filled once by the worker (CrashDumpPollAudio) when the game has loaded it; size last.
+static link_runtime::crash_dump::Range g_crash_xaudio{};static uint32_t g_crash_xaudio_base=0;
+static volatile LONG g_crash_xaudio_size=0;
 static link_runtime::crash_dump::Range CrashCodeRange(HMODULE m,uint32_t& image_size){
     link_runtime::crash_dump::Range r{};image_size=0;if(!m)return r;
     const auto* p=reinterpret_cast<const unsigned char*>(m);
@@ -713,6 +741,8 @@ static void CrashWhere(uint32_t a,char* out,size_t n){
         _snprintf_s(out,n,_TRUNCATE,"winmm+0x%X",a-g_crash_winmm_base);
     else if(g_crash_bio4_base&&a>=g_crash_bio4_base&&a-g_crash_bio4_base<g_crash_bio4_size)
         _snprintf_s(out,n,_TRUNCATE,"bio4+0x%X",a-g_crash_bio4_base);
+    else if(g_crash_xaudio_size&&a>=g_crash_xaudio_base&&a-g_crash_xaudio_base<static_cast<uint32_t>(g_crash_xaudio_size))
+        _snprintf_s(out,n,_TRUNCATE,"xaudio+0x%X",a-g_crash_xaudio_base);
     else _snprintf_s(out,n,_TRUNCATE,"0x%08X",a);
 }
 static LONG CALLBACK CrashDumpHandler(EXCEPTION_POINTERS* info){
@@ -720,7 +750,8 @@ static LONG CALLBACK CrashDumpHandler(EXCEPTION_POINTERS* info){
     if(!info||!info->ExceptionRecord||!info->ContextRecord)return EXCEPTION_CONTINUE_SEARCH;
     const uint32_t code=info->ExceptionRecord->ExceptionCode;
     const uint32_t at=static_cast<uint32_t>(reinterpret_cast<uintptr_t>(info->ExceptionRecord->ExceptionAddress));
-    const c::Kind kind=c::Classify(code,at,g_crash_winmm,g_crash_bio4);
+    const c::Range xaudio=g_crash_xaudio_size?g_crash_xaudio:c::Range{};
+    const c::Kind kind=c::Classify(code,at,g_crash_winmm,g_crash_bio4,xaudio);
     // One dump per process; the flag also stops recursion if anything below faults.
     if(kind==c::Kind::None||InterlockedCompareExchange(&g_crash_taken,1,0)!=0)return EXCEPTION_CONTINUE_SEARCH;
     const CONTEXT& x=*info->ContextRecord;uint32_t top=0;const bool top_ok=CrashReadStack(x.Esp,top);
@@ -761,6 +792,16 @@ static void CrashDumpInstall(const wchar_t* ini){
     const bool added=AddVectoredExceptionHandler(0,&CrashDumpHandler)!=nullptr;
     Log("crash_dump on handler=%u dbghelp=%u winmm_code=0x%08X+0x%X bio4_code=0x%08X+0x%X",added?1U:0U,g_crash_write?1U:0U,
         g_crash_winmm.base,g_crash_winmm.size,g_crash_bio4.base,g_crash_bio4.size);
+}
+// XAudio2_7.dll arrives after CrashDumpInstall: look for it every 2 s until found (worker thread, never in the handler).
+static void CrashDumpPollAudio(){
+    static uint64_t next=0;if(!g_crash_write||g_crash_xaudio_size)return;
+    const uint64_t now=GetTickCount64();if(now<next)return;next=now+2000;
+    const HMODULE xa=GetModuleHandleW(L"XAudio2_7.dll");if(!xa)return;
+    uint32_t image=0;const link_runtime::crash_dump::Range r=CrashCodeRange(xa,image);if(!r.size)return;
+    g_crash_xaudio=r;g_crash_xaudio_base=static_cast<uint32_t>(reinterpret_cast<uintptr_t>(xa));
+    InterlockedExchange(&g_crash_xaudio_size,static_cast<LONG>(image));
+    Log("crash_dump xaudio_code=0x%08X+0x%X",r.base,r.size);
 }
 // FpsProbe: logic ticks per real second (+0x530C) and simulation speed (sum of deltaTime/30 per
 // real second; 1.00 = real time, below 1 the PC cannot hold the fixed step and the game slows).
@@ -1139,10 +1180,10 @@ static unsigned char* g_oca_bin=nullptr;
 static unsigned char* g_oca_tpl[4]{};
 static oca::OcarinaAsset g_oca_asset[4];
 static bool g_oca_asset_tried[4]{};
-static unsigned char* OcaResident(const wchar_t* directory,const OcaFile& file){
+static unsigned char* OcaResident(const wchar_t* directory,const OcaFile& file,bool quiet=false){
     std::vector<unsigned char> bytes;unsigned char digest[32]{};
     if(!MortalRead(directory,file.name,file.size,bytes)||!mortal::resident_assets::detail::Hash(bytes.data(),bytes.size(),digest)||
-       !mortal::resident_assets::detail::Matches(digest,file.sha)){Log("Ocarina asset missing or changed: %ls",file.name);return nullptr;}
+       !mortal::resident_assets::detail::Matches(digest,file.sha)){if(!quiet)Log("Ocarina asset missing or changed: %ls",file.name);return nullptr;}
     auto* out=static_cast<unsigned char*>(VirtualAlloc(nullptr,file.size,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
     if(out)std::memcpy(out,bytes.data(),file.size);
     return out;
@@ -1481,6 +1522,11 @@ static int __cdecl FairyLifeDownDetour(void* em,int damage,int rnd,int flag){
         ret_rva+g_fairy_base,link_runtime::shield::runtime::current_scope);
     const DWORD after=GetLastError();
     const int out=g_fairy.Leave(host,entry,result);
+    // Every life-down on Link with its caller: a live check attributes damage (which attack landed after a parry)
+    // instead of guessing from lock or HUD side effects. LifeDownSet2 also takes enemies' damage (em10DmCk, the
+    // riposte): only Link's own entries are logged.
+    if(entry.player)Log("life_down ret=0x%X damage=%d rnd=%d flag=0x%X hp=%d out=%d em=0x%08X player=1",
+        ret_rva,damage,rnd,flag,result,out,reinterpret_cast<uint32_t>(em));
     SetLastError(after);
     return out;
 }
@@ -1800,6 +1846,9 @@ static OcaSongFlow g_oca_song;
 static bool g_oca_staff_on=false;
 static unsigned char* g_oca_staff_block=nullptr;
 static const OcaFile kOcaStaffBlock={L"link_ocarina_staff.eff",672,"886af2cd6cdcc5b446f4692837d3cebab8fefc8028a568b0729ae03c21874385"};
+// Chromatic staff (29-oct, scripts/ocarina_staff.py chromatic): the same 6 frames plus 22 chromatic note frames appended
+// to 07000000 at 369..390. With the 6-frame block the staff still works and only the chromatic notes stay hidden.
+static const OcaFile kOcaStaffBlockChroma={L"link_ocarina_staff.eff",1792,"0c8cb9da7bf0d666ea50dab2974f8cd216eec28af4d946654994d011b7ecded9"};
 struct OcaStaffNative {   // IdSys 0x859788: set 0x4449, kill 0xCE9B, unitPtr 0x95F7; IdTexDataLoad 0x1F46, IdTexRelease 0xBF50
     uint32_t base=g_oca_base;
     bool Read(uint32_t a,void* out,size_t n){return a&&OcaCopy(a,static_cast<unsigned char*>(out),n);}
@@ -2077,7 +2126,7 @@ static void __cdecl OcarinaDecide(mortal::dispatch::Runtime& run,void* player){
     ocr::Pad pad;pad.connected=((packed>>48)&1)!=0;pad.buttons=static_cast<uint16_t>(packed);
     pad.lx=static_cast<int16_t>(packed>>16);pad.ly=static_cast<int16_t>(packed>>32);
     const uint64_t right=g_oca_pad_right.load(std::memory_order_acquire);
-    pad.rx=static_cast<int16_t>(right);pad.ry=static_cast<int16_t>(right>>16);
+    pad.rx=static_cast<int16_t>(right);pad.ry=static_cast<int16_t>(right>>16);pad.rt=static_cast<uint8_t>(right>>40);
     const auto raw=ocr::Assemble(g_oca_cfg.keys,[](uint8_t vk){return (GetAsyncKeyState(vk)&0x8000)!=0;},pad,g_oca_cfg.pad,g_oca_cfg.pad_n64);
     auto events=g_oca_keys.Poll(raw,focused);
     if(g_oca_cfg.item&&g_oca_use.TakeToggle(gameplay,g_oca_epoch.Current())){events.toggle=true;OcaRecordPush(6,"use toggles");}
@@ -2333,6 +2382,8 @@ static sg::BodySwap g_sg_swap;
 static uint32_t g_sg_refused_key=0;   // shield-guard-02: last fingerprint refusal logged (costume, field)
 static link_runtime::parry::general::Follow g_sg_follow;
 static unsigned char* g_sg_fcv[3]{};static unsigned char* g_sg_seq[3]{};
+static unsigned char* g_sg_fcv_fk[3]{};static unsigned char* g_sg_seq_fk[3]{};static bool g_sg_fk_ok=false;   // shield-fk-guard-01
+static sg::ClipVariant g_sg_use=sg::ClipVariant::Effector,g_sg_running=sg::ClipVariant::Effector;   // for the next install / installed
 alignas(16) static unsigned char g_sg_work[0x200];
 static unsigned char* g_sg_bin[4][2]{};           // [costume][0 hand, 1 none], page aligned, never released
 static sg::Variant g_sg_variant[4][2];
@@ -2352,18 +2403,23 @@ static void GuardSound(uint8_t code){
     if(w-g_sg_sound_r.load(std::memory_order_acquire)>=16)return;
     g_sg_sounds[w%16]=code;g_sg_sound_w.store(w+1,std::memory_order_release);
 }
-static bool GuardSecondaryInit(uint32_t player,sg::Clip clip){
-    __try{reinterpret_cast<RxInit>(g_cmb_base+0x2611A0)(reinterpret_cast<void*>(player),g_sg_work,g_sg_fcv[int(clip)],g_sg_seq[int(clip)],0,0,0.f,0);return true;}
+static bool GuardSecondaryInit(uint32_t player,sg::Clip clip,bool fk){
+    unsigned char* const f=fk?g_sg_fcv_fk[int(clip)]:g_sg_fcv[int(clip)];unsigned char* const q=fk?g_sg_seq_fk[int(clip)]:g_sg_seq[int(clip)];
+    __try{reinterpret_cast<RxInit>(g_cmb_base+0x2611A0)(reinterpret_cast<void*>(player),g_sg_work,f,q,0,0,0.f,0);return true;}
     __except(EXCEPTION_EXECUTE_HANDLER){return false;}
 }
 // shield_guard.h Port: the reaction port's exact install contract (CmbReactionPort) on our own work.
 struct GuardPort {
     bool Install(uint32_t player,sg::Clip clip,uint32_t& work){
-        const int i=int(clip);if(!g_sg_fcv[i]||!g_sg_seq[i])return false;
+        // The guard install takes the variant this primary needs; hit and break keep the running layer's variant.
+        const sg::ClipVariant v=clip==sg::Clip::Guard?g_sg_use:g_sg_running;const bool fk=v==sg::ClipVariant::Fk;
+        const int i=int(clip);
+        if(fk?(!g_sg_fcv_fk[i]||!g_sg_seq_fk[i]):(!g_sg_fcv[i]||!g_sg_seq[i]))return false;
         float weight=0.f;std::memcpy(&weight,g_sg_work+0xC8,4);
         std::memset(g_sg_work,0,sizeof(g_sg_work));
         uint32_t flags=0x10000000U;std::memcpy(g_sg_work+0x44,&flags,4);
-        if(!GuardSecondaryInit(player,clip))return false;
+        if(!GuardSecondaryInit(player,clip,fk))return false;
+        g_sg_running=v;
         std::memcpy(&flags,g_sg_work+0x44,4);flags&=~0x10000000U;std::memcpy(g_sg_work+0x44,&flags,4);
         const float one=1.f;std::memcpy(g_sg_work+0xC0,&one,4);
         if(clip==sg::Clip::Guard)weight=0.f;
@@ -2397,6 +2453,12 @@ static void StartGuard(const wchar_t* directory){
         clips&=CmbResident(directory,c.fcv.name,c.fcv.size,c.fcv.sha,g_sg_fcv[i])&&CmbResident(directory,c.seq.name,c.seq.size,c.seq.sha,g_sg_seq[i]);
     }
     if(!clips){Log("ShieldGuard disabled: link_shield_guard*.fcv/.seq missing or changed");return;}
+    g_sg_fk_ok=true;
+    for(unsigned i=0;i<3;++i){
+        const auto& c=sga::kClipsFk[i];
+        g_sg_fk_ok&=CmbResident(directory,c.fcv.name,c.fcv.size,c.fcv.sha,g_sg_fcv_fk[i])&&CmbResident(directory,c.seq.name,c.seq.size,c.seq.sha,g_sg_seq_fk[i]);
+    }
+    if(!g_sg_fk_ok)Log("ShieldGuard fk clips missing or changed (link_shield_guard*_fk.fcv/.seq): no guard over primaries without arm IK");
     g_sg_native_ok=PinsAt(g_cmb_base,link_runtime::native_pins::kOcarinaMount);
     unsigned bodies=0;
     for(unsigned c=0;c<4&&g_sg_native_ok;++c){
@@ -2406,8 +2468,8 @@ static void StartGuard(const wchar_t* directory){
     g_sg_dur.Configure(g_cmb.guard.blocks,g_cmb.guard.regen_seconds);
     g_sg_layer=new sg::GuardLayer();
     g_sg_on=true;
-    Log("ShieldGuard ready=1 blocks=%u regen_s=%u body_variants=%u/8 native=%u tier3=%s problems=%u",g_sg_dur.Max(),g_cmb.guard.regen_seconds,
-        bodies,g_sg_native_ok?1U:0U,g_gen.settings.mode!=link_runtime::parry::general::Mode::Off?"after_tier2":"needs_ParryGeneralBlock",g_cmb.guard_problems);
+    Log("ShieldGuard ready=1 blocks=%u regen_s=%u body_variants=%u/8 native=%u fk=%u tier3=%s problems=%u",g_sg_dur.Max(),g_cmb.guard.regen_seconds,
+        bodies,g_sg_native_ok?1U:0U,g_sg_fk_ok?1U:0U,g_gen.settings.mode!=link_runtime::parry::general::Mode::Off?"after_tier2":"needs_ParryGeneralBlock",g_cmb.guard_problems);
 }
 static const sg::Variant* GuardVariant(unsigned costume,unsigned k){
     if(costume>3||!g_sg_bin[costume][k])return nullptr;
@@ -2483,24 +2545,50 @@ static void GuardTick(uint32_t frame,const CmbPlayer& p,bool player,void* model)
     if(player&&g_sg_wanted&&arm_ik!=g_sg_arm_ik_logged){
         g_sg_arm_ik_logged=arm_ik;
         CmbLog("shield_guard primary arm_ik=%d motion=0x%08X%s",arm_ik,CmbGet<uint32_t>(reinterpret_cast<uint32_t>(model)+sg::kPrimaryMotion),
-            arm_ik==1?"":" (layer held back: the hand would not be an IK effector)");
+            arm_ik==1?" (ik clips)":arm_ik==0&&g_sg_fk_ok?" (fk clips: the hand is not an IK effector)":" (layer held back: no clip variant for this primary)");
     }
-    w.blocked=!player||p.damaged||!gameplay||scene||mortal::dispatch_hooks::runtime.active||g_oca_session.state()!=oca::State::Idle||arm_ik!=1;
+    const sg::ClipVariant variant=sg::VariantFor(arm_ik,g_sg_fk_ok);
+    if(variant!=sg::ClipVariant::None)g_sg_use=variant;
+    const bool mismatch=sg::VariantMismatch(g_sg_layer->phase()!=sg::Phase::Idle,g_sg_running,variant);
+    w.blocked=!player||p.damaged||!gameplay||scene||mortal::dispatch_hooks::runtime.active||g_oca_session.state()!=oca::State::Idle||
+        variant==sg::ClipVariant::None||mismatch;
     GuardPort port;
     w.lent=g_rx&&g_rx->Active()&&port.Secondary(w.player)!=g_sg_layer->Work();
     const sg::Phase before=g_sg_layer->phase();const sg::Clip clip_before=g_sg_layer->clip();
     g_sg_layer->Tick(w,port);g_sg_last_tick=GetTickCount64();
     if(before!=g_sg_layer->phase()||clip_before!=g_sg_layer->clip()){
         const auto& s=g_sg_layer->stats();
-        CmbLog("shield_guard layer %s->%s clip=%s frame=%u installs=%u lost=%u refused=%u failed=%u lent=%u contested=%u",
-            sg::PhaseName(before),sg::PhaseName(g_sg_layer->phase()),sg::ClipName(g_sg_layer->clip()),frame,s.installs,s.lost_owner,
+        CmbLog("shield_guard layer %s->%s clip=%s variant=%s frame=%u installs=%u lost=%u refused=%u failed=%u lent=%u contested=%u",
+            sg::PhaseName(before),sg::PhaseName(g_sg_layer->phase()),sg::ClipName(g_sg_layer->clip()),sg::VariantName(g_sg_running),frame,s.installs,s.lost_owner,
             s.refused,s.install_failed,s.lent,s.contested);
     }
     // The body swap follows on frames where the player object is the one we know; a room/player change
     // first drops the lease (Restore detects it) and the native body of the new room is untouched until
     // the next wanted placement.
     const bool shield_action=g_sg_supported&&!p.damaged&&SwordShieldInHand();
-    const sg::Placement want=sg::Want(g_sg_supported&&!scene,broken,g_sg_wanted,g_sg_layer->Weight(),shield_action);
+    // A primary with no clip variant (unreadable, or no arm IK and the FK clips missing) can't play the guard: keep the
+    // shield on the back instead of hanging it in the hand with no pose (the rear shield keeps working there).
+    const sg::Placement want=sg::Want(g_sg_supported&&!scene,broken,g_sg_wanted&&variant!=sg::ClipVariant::None,g_sg_layer->Weight(),shield_action);
+    // shield-weapon-log-01 (Donald 29-oct: Striker shows no shield, grenades show it without the guard pose): one line
+    // per change of the guard inputs, with the equipped weapon (global+0x4FC0), to tell per weapon why it fails.
+    if(player){
+        const uint8_t weapon=link_runtime::IsPointer(g)?CmbGet<uint8_t>(g+0x4FC0):0xFF;
+        const uint32_t motion=CmbGet<uint32_t>(reinterpret_cast<uint32_t>(model)+sg::kPrimaryMotion);
+        const uint32_t key=weapon|(lock?1U<<8:0)|(knife?1U<<9:0)|(g_sg_wanted?1U<<10:0)|(static_cast<uint32_t>(arm_ik+1)<<11)|
+            (w.blocked?1U<<13:0)|(static_cast<uint32_t>(variant)<<25)|(mismatch?1U<<27:0)|(static_cast<uint32_t>(want)<<14)|(static_cast<uint32_t>(g_sg_layer->phase())<<16)|
+            (g_sg_supported?1U<<20:0)|(broken?1U<<21:0)|(p.damaged?1U<<22:0)|(shield_action?1U<<23:0)|(w.lent?1U<<24:0);
+        static uint32_t last_key=0xFFFFFFFF;
+        if(key!=last_key){
+            last_key=key;
+            const char* why=!gameplay?"no_gameplay":p.damaged?"damaged":scene?"scene":mortal::dispatch_hooks::runtime.active?"mortal_draw":
+                g_oca_session.state()!=oca::State::Idle?"ocarina":variant==sg::ClipVariant::None?"no_variant":mismatch?"variant_flip":"-";
+            CmbLog("shield_guard state weapon=0x%02X lock=%u knife=%u routine=0x%08X supported=%u wanted=%u arm_ik=%d motion=0x%08X "
+                "variant=%s blocked=%u why=%s want=%s shown=%s phase=%s weight=%.2f action=%u lent=%u broken=%u",
+                weapon,lock?1U:0U,knife?1U:0U,p.routine,g_sg_supported?1U:0U,g_sg_wanted?1U:0U,arm_ik,motion,sg::VariantName(variant),w.blocked?1U:0U,
+                w.blocked?why:"-",sg::PlacementName(want),sg::PlacementName(g_sg_shown),sg::PhaseName(g_sg_layer->phase()),
+                g_sg_layer->Weight(),shield_action?1U:0U,w.lent?1U:0U,broken?1U:0U);
+        }
+    }
     if(costume_ok)GuardPlace(want,costume);
     else if(g_sg_swap.Holding())GuardPlace(sg::Placement::Back,0);
     InterlockedExchange(&link_runtime::shield::runtime::rear_suppressed,sg::RearAllowed(true,g_sg_shown,broken)?0:1);
@@ -2524,10 +2612,13 @@ struct GuardSources {
         if(!pp::front_native::Evaluate(g_gen.front,g_gen.access,o,pa,pa+3,res,forward))return false;
         std::memcpy(f.sample,o.current.data(),12);std::memcpy(f.player,pa,12);
         f.frontal=res.frontal;f.dot=res.dot;
-        f.half=forward[0]*(f.sample[0]-pa[0])+forward[2]*(f.sample[2]-pa[2]);
+        // Unit length along Link's horizontal forward, as general::NativeSources::Front (the cone reads forward, not half).
+        const float flat=std::sqrt(forward[0]*forward[0]+forward[2]*forward[2]);
+        f.half=(forward[0]*(f.sample[0]-pa[0])+forward[2]*(f.sample[2]-pa[2]))/(flat>1e-3f?flat:1.f);
         return std::isfinite(f.half);
     }
     uint32_t Owner(const link_runtime::parry::Candidate& c){return base.Owner(c);}
+    bool Routine(uint32_t owner,uint8_t (&out)[2]){return base.Routine(owner,out);}
     bool OwnerPosition(uint32_t owner,float (&out)[3]){link_runtime::parry::general::Memory m;return m.Read(owner+0x94,out,12)&&std::isfinite(out[0])&&std::isfinite(out[2]);}
     uint64_t Now(){return GetTickCount64();}
 };
@@ -2544,8 +2635,8 @@ static bool GuardResolve(const link_runtime::parry::Candidate& c){
         const unsigned key=static_cast<unsigned>(o.reason);const uint64_t now=GetTickCount64();
         if((up||o.reason==sg::Reason::Broken)&&o.reason!=sg::Reason::Structure&&key<16&&now-g_sg_last_pass[key]>=1000){
             g_sg_last_pass[key]=now;
-            CmbLog("shield_guard pass reason=%s producer=0x%X class=%c verdict=%s cos=%.3f owner_source=%u left=%u",sg::ReasonName(o.reason),
-                o.ret_rva,o.cls,g::VerdictName(o.verdict),o.cos,o.owner_source?1U:0U,g_sg_dur.Left());
+            CmbLog("shield_guard pass reason=%s producer=0x%X class=%c verdict=%s cos=%.3f owner_source=%u left=%u owner=0x%08X",sg::ReasonName(o.reason),
+                o.ret_rva,o.cls,g::VerdictName(o.verdict),o.cos,o.owner_source?1U:0U,g_sg_dur.Left(),o.owner);
         }
         return false;
     }
@@ -2560,8 +2651,8 @@ static bool GuardResolve(const link_runtime::parry::Candidate& c){
         g_sg_layer->OnBroken();GuardSound(wood?3:4);
         CmbLog("shield_guard break costume=%u regen_s=%.0f",costume,g_sg_dur.RegenFrames()/60.0);
     }else{g_sg_layer->OnBlocked();GuardSound(wood?1:2);}
-    CmbLog("shield_guard block producer=0x%X class=%c power=%u cos=%.3f owner_source=%u left=%u/%u broke=%u sparks=%u deflect=%d",
-        o.ret_rva,o.cls,o.descriptor.power,o.cos,o.owner_source?1U:0U,o.left,g_sg_dur.Max(),o.broke?1U:0U,sparks,deflected);
+    CmbLog("shield_guard block producer=0x%X class=%c power=%u cos=%.3f owner_source=%u left=%u/%u broke=%u sparks=%u deflect=%d owner=0x%08X",
+        o.ret_rva,o.cls,o.descriptor.power,o.cos,o.owner_source?1U:0U,o.left,g_sg_dur.Max(),o.broke?1U:0U,sparks,deflected,o.owner);
     return true;
 }
 // Worker: the block reuses the rear shield's TP hit sounds; break and return are their own files.
@@ -3127,7 +3218,7 @@ static void CombatPrepare(unsigned char* base,uint32_t player_slot,uint32_t glob
 static bool CmbHook(uint32_t rva,void* detour,void** original,const char* name){
     void* target=reinterpret_cast<void*>(g_cmb_base+rva);
     MH_STATUS s=MH_CreateHook(target,detour,original);
-    if(s==MH_OK)s=MH_EnableHook(target);
+    if(s==MH_OK&&(s=MH_EnableHook(target))!=MH_OK)MH_RemoveHook(target);
     if(s!=MH_OK){Log("Combat hook %s 0x%X failed: %s",name,rva,MH_StatusToString(s));return false;}
     return true;
 }
@@ -3301,7 +3392,7 @@ static void UserIniPoll(){
 }
 // --- end user-ini-01
 static void __cdecl CombinedDecide(mortal::dispatch::Runtime& run,void* player){
-    UserIniApply();   // user-ini-01: a new cosmetic snapshot from the worker, before any of its readers this frame
+    UserIniApply();   // user-ini-01: a new cosmetic snapshot from the worker, before this dispatch's readers (the arbiter and the lifecycle may read the previous one for one frame: same thread, cosmetic)
     zlr::Frame();   // Zelda's light ray: shares the freshly applied particle switch and gain
     link_runtime::sword_trail::probe::runtime::Frame();   // Task 3b probe: no-op unless SwordTrailProbe=1 started it
     if(g_oca_on.load(std::memory_order_acquire))OcarinaDecide(run,player);
@@ -3367,18 +3458,89 @@ public:
         if(waveOutWrite(out,&ramp,sizeof(ramp))!=MMSYSERR_NOERROR)DropRamp();
     }
 };
+// Chromatic ocarina (29-oct): the 31 pitch WAVs share ONE waveOut (31 more devices would be a lot of handles); a new
+// pitch swaps the buffer of that voice after the 15 ms fade NoteConsumer already queued.
+class OcaPitchVoice {
+    HWAVEOUT out=nullptr;WAVEHDR main{},ramp{};link_runtime::WaveData waves[oca::kPitchCount];bool have[oca::kPitchCount]{};
+    std::vector<int16_t> tail;unsigned block=2,rate=0,channels=0;DWORD base=0;bool main_prepared=false,ramp_prepared=false;int cur=-1;
+    void DropRamp(){if(ramp_prepared){waveOutUnprepareHeader(out,&ramp,sizeof(ramp));ramp_prepared=false;}}
+    void DropMain(){if(main_prepared){waveOutUnprepareHeader(out,&main,sizeof(main));main_prepared=false;}}
+public:
+    unsigned loaded=0;
+    ~OcaPitchVoice(){if(out){waveOutReset(out);DropRamp();DropMain();waveOutClose(out);}}
+    // Every non-button pitch, or none: a missing or changed file leaves the piano silent (the staff still shows it).
+    bool Load(const wchar_t* directory,unsigned volume){
+        for(int i=0;i<oca::kPitchCount;++i){
+            if(!oca::kPitchSha[i])continue;
+            wchar_t path[MAX_PATH]{};std::vector<unsigned char> bytes;FILE* file=nullptr;
+            if(link_runtime::paths::Format(path,L"%slink_ocarina_pitch_%u.wav",directory,unsigned(oca::kPitchLo+i))<=0||_wfopen_s(&file,path,L"rb")||!file)return false;
+            std::fseek(file,0,SEEK_END);const long length=std::ftell(file);std::rewind(file);
+            if(length<44||length>8*1024*1024){std::fclose(file);return false;}
+            bytes.resize(static_cast<size_t>(length));const size_t read=std::fread(bytes.data(),1,bytes.size(),file);std::fclose(file);
+            unsigned char digest[32]{};
+            if(read!=bytes.size()||!link_runtime::mortal_draw::resident_assets::detail::Hash(bytes.data(),bytes.size(),digest)||
+               !link_runtime::mortal_draw::resident_assets::detail::Matches(digest,oca::kPitchSha[i])||!link_runtime::ParseWave(bytes,waves[i])||!waves[i].channels)return false;
+            if(!rate){rate=waves[i].rate;channels=waves[i].channels;}
+            else if(waves[i].rate!=rate||waves[i].channels!=channels)return false;
+            link_runtime::ScaleWave(waves[i],volume);have[i]=true;++loaded;
+        }
+        if(!rate)return false;
+        block=channels*2;tail.resize(oca::FadeFrames(rate)*channels);
+        WAVEFORMATEX format{};format.wFormatTag=WAVE_FORMAT_PCM;format.nChannels=static_cast<WORD>(channels);
+        format.nSamplesPerSec=rate;format.wBitsPerSample=16;format.nBlockAlign=static_cast<WORD>(block);
+        format.nAvgBytesPerSec=format.nSamplesPerSec*format.nBlockAlign;
+        if(waveOutOpen(&out,WAVE_MAPPER,&format,0,0,CALLBACK_NULL)!=MMSYSERR_NOERROR){out=nullptr;return false;}
+        return true;
+    }
+    bool Play(int midi){
+        const int i=midi-oca::kPitchLo;
+        if(!out||i<0||i>=oca::kPitchCount||!have[i])return false;
+        if(main_prepared&&(main.dwFlags&WHDR_INQUEUE))return false;   // FadeStop always runs first (NoteConsumer)
+        if(ramp_prepared&&(ramp.dwFlags&WHDR_INQUEUE))base=ramp.dwBufferLength;   // plays right after the fade
+        else {waveOutReset(out);DropRamp();base=0;}
+        DropMain();
+        main={};main.lpData=reinterpret_cast<LPSTR>(waves[i].pcm.data());main.dwBufferLength=static_cast<DWORD>(waves[i].pcm.size());
+        if(waveOutPrepareHeader(out,&main,sizeof(main))!=MMSYSERR_NOERROR)return false;
+        main_prepared=true;cur=i;
+        return waveOutWrite(out,&main,sizeof(main))==MMSYSERR_NOERROR;
+    }
+    void FadeStop(){
+        if(!out||!main_prepared||!(main.dwFlags&WHDR_INQUEUE)||cur<0)return;
+        MMTIME t{};t.wType=TIME_BYTES;
+        const bool known=waveOutGetPosition(out,&t,sizeof(t))==MMSYSERR_NOERROR&&t.wType==TIME_BYTES&&t.u.cb>=base;
+        waveOutReset(out);DropRamp();
+        if(!known)return;
+        const link_runtime::WaveData& wave=waves[cur];
+        const size_t at=(t.u.cb-base)/block,frames=wave.pcm.size()/block;
+        const size_t n=oca::FadeTail(reinterpret_cast<const int16_t*>(wave.pcm.data()),frames,channels,at,oca::FadeFrames(rate),tail.data());
+        if(!n)return;
+        ramp={};ramp.lpData=reinterpret_cast<LPSTR>(tail.data());ramp.dwBufferLength=static_cast<DWORD>(n*block);
+        if(waveOutPrepareHeader(out,&ramp,sizeof(ramp))!=MMSYSERR_NOERROR)return;
+        ramp_prepared=true;
+        if(waveOutWrite(out,&ramp,sizeof(ramp))!=MMSYSERR_NOERROR)DropRamp();
+    }
+};
 class OcaNoteAudio {
-    OcaNoteVoice voices[5];
+    OcaNoteVoice voices[5];OcaPitchVoice pitches;bool piano=false;
 public:
     bool Load(const wchar_t* directory,unsigned volume){
         for(unsigned i=0;i<5;++i){
             wchar_t path[MAX_PATH]{};
             if(link_runtime::paths::Format(path,L"%slink_ocarina_note_%u.wav",directory,i)<=0||!voices[i].Load(path,volume,kOcaNoteSha[i]))return false;
         }
+        piano=pitches.Load(directory,volume);
         return true;
     }
-    bool Play(int note){return note>=0&&note<=4&&voices[note].Play();}   // NoteConsumer fades the previous note first
-    void FadeStop(){for(auto& v:voices)v.FadeStop();}
+    bool PianoLoaded() const {return piano;}
+    // Note code (ocarina_pitch.h): a button, or a chromatic pitch; a pitch equal to a button plays that button's WAV
+    // (the same file). NoteConsumer fades the previous note first.
+    bool Play(int note){
+        if(oca::IsButtonNote(note))return voices[note].Play();
+        const int button=oca::ButtonOfMidi(note);
+        if(button>=0)return voices[button].Play();
+        return piano&&pitches.Play(note);
+    }
+    void FadeStop(){for(auto& v:voices)v.FadeStop();pitches.FadeStop();}
 };
 static OcaNoteAudio g_oca_audio;
 static OcaNoteVoice g_oca_jingle_voice;   // link_ocarina_song_ok.wav (TP Z2SE_READ_RIDDLE_B, ocarina-serenity-01)
@@ -3424,6 +3586,7 @@ static bool OcaLoad(const link_runtime::shield::NativeAccess& n,const wchar_t* d
     g_oca_weapon_ok=g_oca_cfg.pose&&PinsAt(g_oca_base,link_runtime::native_pins::kOcarinaWeapon);
     if(g_oca_cfg.pose&&!g_oca_weapon_ok)Log("Ocarina weapon hide disabled: native pins");
     if(g_oca_cfg.notes&&!g_oca_audio.Load(directory,g_oca_cfg.volume)){Log("Ocarina disabled: note WAVs or audio device");return false;}
+    if(g_oca_cfg.notes&&g_oca_cfg.piano&&!g_oca_audio.PianoLoaded())Log("Ocarina piano notes silent: link_ocarina_pitch_*.wav missing or changed");
     if(g_oca_cfg.item&&!OcaPatchUse())return false;
     if(g_oca_manual_on&&g_oca_cfg.item){   // optional: a failure leaves the Files menu native, the ocarina runs
         OcaPatchMem pm;
@@ -3477,12 +3640,19 @@ static bool OcaLoad(const link_runtime::shield::NativeAccess& n,const wchar_t* d
     }
     if(g_oca_staff_on){
         if(!PinsAt(g_oca_base,ostf::kPins)){g_oca_staff_on=false;Log("Ocarina staff disabled: IdSys native pins (base 0x%X)",g_oca_base);}
-        else if(!(g_oca_staff_block=OcaResident(directory,kOcaStaffBlock))){g_oca_staff_on=false;Log("Ocarina staff disabled: link_ocarina_staff.eff");}
-        else{g_oca_painter.SetBlock(g_oca_staff_block);Log("Ocarina staff ready: class=0x%02X tex=0x%02X owner=0x%X idsys=0x%X",ostf::layout::id_class,ostf::layout::tex_id,ostf::layout::tex_owner,g_oca_base+ostf::layout::idsys_rva);}
+        else{
+            const bool chroma=(g_oca_staff_block=OcaResident(directory,kOcaStaffBlockChroma,true))!=nullptr;
+            if(!chroma)g_oca_staff_block=OcaResident(directory,kOcaStaffBlock);
+            if(!g_oca_staff_block){g_oca_staff_on=false;Log("Ocarina staff disabled: link_ocarina_staff.eff");}
+            else{g_oca_painter.SetBlock(g_oca_staff_block);g_oca_song.SetChromaticArt(chroma);
+                Log("Ocarina staff ready: class=0x%02X tex=0x%02X owner=0x%X idsys=0x%X chromatic_frames=%u",ostf::layout::id_class,ostf::layout::tex_id,ostf::layout::tex_owner,g_oca_base+ostf::layout::idsys_rva,chroma?1U:0U);}
+        }
     }
-    Log("Ocarina ready: item=%u freeze=%u mount=%u pose=%u weapon_hide=%u notes=%u pad=%u pad_style=%s keys toggle=0x%02X stow=0x%02X A=0x%02X arrows=0x%02X/0x%02X/0x%02X/0x%02X volume=%u",
+    unsigned piano_keys=0;for(uint8_t k:g_oca_cfg.keys.piano)if(k)++piano_keys;
+    Log("Ocarina ready: item=%u freeze=%u mount=%u pose=%u weapon_hide=%u notes=%u pad=%u pad_style=%s keys toggle=0x%02X stow=0x%02X A=0x%02X arrows=0x%02X/0x%02X/0x%02X/0x%02X volume=%u piano=%u piano_keys=%u piano_wavs=%u",
         g_oca_cfg.item?1U:0U,g_oca_cfg.freeze?1U:0U,g_oca_cfg.mount?1U:0U,g_oca_cfg.pose?1U:0U,g_oca_weapon_ok?1U:0U,g_oca_cfg.notes?1U:0U,g_oca_cfg.pad?1U:0U,
-        g_oca_cfg.pad_n64?"n64(LB+RB,A,B,right stick)":"legacy(left stick)",g_oca_cfg.keys.toggle,g_oca_cfg.keys.stow,g_oca_cfg.keys.note_a,g_oca_cfg.keys.up,g_oca_cfg.keys.down,g_oca_cfg.keys.left,g_oca_cfg.keys.right,g_oca_cfg.volume);
+        g_oca_cfg.pad_n64?"n64(LB+RB,A,B,right stick)":"legacy(left stick)",g_oca_cfg.keys.toggle,g_oca_cfg.keys.stow,g_oca_cfg.keys.note_a,g_oca_cfg.keys.up,g_oca_cfg.keys.down,g_oca_cfg.keys.left,g_oca_cfg.keys.right,g_oca_cfg.volume,
+        g_oca_cfg.piano?1U:0U,piano_keys,g_oca_audio.PianoLoaded()?1U:0U);
     return true;
 }
 using OcaXInputGetState=DWORD(WINAPI*)(DWORD,void*);
@@ -3510,7 +3680,7 @@ struct OcaWorker {
             OcaPadState state{};
             const bool connected=xinput(0,&state)==ERROR_SUCCESS;
             link_runtime::ztarget::runtime::PublishPad(connected,focused,state.buttons,state.rx,state.lt);
-            g_oca_pad_right.store(connected?(uint64_t(state.lt)<<32)|(uint64_t(uint16_t(state.ry))<<16)|uint16_t(state.rx):0,std::memory_order_release);
+            g_oca_pad_right.store(connected?(uint64_t(state.rt)<<40)|(uint64_t(state.lt)<<32)|(uint64_t(uint16_t(state.ry))<<16)|uint16_t(state.rx):0,std::memory_order_release);
             if(connected)
                 g_oca_pad.store((1ULL<<48)|(uint64_t(uint16_t(state.ly))<<32)|(uint64_t(uint16_t(state.lx))<<16)|state.buttons,std::memory_order_release);
             else {g_oca_pad.store(0,std::memory_order_release);next_pad=GetTickCount64()+1000;}  // disconnected pads are slow to poll
@@ -3980,6 +4150,9 @@ static DWORD WINAPI Worker(LPVOID) {
     const unsigned shield_switch=GetPrivateProfileIntW(L"LinkRuntime",L"ShieldObserve",0,path);
     const bool defense_requested=ChapterIniSwitch(path,L"ParryActive");
     const bool parry_requested=defense_requested||ChapterIniSwitch(path,L"ParryObserve");
+    for(unsigned i=0;i<link_runtime::parry::direct::kCount;++i)
+        link_runtime::parry::direct::requested[i]=GetPrivateProfileIntW(L"LinkRuntime",link_runtime::parry::direct::kSpecs[i].key,link_runtime::parry::direct::kSpecs[i].on?1:0,path)==1;
+    g_parry_line_requested=GetPrivateProfileIntW(L"LinkRuntime",L"ParryLineBlock",0,path)==1;   // 3.2.1: off until checked live
     unsigned general_problems=0;
     g_gen.settings=link_runtime::parry::general::ReadSettings([&](const wchar_t* key,wchar_t* out,size_t count){
         GetPrivateProfileStringW(L"LinkRuntime",key,L"",out,static_cast<DWORD>(count),path);},defense_requested,parry_requested,general_problems);
@@ -4021,7 +4194,7 @@ static DWORD WINAPI Worker(LPVOID) {
     g_oca_manual_on=GetPrivateProfileIntW(L"Ocarina",L"Manual",1,path)==1;   // default on; needs Item=1
     g_cmb=cmb::ReadConfig([&](const wchar_t* key,wchar_t* out,size_t count){
         GetPrivateProfileStringW(L"LinkRuntime",key,L"",out,static_cast<DWORD>(count),path);},defense_requested);
-    if(g_cmb.problems)Log("Combat: %u invalid values or unmet dependencies (Damage needs Contextual, parry keys need ParryActive); those stay off",g_cmb.problems);
+    if(g_cmb.problems)Log("Combat: %u invalid values or unmet dependencies (Damage needs Contextual, parry keys need ParryActive); switches, unmet dependencies and a bad ParryRiposteMilli stay off, other numbers keep their defaults",g_cmb.problems);
     if(g_cmb.leap_problems)Log("EndingBlowLeap: %u invalid values; their defaults kept",g_cmb.leap_problems);
     if(g_cmb.lift_problems)Log("EndingBlowCameraLift: %u invalid values; their defaults kept",g_cmb.lift_problems);
     // E1 sword trail log (spin_attack_runtime.h SwordTrail*): exact 1, with SpinAttack=1 and LogLevel=2 (lines every frame).
@@ -4180,6 +4353,7 @@ static DWORD WINAPI Worker(LPVOID) {
     StartSwordTrail(base,slot,global_slot,dispatch_up);
     StartSwordCharge(base,slot,global_slot,dispatch_up,mortal_name?mortal_directory:nullptr);
     StartSwordParticles(base,slot,global_slot,dispatch_up);   // sword-particles-01: after the trail (it reads its samples)
+    if(zlr::g_on&&!g_trail_on.load(std::memory_order_acquire))Log("ZeldaLight inert: sword_trail is off (its reason above); the ray is drawn with the trail's node");
     UserIniStart(user_ini,user_file_problems);   // user-ini-01: after the three: what started, then live reloads
     StartZTargetArrow(base,slot,global_slot,dispatch_up,path);   // before ztarget Start: it mutes the 2D cursor
     if(combat)GuardLoadAudio(mortal_directory);
@@ -4228,6 +4402,7 @@ static DWORD WINAPI Worker(LPVOID) {
     uint64_t camera_interp_next = GetTickCount64() + 5000;
     for (;;) {
         fps_probe.Poll();
+        CrashDumpPollAudio();
         if (camera_interp && GetTickCount64() >= camera_interp_next) {
             camera_interp_next = GetTickCount64() + 5000;
             const auto& cs = link_runtime::camera_interp::install::g_stats;

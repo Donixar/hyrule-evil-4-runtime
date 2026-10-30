@@ -41,7 +41,10 @@ inline Code Find(const unsigned char* image,size_t size,const NativeAccess& a) {
 }
 struct Stamp {uint32_t player=0,global=0,frame=0;};
 inline bool Same(const Stamp& a,const Stamp& b){return a.player==b.player&&a.global==b.global&&a.frame==b.frame;}
+// Rejection provenance only. Admission still depends on the existing epoch guards.
+enum class Failure:uint32_t {None,Entry,Nested,OrphanTail,TailGuard,TailRead,TailChanged,ContactContext,ContactRead,ContactChanged,Exception};
 struct State {
+    Failure failure=Failure::None;reader::ReadFailure reader_failure=reader::ReadFailure::None;
     Stamp stamp{};reader::Observation pose{};
     uint64_t serial=0;
     unsigned depth=0;
@@ -75,11 +78,19 @@ inline bool ReadStamp(Stamp& out) {
 #ifdef LINK_SWORD_EPOCH_FIXTURE
 void FixtureDuringCapture();
 #endif
-inline bool Capture(reader::Observation& out){
+inline bool Capture(reader::Observation& out,reader::ReadFailure* failure=nullptr){
 #ifdef LINK_SWORD_EPOCH_FIXTURE
     FixtureDuringCapture();
 #endif
-    return reader::ObserveCurrent(Slots(),out);
+    return reader::ObserveCurrent(Slots(),out,failure);
+}
+// Contact re-read of the pose this epoch's tail already proved (resource hashed there): the same walk and matrices,
+// the resource accepted by identity (reader::ReadPose, no bcrypt). SamePose below still compares the whole pose.
+inline bool Recapture(const reader::Observation& known,reader::Observation& out,reader::ReadFailure* failure=nullptr){
+#ifdef LINK_SWORD_EPOCH_FIXTURE
+    FixtureDuringCapture();
+#endif
+    reader::ProcessMemory memory;return reader::ReadPose(memory,Slots(),reader::IdentityOf(known),out,failure);
 }
 // Entry/tail callbacks receive actual PUSHAD frames. They never accept an
 // external frame-valid or pose-ready boolean.
@@ -89,17 +100,17 @@ __declspec(noinline) inline void __cdecl EntryRecord(const parry::MachineFrame* 
         if(thread_binding::ClaimLatch(owner_thread,binding)){Sync();
             __try {
                 ++state.serial;state.ready=false;
-                if(state.depth){state.poisoned=true;if(state.depth<0xffff)++state.depth;}
+                if(state.depth){state.failure=Failure::Nested;state.poisoned=true;if(state.depth<0xffff)++state.depth;}
                 else {
-                    state.pose={};state.poisoned=false;state.depth=1;
-                    if(!frame||!ReadStamp(state.stamp)||frame->ecx!=state.stamp.player)state.poisoned=true;
+                    state.pose={};state.failure=Failure::None;state.reader_failure=reader::ReadFailure::None;state.poisoned=false;state.depth=1;
+                    if(!frame||!ReadStamp(state.stamp)||frame->ecx!=state.stamp.player){state.failure=Failure::Entry;state.poisoned=true;}
                 }
                 if(before_entry) {
                     if(state.poisoned)before_entry(0,0,0);
                     else before_entry(frame->ecx,state.stamp.global,state.stamp.frame);
                 }
             } __except(EXCEPTION_EXECUTE_HANDLER){
-                state.poisoned=true;state.ready=false;
+                state.failure=Failure::Exception;state.poisoned=true;state.ready=false;
                 __try {if(before_entry)before_entry(0,0,0);} __except(EXCEPTION_EXECUTE_HANDLER) {}
             }
         }
@@ -111,21 +122,21 @@ __declspec(noinline) inline void __cdecl Tail(const parry::MachineFrame* frame){
     if(Enabled()&&InterlockedCompareExchange(&owner_thread,0,0)==static_cast<LONG>(GetCurrentThreadId())){
         Sync();
         __try {
-            if(!state.depth){state.ready=false;state.poisoned=true;}
-            else if(state.depth>1){--state.depth;state.ready=false;state.poisoned=true;}
+            if(!state.depth){state.failure=Failure::OrphanTail;state.ready=false;state.poisoned=true;}
+            else if(state.depth>1){state.failure=Failure::Nested;--state.depth;state.ready=false;state.poisoned=true;}
             else {
                 Stamp before{},after{};reader::Observation pose;state.ready=false;
-                if(state.poisoned||state.sampling||!frame||frame->esi!=state.stamp.player||!ReadStamp(before)||!Same(before,state.stamp))state.poisoned=true;
+                if(state.poisoned||state.sampling||!frame||frame->esi!=state.stamp.player||!ReadStamp(before)||!Same(before,state.stamp)){if(state.failure==Failure::None)state.failure=Failure::TailGuard;state.poisoned=true;}
                 else {
                     state.sampling=true;const auto serial=state.serial;
-                    const bool read=Capture(pose);
-                    if(read&&Enabled()&&seen_lifecycle==static_cast<uint32_t>(InterlockedCompareExchange(&lifecycle,0,0))&&!state.poisoned&&serial==state.serial&&state.depth==1&&ReadStamp(after)&&Same(after,before)&&pose.player==before.player&&pose.global==before.global){state.pose=pose;state.ready=true;}
-                    else state.poisoned=true;
+                    const bool read=Capture(pose,&state.reader_failure);
+                    if(read&&Enabled()&&seen_lifecycle==static_cast<uint32_t>(InterlockedCompareExchange(&lifecycle,0,0))&&!state.poisoned&&serial==state.serial&&state.depth==1&&ReadStamp(after)&&Same(after,before)&&pose.player==before.player&&pose.global==before.global){state.pose=pose;state.failure=Failure::None;state.ready=true;}
+                    else {if(state.failure==Failure::None)state.failure=read?Failure::TailChanged:Failure::TailRead;state.poisoned=true;}
                     state.sampling=false;
                 }
                 state.depth=0;
             }
-        } __except(EXCEPTION_EXECUTE_HANDLER){state.ready=false;state.poisoned=true;state.sampling=false;state.depth=0;}
+        } __except(EXCEPTION_EXECUTE_HANDLER){state.failure=Failure::Exception;state.ready=false;state.poisoned=true;state.sampling=false;state.depth=0;}
         __try {if(after_tail)after_tail();}
         __except(EXCEPTION_EXECUTE_HANDLER) {} // Diagnostics never escape into native motion.
     }
@@ -152,11 +163,12 @@ inline bool CurrentImpl(reader::Observation& out,Stamp* contact_stamp=nullptr){
                 before.global==state.stamp.global&&before.frame>state.stamp.frame&&before.frame-state.stamp.frame==1;
             if(state.ready&&!state.depth&&!state.poisoned&&!state.sampling&&(completed||next_contact)){
                 const auto serial=state.serial;reader::Observation now;state.sampling=true;
-                const bool read=Capture(now);state.sampling=false;
-                if(read&&Enabled()&&seen_lifecycle==static_cast<uint32_t>(InterlockedCompareExchange(&lifecycle,0,0))&&state.ready&&!state.poisoned&&!state.depth&&serial==state.serial&&ReadStamp(after)&&Same(before,after)&&SamePose(now,state.pose)){out=now;if(contact_stamp)*contact_stamp=after;result=true;}
+                const bool read=Recapture(state.pose,now,&state.reader_failure);state.sampling=false;
+                if(read&&Enabled()&&seen_lifecycle==static_cast<uint32_t>(InterlockedCompareExchange(&lifecycle,0,0))&&state.ready&&!state.poisoned&&!state.depth&&serial==state.serial&&ReadStamp(after)&&Same(before,after)&&SamePose(now,state.pose)){out=now;state.failure=Failure::None;if(contact_stamp)*contact_stamp=after;result=true;}
+                else if(state.failure==Failure::None)state.failure=read?Failure::ContactChanged:Failure::ContactRead;
             }
-            if(!result)state.ready=false;
-        } __except(EXCEPTION_EXECUTE_HANDLER){state.ready=false;state.poisoned=true;state.sampling=false;}
+            if(!result){if(state.failure==Failure::None)state.failure=Failure::ContactContext;state.ready=false;}
+        } __except(EXCEPTION_EXECUTE_HANDLER){state.failure=Failure::Exception;state.ready=false;state.poisoned=true;state.sampling=false;}
     }
     SetLastError(error);return result;
 }

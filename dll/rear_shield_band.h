@@ -9,7 +9,7 @@
 // shield-before-body ordering (accepted simplification), no scythe handler
 // byte pin (re4_fps redirects 0x700A5/0x700DF) and no hitpart body bytes
 // (the game writes +0x28). A hit is halved when ALL hold:
-//   * gameplay, pl08 or pl10 Hylian Link (character 0x100 or 0x300, 119 parts, kind 0);
+//   * gameplay, pl08/pl09/pl10 Hylian Link (character 0x100/0x200/0x300, 119 parts, kind 0);
 //   * Link standing (Footwork 0x00010000 / 0x01010000) or walking/backing/running
 //     (R0 0, R1 1/2/3; table pinned in mortal_draw_start_gate.h). Damage, grab,
 //     ladder, kick, aim, knife, turn, death and loading are other routines;
@@ -70,11 +70,11 @@ struct Evidence {
     uint32_t routine=0,caller=0,attack_no=0,weapon_type=0;
     double bearing=0,height=0,local_z=0,front_dot=0,band_low=0,band_high=0;
 };
-// Leon (pl_type 0) as pl08 (costume 1) or pl10 (costume 3). The installed pl10 body is the pl08
-// body with the Master Sword sheath instead of the Ordon one: the Hylian shield (3248 triangles,
-// rigid on bone 2) matches pl08's to 2.4e-6 in position, normal, UV and weights
-// (docs/ms-castle-01-2026-10-18.md), so kShieldLow/kShieldHigh hold for both.
-inline bool HylianLinkCharacter(uint32_t character){const uint32_t c=character&0xFFFFu;return c==0x100u||c==0x300u;}
+// Leon (pl_type 0) as pl08 (costume 1), pl09 (Magic Armor, costume 2) or pl10 (costume 3).
+// The installed pl09 shield matches pl08 exactly in extracted position, normal, UV and weights
+// (3248 triangles, rigid on bone 2; identical native bone records). The pl10 shield matches to
+// 2.4e-6 (docs/ms-castle-01-2026-10-18.md), so kShieldLow/kShieldHigh hold for all three.
+inline bool HylianLinkCharacter(uint32_t character){const uint32_t c=character&0xFFFFu;return c==0x100u||c==0x200u||c==0x300u;}
 inline Evidence Evaluate(const Sample& s,unsigned stage=1){
     Evidence e;e.evaluated=true;e.stage=stage;
     const auto& f=s.frame;const auto& r=s.route;

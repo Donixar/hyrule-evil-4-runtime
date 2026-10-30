@@ -705,7 +705,6 @@ function Invoke-Install {
     }
 
     # Validate all destinations before touching either the game or its backup.
-    $links = New-Object System.Collections.ArrayList
     try {
         foreach ($f in $planFiles) {
             $f.Target = Get-SafePath $game $f.Path
@@ -762,8 +761,11 @@ function Invoke-Install {
             continue
         }
         $f.Current = Get-Sha256 $f.Target
-        if ($f.ContainsKey('Retained') -and $f.Path -eq 'Bin32/link_runtime.ini') {
-            # Adding/resuming textures must not reset the player's Core settings. Verify and
+        if ($f.Path -eq 'Bin32/link_runtime.ini' -and -not $patchMode -and ($f.ContainsKey('Retained') -or $ours.ContainsKey($f.Path)) -and
+            -not ($backup.ContainsKey($f.Path) -and $f.Current -eq $backup[$f.Path].sha256 -and -not (Test-File (Join-Rel $filesDir $f.Path)))) {
+            # Re-running the installer (textures added, a resume, Core again) must not reset the player's settings. With
+            # Core selected only an INI this backup set placed counts, so a leftover from before is still backed up, as is a
+            # backed-up original the backup no longer holds (an uninstall that ended with warnings put it back). Verify and
             # record their actual bytes without claiming ownership of a user edit in the journal.
             $f.OutputSha = $f.Current
             $f.OutputBytes = Get-Length $f.Target
@@ -830,7 +832,7 @@ function Invoke-Install {
     foreach ($l in $lfsList) {
         $path = Join-Rel $game $l
         if (-not (Test-File $path)) { continue }
-        if (Test-Reparse $path) { [void]$links.Add($l); continue }
+        if (Test-Reparse $path) { continue }
         if ($backup.ContainsKey($l)) {
             $current = Get-Sha256 $path
             if ($current -ne $backup[$l].sha256) { [void]$conflicts.Add($l) }

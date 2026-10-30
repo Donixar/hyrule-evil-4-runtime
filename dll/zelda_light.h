@@ -113,13 +113,14 @@ inline core::Vec3 Hand(const float* feet, float yaw) {
     return {feet[0] + fx * kHandAhead + rx * kHandSide, feet[1] + kHandHeight, feet[2] + fz * kHandAhead + rz * kHandSide};
 }
 
-// One ray per press of the button: fires on the rising edge only, once the cooldown since the last ray has passed.
+// One ray per press of the button: fires on the rising edge only, once the cooldown since the last ray has passed or game
+// time ran back (a save load: the cooldown then counts from the new time, as back_slice.h and shield_bash.h).
 class Press {
     bool down_ = false, fired_ = false; double last_ = 0;
 public:
     bool Fire(bool pressed, double now, unsigned cooldown_ms) {
         const bool edge = pressed && !down_; down_ = pressed;
-        if (!edge || (fired_ && now - last_ < cooldown_ms)) return false;
+        if (!edge || (fired_ && now >= last_ && now - last_ < cooldown_ms)) return false;
         fired_ = true; last_ = now; return true;
     }
 };

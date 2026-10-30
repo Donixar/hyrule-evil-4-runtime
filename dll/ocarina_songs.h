@@ -23,6 +23,7 @@
 // Frames are 60 Hz frames of game time (game_clock.h Step60), so the waits keep their seconds at 165 FPS.
 #include <cstdint>
 #include "game_clock.h"
+#include "ocarina_pitch.h"
 
 namespace link_runtime::ocarina::songs {
 // Sheik and Epona (17-oct, docs/ocarina-canciones-sheik-epona-2026-10-17.md): combat songs whose effects live
@@ -91,18 +92,19 @@ template <class Get> Config ReadConfig(Get get) {
     return c;
 }
 
-// Last 8 notes of the current session; a match consumes them, so one melody fires once.
+// Last 8 notes of the current session; a match consumes them, so one melody fires once. Notes compare by written
+// pitch (ocarina_pitch.h ToMidi): a melody of buttons also matches the same pitches played on the piano keys.
 class Detector {
     int8_t notes_[8] = {}; uint8_t count_ = 0;
 public:
     void Reset() { count_ = 0; }
     uint8_t Size() const { return count_; }
     bool Push(int8_t note, const Melody& m) {
-        if (note < 0 || note > 4) return false;
+        if (!ValidNote(note)) return false;
         if (count_ == 8) { for (int i = 1; i < 8; ++i) notes_[i - 1] = notes_[i]; --count_; }
-        notes_[count_++] = note;
+        notes_[count_++] = int8_t(ToMidi(note));
         if (!m.length || m.length > 8 || count_ < m.length) return false;
-        for (uint8_t i = 0; i < m.length; ++i) if (notes_[count_ - m.length + i] != m.notes[i]) return false;
+        for (uint8_t i = 0; i < m.length; ++i) if (notes_[count_ - m.length + i] != ToMidi(m.notes[i])) return false;
         count_ = 0;
         return true;
     }

@@ -35,6 +35,14 @@ cl /nologo /std:c++17 /W4 /WX /O2 /MT /EHsc tests\native\test_link_runtime_trace
 "%BUILD%\test_trace.exe" || exit /b 1
 cl /nologo /std:c++17 /W4 /WX /O2 /MT /EHsc tests\native\test_link_runtime_log.cpp /Fo"%BUILD%\test_log.obj" /Fe"%BUILD%\test_log.exe" || exit /b 1
 "%BUILD%\test_log.exe" "%BUILD%" || exit /b 1
+rem Shot line parry: standalone x86 transport and admission regression.
+cl /nologo /std:c++17 /W4 /WX /O2 /MT /EHsc tests\native\test_parry_line.cpp /I"%MH%\include" /Fo"%BUILD%\test_parry_line.obj" /Fe"%BUILD%\test_parry_line.exe" /link "%BUILD%\minhook.lib" || exit /b 1
+"%BUILD%\test_parry_line.exe" || exit /b 1
+rem Direct parry: native contact shims and fixed-damage admission.
+cl /nologo /std:c++17 /W4 /WX /O2 /MT /EHsc tests\native\test_parry_direct_routes.cpp /I"%MH%\include" /Fo"%BUILD%\test_parry_direct_routes.obj" /Fe"%BUILD%\test_parry_direct_routes.exe" /link "%BUILD%\minhook.lib" || exit /b 1
+"%BUILD%\test_parry_direct_routes.exe" || exit /b 1
+cl /nologo /std:c++17 /W4 /WX /O2 /MT /EHsc tests\native\test_parry_direct_runtime.cpp /I"%MH%\include" /Fo"%BUILD%\test_parry_direct_runtime.obj" /Fe"%BUILD%\test_parry_direct_runtime.exe" /link "%BUILD%\minhook.lib" || exit /b 1
+"%BUILD%\test_parry_direct_runtime.exe" || exit /b 1
 rem VERSIONINFO (dll\link_runtime.rc; labels in dll\link_runtime_version.h), linked into the DLL.
 "%WK%\bin\%WKVER%\x86\rc.exe" /nologo /fo "%BUILD%\link_runtime.res" dll\link_runtime.rc || exit /b 1
 cl /nologo /std:c++17 /W4 /WX /O2 /MT /EHsc /LD /DUNICODE /D_UNICODE dll\link_runtime.cpp /I"%MH%\include" /Fo"%BUILD%\link_runtime.obj" /link /DEF:dll\link_runtime.def /OUT:"%BUILD%\dinput8.dll" /IMPLIB:"%BUILD%\dinput8.lib" "%BUILD%\minhook.lib" "%BUILD%\link_runtime.res" kernel32.lib user32.lib winmm.lib || exit /b 1

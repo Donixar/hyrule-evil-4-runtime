@@ -23,6 +23,7 @@
 
 #include "game_clock.h"
 #include "native_pins.h"
+#include "ocarina_pitch.h"
 
 namespace link_runtime::ocarina::staff {
 namespace layout {
@@ -71,6 +72,22 @@ inline constexpr const auto& kPins = native_pins::kOcarinaStaff;
 // any aspect; Fit (below) places it for the visible height. Texture: 512x128 staff, lines 16 px apart
 // at rows 32..96 (E4 G4 B4 D5 F5).
 constexpr int kSlots = 8, kUnits = 1 + kSlots;
+// Chromatic ocarina (29-oct): a chromatic note keeps ONE unit per slot (IDSystem has 0x80 units for the whole HUD,
+// main.cpp IdSys.gameInit(0x80)); its sharp and ledger lines are drawn into the frame. Frames: 0 staff, 1..5 the
+// button icons, then (chromatic block only) 22 note frames 128x256: the head centred at (96, 40), the sharp left of
+// it, and 0..5 ledger lines below or through the head, kChromaGapPx apart (the staff's line gap at the head's size).
+//   frame = 6 + sharp + 2 * (ledgers ? 1 + 2 * (ledgers - 1) + in_space : 0)   (in_space: the top ledger is half a gap below)
+constexpr uint8_t kFrameChroma0 = 6, kChromaticFrames = 28, kMaxLedgers = 5;
+constexpr float kHeadScale = 0.85f;                       // head size / button icon size
+constexpr float kChromaW = 2.0f, kChromaH = 4.0f;         // frame size in head sizes (128x256 px for a 64 px head)
+constexpr float kChromaCx = 96.0f / 64.0f, kChromaCy = 40.0f / 64.0f;   // head centre in the frame, in head sizes
+inline uint8_t ChromaFrame(int midi) {
+    const int step = StaffStep(midi);
+    const Ledgers l = LedgersFor(step);
+    const int k = l.count > kMaxLedgers ? kMaxLedgers : l.count;
+    const int in_space = (step & 1) != 0;
+    return uint8_t(kFrameChroma0 + (StaffSharp(midi) ? 1 : 0) + 2 * (k ? 1 + 2 * (k - 1) + in_space : 0));
+}
 struct Geometry {
     float staff_x = 0.0f, staff_y = -187.0f, staff_w = 360.0f, staff_h = 90.0f;
     float note = 28.0f, slot_x0 = -88.0f, slot_dx = 34.0f;
@@ -80,6 +97,7 @@ inline constexpr int8_t kStep[5] = {-1, 1, 3, 4, 6};
 inline float LineGap(const Geometry& g) { return g.staff_h * 16.0f / 128.0f; }
 inline float BottomLine(const Geometry& g) { return g.staff_y - g.staff_h * 32.0f / 128.0f; }
 inline float NoteY(const Geometry& g, int note) {
+    if (IsPitchNote(note)) return BottomLine(g) + StaffStep(note) * LineGap(g) * 0.5f;
     return note < 0 || note > 4 ? g.staff_y : BottomLine(g) + kStep[note] * LineGap(g) * 0.5f;
 }
 inline float SlotX(const Geometry& g, int slot) { return g.slot_x0 + slot * g.slot_dx; }
@@ -144,7 +162,10 @@ struct UnitView { bool visible = false; uint8_t tex_no = 0; float x = 0, y = 0, 
 class Staff {
     int8_t note_[kSlots] = {}; uint8_t count_ = 0; uint8_t lit_ = 0;
     double age_[kSlots] = {}; double mode_t_ = 0; Mode mode_ = Mode::Hidden;
+    bool chromatic_art_ = true;   // the loaded texture has frames 6..27 (else chromatic notes stay hidden)
 public:
+    void SetChromaticArt(bool on) { chromatic_art_ = on; }
+    bool chromatic_art() const { return chromatic_art_; }
     static constexpr double kPop = 6, kJinglePeriod = 20, kFade = 18, kDimRgb = 96, kDimA = 200;
     Mode mode() const { return mode_; }
     uint8_t count() const { return count_; }
@@ -152,7 +173,7 @@ public:
     void Open() { count_ = 0; lit_ = 0; mode_ = Mode::Live; mode_t_ = 0; }
     void Close() { count_ = 0; lit_ = 0; mode_ = Mode::Hidden; mode_t_ = 0; }
     void Push(int8_t n) {
-        if (mode_ != Mode::Live || n < 0 || n > 4) return;
+        if (mode_ != Mode::Live || !ValidNote(n)) return;
         if (count_ == kSlots) {
             for (int i = 1; i < kSlots; ++i) { note_[i - 1] = note_[i]; age_[i - 1] = age_[i]; }
             --count_;
@@ -189,6 +210,8 @@ public:
         const int slot = unit - 1;
         if (slot >= count_) return v;
         const int8_t n = note_[slot];
+        const bool pitch = IsPitchNote(n);
+        if (pitch && !chromatic_art_) return v;
         const bool dim = mode_ == Mode::Replay && slot >= lit_;
         double scale = 1.0, rgb = 255, a = alpha;
         if (dim) { rgb = kDimRgb; a = alpha * kDimA / 255.0; }
@@ -197,9 +220,19 @@ public:
             const double ph = mode_t_ / kJinglePeriod; const double tri = ph - double(int(ph));
             scale = 1.0 + 0.12 * (tri < 0.5 ? tri * 2 : (1 - tri) * 2);
         }
-        v.visible = a > 0.5; v.tex_no = uint8_t(1 + n);
-        v.x = SlotX(g, slot); v.y = NoteY(g, n); v.w = v.h = float(g.note * scale);
+        v.visible = a > 0.5;
         v.rgba[0] = v.rgba[1] = v.rgba[2] = uint8_t(rgb); v.rgba[3] = uint8_t(a);
+        const float size = float(g.note * scale);
+        if (!pitch) {
+            v.tex_no = uint8_t(1 + n);
+            v.x = SlotX(g, slot); v.y = NoteY(g, n); v.w = v.h = size;
+        } else {   // the frame is kChromaW x kChromaH head sizes, the head at (kChromaCx, kChromaCy) from its top left
+            const float head = size * kHeadScale;
+            v.tex_no = ChromaFrame(n);
+            v.w = head * kChromaW; v.h = head * kChromaH;
+            v.x = SlotX(g, slot) + (v.w * 0.5f - head * kChromaCx);
+            v.y = NoteY(g, n) - (v.h * 0.5f - head * kChromaCy);
+        }
         return v;
     }
 };
@@ -307,7 +340,7 @@ private:
     static bool Usable(const Melody& m) { return m.length && m.length <= 8; }
     static bool Suffix(const Melody& a, const Melody& b) {   // a is a suffix of b
         if (!Usable(a) || !Usable(b) || a.length > b.length) return false;
-        for (uint8_t i = 0; i < a.length; ++i) if (a.notes[a.length - 1 - i] != b.notes[b.length - 1 - i]) return false;
+        for (uint8_t i = 0; i < a.length; ++i) if (ToMidi(a.notes[a.length - 1 - i]) != ToMidi(b.notes[b.length - 1 - i])) return false;
         return true;
     }
     bool On(int8_t s) const { return s == 0 ? cfg_.serenity : (s > 0 && unsigned(s) <= cfg_.extra_count && cfg_.extra[s - 1].enabled); }
@@ -316,14 +349,17 @@ private:
     SongEnum Id() const { return cur_ == 0 ? SongEnum::Serenity : cfg_.extra[cur_ - 1].song; }
     const char* Name() const { return cur_ == 0 ? "serenity" : cfg_.extra[cur_ - 1].name; }
     const char* Line(const char* what) { std::snprintf(line_, sizeof(line_), "%s %s", Name(), what); return line_; }
+    // By written pitch (ocarina_pitch.h): hist_ holds ToMidi of each note, the melody's buttons are converted.
     bool Match(int8_t s) const {
         const Melody& mel = MelodyOf(s); const uint8_t m = mel.length;
         if (!m || m > 8 || hn_ < m) return false;
-        for (uint8_t i = 0; i < m; ++i) if (hist_[hn_ - m + i] != mel.notes[i]) return false;
+        for (uint8_t i = 0; i < m; ++i) if (hist_[hn_ - m + i] != ToMidi(mel.notes[i])) return false;
         return true;
     }
 public:
     explicit ReplayFlow(Config c = {}) { Configure(c); }
+    // The loaded staff texture has the chromatic frames (ocarina_staff.h kChromaticFrames); else those notes stay hidden.
+    void SetChromaticArt(bool on) { staff_.SetChromaticArt(on); }
     void Configure(Config c) {
         if (c.extra_count > kExtraSongs) c.extra_count = kExtraSongs;
         dropped_ = 0;
@@ -354,10 +390,10 @@ public:
     void OnOpen(uint64_t token) { if (token != seen_) { seen_ = token; hn_ = 0; if (phase_ == Phase::Idle) staff_.Open(); } }
     void OnNote(uint64_t token, int8_t note, Host& h) {
         if (token != seen_) { seen_ = token; hn_ = 0; staff_.Open(); }
-        if (phase_ != Phase::Idle || note < 0 || note > 4) return;
+        if (phase_ != Phase::Idle || !ValidNote(note)) return;
         staff_.Push(note);
         if (hn_ == 8) { for (int i = 1; i < 8; ++i) hist_[i - 1] = hist_[i]; --hn_; }
-        hist_[hn_++] = note;
+        hist_[hn_++] = int8_t(ToMidi(note));
         int8_t hit = -1;
         for (int8_t s = 0; s <= int8_t(cfg_.extra_count) && hit < 0; ++s) if (On(s) && Match(s)) hit = s;
         if (hit < 0) return;

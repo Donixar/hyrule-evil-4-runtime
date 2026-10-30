@@ -1208,9 +1208,10 @@ static void SwordDecide(mortal::dispatch::Runtime& run,void* player){
             else if(a.request.kind==SwordKind::Ending||a.request.kind==SwordKind::Back){targets.items[0]=a.request.target;targets.count=1;}
             else {CmbMem m;targets=sword::target::Select(m,g_cmb_base,g_cmb_tracker,p.pos,CmbGet<float>(p.player+0xA4),SwordSpinTargets(a.request.great),false);}
             // The bullets' Ganados are published after the spin's own, one per tick at best: 2 more ticks each, so a
-            // full Great Spin still reaches them at 30 FPS (review 22-oct).
+            // full Great Spin still reaches them at 30 FPS (review 22-oct); never under 2 frames per target, so a full
+            // 16-target list lands at 30 FPS too (review 27-oct; 60/165 FPS publish them inside the 24).
             const unsigned shot=a.request.kind==SwordKind::Spin?SpinBullets(a.lease,now,p,a.request.great,targets):0U;
-            a.hits.Begin(targets,now+24.0+2.0*shot);
+            const double window=24.0+2.0*shot,need=2.0*targets.count;a.hits.Begin(targets,now+(window>need?window:need));
             if(a.request.kind==SwordKind::Spin&&a.request.great){
                 const unsigned sparks=GreatSparkle(p);
                 CmbLog("spin_strike lease=%llu frame=%u targets=%u strike_tick=%u great=1 radius=%u permille=%u sparks=%u spark_code=%u",a.lease,frame,

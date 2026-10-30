@@ -128,7 +128,7 @@ struct Outcome {
 };
 // Sources: bool Invocation(c); uint32_t ImageBase(); bool Live(size_t); bool Descriptor(uint32_t, Descriptor&);
 // bool Front(c, Front&, float forward[3]); uint32_t Owner(c); bool OwnerPosition(uint32_t owner, float out[3]);
-// uint64_t Now() (ms, follow-up timing).
+// bool Routine(uint32_t owner, uint8_t (&)[2]) (cEm r0/r1, general::Follow chain/flail bounds); uint64_t Now() (ms, follow-up timing).
 // up: the guard pose is up (GuardLayer::Up); game_now: Clock::Now. A cancel with !follow consumed one block.
 template <class S> Outcome Decide(S& s, const parry::Candidate& c, const parry::general::Settings& set,
                                   parry::general::Follow& follow, Durability& durability, bool enabled, bool up, double game_now) {
@@ -151,11 +151,13 @@ template <class S> Outcome Decide(S& s, const parry::Candidate& c, const parry::
     o.reason = Reason::Front;
     if (!s.Front(c, o.front, forward)) return o;
     o.owner = s.Owner(c);
+    g::Swing swing{};   // the attacker's routine: chain/flail returns keep the longer follow-up (as tier 2)
+    if (o.owner) swing.known = s.Routine(o.owner, swing.routine);
     const uint64_t now = s.Now();
     follow.Expire(now);
     // A later sample of a swing this guard already stopped: cancelled silently, free, even if the guard dropped or
     // the shield broke on that swing (it must not hit Link a frame later).
-    if (follow.Matches(o.function, o.owner, o.front.sample, now)) {
+    if (follow.Matches(o.function, o.owner, o.front.sample, now, false, &swing)) {
         follow.Touch(o.front.sample, now);
         o.follow = o.cancel = true; o.reason = Reason::Blocked; o.left = durability.Left();
         return o;
@@ -171,7 +173,7 @@ template <class S> Outcome Decide(S& s, const parry::Candidate& c, const parry::
     if (!InCone(o.front.player, forward, source, o.cos)) return o;
     const Hit hit = durability.Block(game_now);
     if (hit == Hit::Ignored) { o.reason = Reason::Broken; return o; }
-    follow.Arm(o.function, o.owner, o.front.sample, now);
+    follow.Arm(o.function, o.owner, o.front.sample, now, swing);
     o.broke = hit == Hit::Broke; o.left = durability.Left();
     o.cancel = true; o.reason = Reason::Blocked;
     return o;
@@ -213,6 +215,7 @@ struct LayerConfig {
     unsigned break_hold = 75;             // break clip cap (35 TP frames = 70 game frames at TP speed)
     unsigned contest_limit = 3;           // native detaches within contest_window: give up until the lock is released
     unsigned contest_window = 120;
+    unsigned resume_limit = 12;           // freed-2A8 re-installs within contest_window before the old lost path
 };
 struct LayerWorld {
     uint32_t player = 0;
@@ -225,7 +228,7 @@ struct LayerWorld {
 };
 struct LayerStats {
     unsigned installs = 0, completed = 0, cancelled = 0, lost_owner = 0, dropped = 0, refused = 0, install_failed = 0;
-    unsigned hits = 0, breaks = 0, lent = 0, repeated_frame = 0, neck_suppressed = 0, contested = 0;
+    unsigned hits = 0, breaks = 0, lent = 0, repeated_frame = 0, neck_suppressed = 0, contested = 0, resumed = 0;
 };
 enum class Phase : uint8_t { Idle, In, Hold, Out, Zero, Breaking };
 inline const char* PhaseName(Phase p) {
@@ -260,6 +263,7 @@ public:
         if (!w.wanted && phase_ == Phase::Idle) { contest_ = 0; given_up_ = false; }
         if (cooldown_ > 0) cooldown_ -= step;
         if (contest_window_ > 0) contest_window_ -= step; else contest_ = 0;
+        if (resume_window_ > 0) resume_window_ -= step; else resumes_ = 0;
         if (phase_ != Phase::Idle && w.frame && w.frame == frame_) {
             ++stats_.repeated_frame;
             if (w.player == player_ && port.Secondary(player_) == work_ && phase_ != Phase::Zero) port.SetWeight(work_, last_);
@@ -286,6 +290,20 @@ public:
             // A known action took Link (damage, a sword clip such as the Shield Bash, Mortal Draw, ocarina): its
             // primary MotionSet detached us. Not a contest: the guard comes back after it, while still wanted.
             if (w.blocked) { ++stats_.cancelled; Idle(); cooldown_ = config_.cooldown; return; }
+            // shield-guard-resume (30-oct): a locomotion MotionSet (walk/stop/turn, most often over the grenade and
+            // Striker primaries) clears 2A8 or hands it back to the neck. While still wanted, re-install at once at
+            // the weight in effect instead of dropping the shield for the cooldown; a foreign owner or too many
+            // resumes in the window still take the old path.
+            const uint32_t cur = port.Secondary(player_);
+            const bool freed = !cur || cur == player_ + kNeckWorkOffset || (w.image_base && cur == w.image_base + kStanceWorkRva);
+            if (freed && w.wanted && clip_ == Clip::Guard && (phase_ == Phase::In || phase_ == Phase::Hold) &&
+                resumes_ < config_.resume_limit) {
+                uint32_t work = 0;
+                if (port.Install(player_, Clip::Guard, work) && work && port.Secondary(player_) == work) {
+                    if (resume_window_ <= 0) resume_window_ = config_.contest_window;
+                    ++resumes_; ++stats_.resumed; work_ = work; previous_ = cur; Write(port, last_); return;
+                }
+            }
             ++stats_.lost_owner; Lost(); return;                          // unexplained native detach or the neck
         }
         if (w.blocked) { ++stats_.cancelled; Give(port); Idle(); cooldown_ = config_.cooldown; return; }
@@ -352,9 +370,9 @@ private:
     Phase phase_ = Phase::Idle;
     Clip clip_ = Clip::Guard;
     uint32_t player_ = 0, work_ = 0, previous_ = 0, frame_ = 0;
-    double ramp_ = 0, cooldown_ = 0, contest_window_ = 0;
+    double ramp_ = 0, cooldown_ = 0, contest_window_ = 0, resume_window_ = 0;
     float last_ = 0.f, from_ = 0.f;
-    unsigned contest_ = 0;
+    unsigned contest_ = 0, resumes_ = 0;
     bool hit_pending_ = false, break_pending_ = false, given_up_ = false, lent_now_ = false;
     LayerStats stats_;
 };
@@ -585,5 +603,19 @@ template <class Memory> int PrimaryArmIk(Memory& m, uint32_t model) {
     const size_t need = 3 + 3 * size_t(header[2]);
     if (!m.Read(motion, header, need)) return -1;
     return HeaderHasArmIk(header, need) ? 1 : 0;
+}
+// shield-fk-guard-01 (29-oct): primaries without that chain (grenades 0x08, Striker 0x1C: arm_ik=0) play the FK
+// variant of the clips instead (link_shield_guard*_fk.fcv: part 16 parent-relative, the hand where the forward
+// kinematics of the clip puts it). The variant is chosen when the layer installs; if the primary's verdict flips while
+// the layer is up, the layer ends cleanly (blocked) and comes back with the other variant after the cooldown.
+enum class ClipVariant : uint8_t { None, Effector, Fk };
+inline const char* VariantName(ClipVariant v) { return v == ClipVariant::Effector ? "ik" : v == ClipVariant::Fk ? "fk" : "none"; }
+// arm_ik: PrimaryArmIk (1 chain, 0 no chain, -1 unreadable); fk_ready: the FK clips are resident.
+inline ClipVariant VariantFor(int arm_ik, bool fk_ready) {
+    if (arm_ik == 1) return ClipVariant::Effector;
+    return arm_ik == 0 && fk_ready ? ClipVariant::Fk : ClipVariant::None;
+}
+inline bool VariantMismatch(bool layer_active, ClipVariant running, ClipVariant now) {
+    return layer_active && now != ClipVariant::None && running != now;
 }
 }  // namespace link_runtime::shield_guard

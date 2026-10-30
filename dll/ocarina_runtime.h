@@ -17,7 +17,15 @@ struct Bindings {
     uint8_t stow = 0x44;    // D
     uint8_t note_a = 0x41;  // A
     uint8_t up = 0x26, down = 0x28, left = 0x25, right = 0x27;  // arrows
+    // Chromatic ocarina (29-oct): the piano keys of written C4..B5 (ocarina_input.h RawInput::piano; Shift = +1
+    // octave). Z S X D C V G B H N J M = C C# D D# E F F# G G# A A# B (C4 octave), Q 2 W 3 E R 5 T 6 Y 7 U (C5).
+    // 0 = that key is off (it clashed with one of the bindings above).
+    uint8_t piano[24] = {0x5A, 0x53, 0x58, 0x44, 0x43, 0x56, 0x47, 0x42, 0x48, 0x4E, 0x4A, 0x4D,
+                         0x51, 0x32, 0x57, 0x33, 0x45, 0x52, 0x35, 0x54, 0x36, 0x59, 0x37, 0x55};
+    uint8_t shift = 0x10;   // VK_SHIFT
 };
+// Where stow goes when the piano takes its key (the default D is the piano's D#4): Backspace.
+constexpr uint8_t kPianoStow = 0x08;
 
 // Every switch is off unless the INI holds exactly "1" (like ChapterIniSwitch). Enabled is the
 // master: with it 0 nothing of the ocarina is created, hooked or opened. The other switches
@@ -28,6 +36,8 @@ struct Config {
     // OcarinaPadStyle (18-oct, Donald): n64 (default) = C notes on the RIGHT stick, A note on A, B puts it away, L+R
     // (LB+RB) takes it out or away; the left stick plays nothing. legacy = the 11-oct mapping (notes on the left stick).
     bool pad_n64 = true;
+    // Piano (29-oct): missing or exactly 1 = the piano keys play chromatic notes while the ocarina is out; 0 = off.
+    bool piano = true;
     unsigned volume = 35;
     Bindings keys;
 };
@@ -45,7 +55,7 @@ inline int ParseKey(const wchar_t* v) {
         return -1;
     }
     struct Named { const wchar_t* name; int vk; };
-    static const Named names[] = {{L"Up", 0x26}, {L"Down", 0x28}, {L"Left", 0x25}, {L"Right", 0x27}};
+    static const Named names[] = {{L"Up", 0x26}, {L"Down", 0x28}, {L"Left", 0x25}, {L"Right", 0x27}, {L"Backspace", 0x08}};
     for (const auto& n : names) {
         const wchar_t* a = n.name; const wchar_t* b = v;
         while (*a && *b && *a == *b) { ++a; ++b; }
@@ -100,7 +110,26 @@ Config ReadConfig(Get get, unsigned& problems) {
     for (size_t i = 0; i < 7 && keys_ok; ++i)
         for (size_t j = i + 1; j < 7; ++j)
             if (*slots[i].field == *slots[j].field) { keys_ok = false; ++problems; break; }
+    const bool stow_set = [&] { value[0] = 0; get(L"KeyStow", value, 32); return value[0] != 0; }();
     if (keys_ok) c.keys = keys;
+    value[0] = 0; get(L"Piano", value, 32);
+    if (value[0] == L'0' && !value[1]) c.piano = false;
+    else if (value[0] && !ExactOne(value)) ++problems;
+    if (c.piano) {
+        // A piano key equal to toggle, note A or an arrow stays that binding (the piano loses that note); stow
+        // moves to Backspace (a KeyStow set by hand on a piano key counts a problem).
+        const uint8_t fixed[] = {c.keys.toggle, c.keys.note_a, c.keys.up, c.keys.down, c.keys.left, c.keys.right};
+        for (uint8_t& k : c.keys.piano) for (uint8_t f : fixed) if (k == f) k = 0;
+        bool clash = false;
+        for (uint8_t k : c.keys.piano) if (k && k == c.keys.stow) clash = true;
+        if (clash) {
+            if (stow_set) ++problems;
+            c.keys.stow = kPianoStow;
+            for (uint8_t f : fixed) if (f == kPianoStow) { c.keys.stow = 0; break; }   // no stow key: O still puts it away
+        }
+    } else {
+        for (uint8_t& k : c.keys.piano) k = 0;
+    }
     value[0] = 0; get(L"OcarinaPadStyle", value, 32);
     if (value[0]) {
         auto same = [&](const wchar_t* w) { const wchar_t* a = value; for (; *a && *w; ++a, ++w) { wchar_t x = *a >= L'A' && *a <= L'Z' ? wchar_t(*a + 32) : *a; if (x != *w) return false; } return !*a && !*w; };
@@ -202,7 +231,8 @@ public:
 inline int CostumeAsset(unsigned costume) { return costume <= 3 ? int(costume) : -1; }
 
 // XInput gamepad state, already read (buttons and left stick, raw shorts).
-struct Pad { bool connected = false; uint16_t buttons = 0; int16_t lx = 0, ly = 0, rx = 0, ry = 0; };
+struct Pad { bool connected = false; uint16_t buttons = 0; int16_t lx = 0, ly = 0, rx = 0, ry = 0; uint8_t rt = 0; };
+constexpr uint8_t kPadTrigger = 64;   // right trigger held (of 255) = one octave up for the pad notes
 constexpr uint16_t kPadA = 0x1000, kPadB = 0x2000, kPadLB = 0x0100, kPadRB = 0x0200;
 inline float Axis(int16_t v) { return v < 0 ? (v < -32767 ? -1.f : float(v) / 32767.f) : float(v) / 32767.f; }
 
@@ -212,9 +242,11 @@ RawInput Assemble(const Bindings& k, Down down, const Pad& pad, bool use_pad, bo
     RawInput r;
     r.toggle_key = down(k.toggle); r.stow = down(k.stow); r.a = down(k.note_a);
     r.up = down(k.up); r.down = down(k.down); r.left = down(k.left); r.right = down(k.right);
+    for (int i = 0; i < 24; ++i) if (k.piano[i] && down(k.piano[i])) r.piano |= 1u << i;
+    r.shift = k.shift && down(k.shift);
     if (use_pad && pad.connected) {
         r.pad_a = (pad.buttons & kPadA) != 0; r.pad_b = (pad.buttons & kPadB) != 0;
-        r.lb = (pad.buttons & kPadLB) != 0; r.rb = (pad.buttons & kPadRB) != 0;
+        r.lb = (pad.buttons & kPadLB) != 0; r.rb = (pad.buttons & kPadRB) != 0; r.rt = pad.rt >= kPadTrigger;
         // n64: the C buttons are the right stick; the left stick is not read at all.
         r.lx = Axis(n64 ? pad.rx : pad.lx); r.ly = Axis(n64 ? pad.ry : pad.ly);
     }

@@ -39,12 +39,12 @@ class NoteHistory {
     int8_t notes_[8]={};uint8_t head_=0,count_=0;
 public:
     static constexpr uint8_t kCapacity=8;
-    void Push(int8_t note){if(note<0||note>4)return;notes_[head_]=note;head_=uint8_t((head_+1)%kCapacity);if(count_<kCapacity)++count_;}
+    void Push(int8_t note){if(!ValidNote(note))return;notes_[head_]=note;head_=uint8_t((head_+1)%kCapacity);if(count_<kCapacity)++count_;}
     void Clear(){head_=count_=0;}
     uint8_t Size() const {return count_;}
     int8_t At(uint8_t i) const {return i<count_?notes_[(head_+kCapacity-count_+i)%kCapacity]:int8_t(-1);}
-    // 4 bits per note (note+1, 0 = empty), oldest in the lowest nibble: for one log word.
-    uint32_t Packed() const {uint32_t v=0;for(uint8_t i=0;i<count_;++i)v|=uint32_t(At(i)+1)<<(4*i);return v;}
+    // 4 bits per note (button+1, 0xF = a chromatic pitch, 0 = empty), oldest in the lowest nibble: for one log word.
+    uint32_t Packed() const {uint32_t v=0;for(uint8_t i=0;i<count_;++i){const int8_t n=At(i);v|=uint32_t(IsButtonNote(n)?n+1:0xF)<<(4*i);}return v;}
 };
 template<class Host> class Session {
     State st=State::Idle; Reason why=Reason::None; uint64_t tok=0,next=1;

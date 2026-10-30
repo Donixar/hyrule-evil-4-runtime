@@ -16,7 +16,7 @@ inline Diagnostic Inspect(const shield::HitRecord& h,uint32_t base){
     d.producer=h.event.outer_return>=base?h.event.outer_return-base:0xFFFFFFFFU;
     if((h.frame.character&0xFF)==0){
         const unsigned costume=(h.frame.character>>8)&0xFF;
-        d.model=costume==0?Model::OrdonCandidate:(costume==1||costume==3)?Model::HylianCandidate:Model::Unknown;
+        d.model=costume==0?Model::OrdonCandidate:(costume==1||costume==2||costume==3)?Model::HylianCandidate:Model::Unknown;
     }
     const auto& p=h.preclamp;
     d.final_known=h.captured&&h.event.native_hit>0&&p.valid&&!p.rejected&&p.captures==1&&p.damage>=0;

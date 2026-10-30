@@ -2,8 +2,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include "ocarina_pitch.h"
 namespace link_runtime::ocarina {
-// Packed request: token (48 bits) | sequence (8 bits) | note+1 (8 bits).
+// Packed request: token (48 bits) | sequence (8 bits) | note+1 (8 bits); note = ocarina_pitch.h code (0..4 or 60..95).
 // One game-thread producer, one audio-worker consumer, no game pointers.
 // Push and Close are game-thread only (single producer). A focus-loss fade is
 // done consumer-side: the worker calls audio.FadeStop() itself, never Close.
@@ -12,7 +13,7 @@ class NoteMailbox {
     std::atomic<uint64_t> req{0}; uint64_t closed=0; uint8_t seq=0;
 public:
     bool Push(uint64_t token,int8_t note){
-        if(!token||token<=closed||note<0||note>4||token>=(1ULL<<48))return false;
+        if(!token||token<=closed||!ValidNote(note)||token>=(1ULL<<48))return false;
         ++seq;req.store((token<<16)|(uint64_t(seq)<<8)|uint64_t(note+1),std::memory_order_release);return true;
     }
     void Close(uint64_t token){

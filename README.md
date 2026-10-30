@@ -28,7 +28,7 @@ set VCVARS32=C:\path\to\VC\Auxiliary\Build\vcvars32.bat
 scripts\build_link_runtime.bat build
 ```
 
-The script downloads MinHook 1.3.4 (SHA-256 pinned), compiles it, builds and runs the native tests, compiles
+The script downloads MinHook 1.3.4 (SHA-256 pinned), compiles it, builds and runs the native tests (core, health, damage, trace, log, low health, parry line and direct parry routes), compiles
 `dll/link_runtime.cpp` with `/std:c++17 /W4 /WX /O2 /MT` into `build\dinput8.dll` with its version resource
 (product "Hyrule Evil 4", version from `dll/link_runtime_version.h`), and finally checks that the proxy loads and
 forwards `DirectInput8Create`. It prints `READY: build\dinput8.dll` on success. It never installs anything or starts
@@ -36,8 +36,9 @@ the game. Timestamps and build paths are embedded, so a rebuild is not byte-iden
 
 ## Version
 
-This source corresponds to Hyrule Evil 4 **3.2.0** (shipped `dinput8.dll` SHA-256
-`4eae540a598aac4d6a2d30c6411b19199d4b90b97fd757878fd4734a98eea7a6`); later commits only changed source comments.
+This source corresponds to Hyrule Evil 4 **3.3.0** (shipped `dinput8.dll` SHA-256
+`1239624cc901ead1fbafcc7811566f266074e2359c46c6ce1b81077fbe24f9a7`). The 3.2.0 source is the previous commit of this repository.
+Download mirror for the mod releases: https://github.com/Donixar/HyruleEvil4/releases
 
 ## Disclaimer
 

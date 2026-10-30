@@ -29,9 +29,12 @@ inline double Determinant(const Mat34& a) {
          - a.v[0][1]*(a.v[1][0]*a.v[2][2]-a.v[1][2]*a.v[2][0])
          + a.v[0][2]*(a.v[1][0]*a.v[2][1]-a.v[1][1]*a.v[2][0]);
 }
-inline bool Rigid(const Mat34& a) {
+// The sword reader's tolerance for the animated hand bone (part10): after a first spin, the charge hold's blended
+// bone measured row-dot error 1.2e-4 and det 0.99984 in game (28-oct), so 1e-4 dropped the glow and the parry pose for
+// a whole charge. A garbage read stays far outside 5e-4.
+constexpr double kPoseRigidTolerance=5e-4;
+inline bool Rigid(const Mat34& a,double tolerance=1e-4) {
     // Numerical acceptance tolerance, not evidence of a native pose epoch.
-    constexpr double tolerance=1e-4;
     for(const auto& row:a.v) for(double x:row) if(!std::isfinite(x)) return false;
     for(unsigned i=0;i<3;++i) for(unsigned j=0;j<3;++j) {
         double dot=0;for(unsigned k=0;k<3;++k) dot+=a.v[i][k]*a.v[j][k];
@@ -55,9 +58,10 @@ inline bool InverseRigid(const Mat34& a,Mat34& out) {
 struct Pose {Mat34 body0,info,bone10,inverse_bind10;};
 inline bool WorldTransform(const Pose& pose,Mat34& out) {
     out={};Mat34 inverse{};
-    if(!InverseRigid(pose.body0,inverse)||!Rigid(pose.info)||!Rigid(pose.bone10)||!Rigid(pose.inverse_bind10)) return false;
+    // The animated hand bone (and so the product) carries its blend drift: the reader's pose tolerance for those two.
+    if(!InverseRigid(pose.body0,inverse)||!Rigid(pose.info)||!Rigid(pose.bone10,kPoseRigidTolerance)||!Rigid(pose.inverse_bind10)) return false;
     Mat34 result=Multiply(Multiply(Multiply(Multiply(pose.body0,pose.info),inverse),pose.bone10),pose.inverse_bind10);
-    if(!Rigid(result)) return false;
+    if(!Rigid(result,kPoseRigidTolerance)) return false;
     out=result;return true;
 }
 enum class Profile {Unknown,Ordon,MasterSword,CampaignPl00};
