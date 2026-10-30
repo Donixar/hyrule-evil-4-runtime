@@ -37,7 +37,7 @@ the game. Timestamps and build paths are embedded, so a rebuild is not byte-iden
 ## Version
 
 This source corresponds to Hyrule Evil 4 **3.3.0** (shipped `dinput8.dll` SHA-256
-`1239624cc901ead1fbafcc7811566f266074e2359c46c6ce1b81077fbe24f9a7`). The 3.2.0 source is the previous commit of this repository.
+`1239624cc901ead1fbafcc7811566f266074e2359c46c6ce1b81077fbe24f9a7`). Every released version has a tag: [v3.2.0](../../tree/v3.2.0), [v3.2.1](../../tree/v3.2.1), [v3.3.0](../../tree/v3.3.0).
 Download mirror for the mod releases: https://github.com/Donixar/HyruleEvil4/releases
 
 ## Disclaimer
