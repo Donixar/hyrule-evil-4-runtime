@@ -28,16 +28,18 @@ set VCVARS32=C:\path\to\VC\Auxiliary\Build\vcvars32.bat
 scripts\build_link_runtime.bat build
 ```
 
-The script downloads MinHook 1.3.4 (SHA-256 pinned), compiles it, builds and runs the native tests (core, health, damage, trace, log, low health, parry line and direct parry routes), compiles
-`dll/link_runtime.cpp` with `/std:c++17 /W4 /WX /O2 /MT` into `build\dinput8.dll` with its version resource
-(product "Hyrule Evil 4", version from `dll/link_runtime_version.h`), and finally checks that the proxy loads and
-forwards `DirectInput8Create`. It prints `READY: build\dinput8.dll` on success. It never installs anything or starts
-the game. Timestamps and build paths are embedded, so a rebuild is not byte-identical to the shipped file.
+The script downloads MinHook 1.3.4 (SHA-256 pinned), compiles it, builds and runs the native tests (core, health, damage, trace, log, low health, parry line, direct parry routes, parry pushback and the secondary motion slot), compiles
+`dll/link_runtime.cpp` with `/std:c++17 /W4 /WX /O2 /MT /experimental:deterministic` (source paths mapped with
+`/pathmap`) into `build\dinput8.dll` with its version resource (product "Hyrule Evil 4", version from
+`dll/link_runtime_version.h`), and finally checks that the proxy loads and forwards `DirectInput8Create`. It prints
+`READY: build\dinput8.dll` on success. It never installs anything or starts the game. From 3.4.0 the build is
+deterministic: with the same toolset (VS 2022 Build Tools, SDK 10.0.22621.0) a rebuild in any folder is byte-identical
+to the shipped DLL.
 
 ## Version
 
-This source corresponds to Hyrule Evil 4 **3.3.0** (shipped `dinput8.dll` SHA-256
-`1239624cc901ead1fbafcc7811566f266074e2359c46c6ce1b81077fbe24f9a7`). Every released version has a tag: [v3.2.0](../../tree/v3.2.0), [v3.2.1](../../tree/v3.2.1), [v3.3.0](../../tree/v3.3.0).
+This source corresponds to Hyrule Evil 4 **3.4.0** (shipped `dinput8.dll` SHA-256
+`7032f9f84fa95fee7a9511aed68d9e442451e1a8f21a6bc9585c9138723fec43`). Every released version has a tag: [v3.2.0](../../tree/v3.2.0), [v3.2.1](../../tree/v3.2.1), [v3.3.0](../../tree/v3.3.0), [v3.4.0](../../tree/v3.4.0).
 Download mirror for the mod releases: https://github.com/Donixar/HyruleEvil4/releases
 
 ## Disclaimer

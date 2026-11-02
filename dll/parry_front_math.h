@@ -61,10 +61,21 @@ inline float Dot(const float* a,const float* b){
     return result;
 }
 inline bool Finite(const float* values){return values&&std::isfinite(values[0])&&std::isfinite(values[1])&&std::isfinite(values[2]);}
+// No horizontal travel at all (under 1 unit in XZ): the travel direction says nothing.
+inline bool Degenerate(const float* sample,const float* base){
+    const double x=double(sample[0])-base[0],z=double(sample[2])-base[2];
+    return !(x*x+z*z>=1.0);
+}
 }
 // forward (optional, 3 floats): the native RotVector((0,0,1),angles) used for the dot, for the
 // tier-2 forward half-plane. Written only on success.
-inline bool Evaluate(Rotate rotate,const float* sample,const float* base,const float* position,const float* angles,Result& out,float* forward_out=nullptr){
+// travel (hunt-findings P2-4, 1-nov; the Zealot bolt line, parry_line.h): the direction is always the object's own travel,
+// sample - base, even under the native 100-unit short rule (which uses position - sample: a bolt whose short step
+// already passed Link's centre then read as coming from behind, and one from behind as frontal). Only a step with no
+// horizontal travel falls back to position - base (from where the object was, toward Link). short_direction then
+// says whether that fallback was used.
+inline bool Evaluate(Rotate rotate,const float* sample,const float* base,const float* position,const float* angles,Result& out,float* forward_out=nullptr,
+                     bool travel=false){
     const DWORD error=GetLastError();
     __declspec(align(16)) unsigned char fp[512];const unsigned mxcsr=0x1f80;
     __asm {fxsave fp
@@ -75,8 +86,13 @@ inline bool Evaluate(Rotate rotate,const float* sample,const float* base,const f
         __try {
             if(rotate&&detail::Finite(sample)&&detail::Finite(base)&&detail::Finite(position)&&detail::Finite(angles)){
                 Result r;float direction[3]{},forward[3]={0,0,1};
-                r.short_direction=detail::Short(sample,base);
-                detail::Subtract(r.short_direction?position:sample,r.short_direction?sample:base,direction);
+                if(!travel){
+                    r.short_direction=detail::Short(sample,base);
+                    detail::Subtract(r.short_direction?position:sample,r.short_direction?sample:base,direction);
+                }else{
+                    r.short_direction=detail::Degenerate(sample,base);
+                    detail::Subtract(r.short_direction?position:sample,base,direction);
+                }
                 rotate(forward,angles,forward);
                 if(detail::Finite(direction)&&detail::Finite(forward)){
                     r.dot=detail::Dot(forward,direction);

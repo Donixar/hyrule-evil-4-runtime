@@ -17,6 +17,11 @@ using NormalForward=void(__cdecl*)(Handler,void*);
 using BeforeCore=void(__cdecl*)(void*,void*,void*,uintptr_t);
 inline NormalForward normal_forward=nullptr;
 inline BeforeCore before_core=nullptr;
+// TP HUD (hud_tp.h): once the shared core has run for the CURRENT player model on the owned game thread. Unlike
+// the Normal/Event handlers it also runs on damage / death routine frames, so the hearts follow a hit at once.
+// Null keeps the core untouched ([Hud] keys 0).
+using PlayerFrame=void(__cdecl*)(void*);
+inline PlayerFrame player_frame=nullptr;
 inline LONG thread=0;   // the served game thread (binding's id), read by OwnedThread
 inline thread_binding::Binding binding;
 inline void* targets[3]{};
@@ -39,7 +44,7 @@ inline void __cdecl Normal(void* p){if(PlayerThread(p))runtime.Handle(false,norm
 inline void __cdecl Event(void* p){if(PlayerThread(p))runtime.Handle(true,event_original,p);else event_original(p);}
 inline void __cdecl Core(void* p,void* w,void* c){
     const uintptr_t caller=reinterpret_cast<uintptr_t>(_ReturnAddress());
-    if(OwnedThread()){if(before_core)before_core(p,w,c,caller);runtime.Core(core_original,p,w,c);}
+    if(OwnedThread()){if(before_core)before_core(p,w,c,caller);runtime.Core(core_original,p,w,c);if(player_frame&&runtime.Current(p))player_frame(p);}
     else core_original(p,w,c);
 }
 // Mandatory existing finder output plus independent event/table/call-chain bytes.
@@ -67,7 +72,7 @@ inline bool Qualify(const shield::NativeAccess& a){
 inline MH_STATUS ReleasePrepared(){
     if(ever_enabled)return MH_ERROR_ENABLED;
     for(unsigned i=0;i<3;++i)if(created[i]){const auto s=MH_RemoveHook(targets[i]);if(s!=MH_OK)return s;created[i]=false;}
-    normal_original=nullptr;event_original=nullptr;core_original=nullptr;normal_forward=nullptr;before_core=nullptr;
+    normal_original=nullptr;event_original=nullptr;core_original=nullptr;normal_forward=nullptr;before_core=nullptr;player_frame=nullptr;
     for(auto& target:targets)target=nullptr;
     runtime={};return MH_OK;
 }

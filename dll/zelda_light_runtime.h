@@ -3,7 +3,8 @@
 // Included by link_runtime.cpp after spin_attack_runtime.h: it uses the combat state (g_cmb_*, CmbMem, CmbGet), the
 // Ganado selection (sword::target::Select), the damage adapter, the native line of sight (BulletWall) and the trail's
 // table-17 node (g_trail_on, Submit). ZeldaLightFrame runs once per player dispatch (CombinedDecide), which the live probe
-// of 23-oct showed running about 165 times a second with pl_type 1 in r20d. Nothing here runs while the player is Link.
+// of 23-oct showed running about 165 times a second with pl_type 1 in r20d. While the player is Link only the partner's
+// own rays run (zelda_companion_runtime.h, ZeldaCompanionRay=1); with it off nothing here runs for Link.
 #include "zelda_light.h"
 namespace zlr {
 namespace zl=link_runtime::zelda_light;
@@ -146,6 +147,30 @@ static void HandStar(double age,const ::sword_trail::Vec3& hand,float yaw){
     scd::runtime::Submit(look,base,hand);
 }
 
+}  // namespace zlr
+#include "zelda_companion_runtime.h"   // zelda-companion-01: the AI partner's rays (Link as the player)
+namespace zlr {
+// The partner's step, at most once per native logic frame (global+0x530C): from Frame (CombinedDecide, only on Link's
+// Normal dispatch) and from the player's core (dispatch_hooks::player_frame, PlayerFrame in link_runtime.cpp), which also
+// runs on Link's damage and death frames. Without the second her cast froze while Link was hit: the clip weight on her
+// +0x2A8 stayed where it was and the ray came late, by the time fallback (review 30-oct).
+static uint32_t g_comp_frame=0xFFFFFFFFu;
+static void CompanionTick(){
+    if(!g_on||!g_trail_on.load(std::memory_order_acquire))return;
+    const auto g=CmbGet<uint32_t>(g_cmb_global_slot);if(!link_runtime::IsPointer(g))return;
+    const uint32_t frame=CmbGet<uint32_t>(g+0x530C);
+    if(frame==g_comp_frame)return;
+    g_comp_frame=frame;
+    if((CmbGet<uint32_t>(g+0x4FC8)&0xFF)!=0){CompanionEnd("player_type");return;}
+    CompanionFrame(link_runtime::sword_trail_log::Ms(GameNow(g_cmb_global_slot)),TrailRoom(),CmbGet<uint32_t>(g_cmb_player_slot));
+}
+// Startup, before the dispatch hooks are enabled (player_frame is published before Observe; Prepare runs after): whether
+// the partner's rays are asked for ([ZeldaLight] Enabled and ZeldaCompanionRay=1). Prepare still decides if they run.
+static bool CompanionRequested(const wchar_t* ini){
+    auto get=[&](const wchar_t* key,wchar_t* out,unsigned count){GetPrivateProfileStringW(L"ZeldaLight",key,L"",out,count,ini);};
+    unsigned extra=0;
+    return zl::ReadConfig(get).on&&link_runtime::zelda_companion::ReadConfig(get,extra).on;
+}
 // Every player dispatch. Off, or the player is not Ashley in play: only the beam ends (room/player change) and nothing is read.
 static void Frame(){
     if(!g_on&&!g_cfg.probe)return;
@@ -154,6 +179,8 @@ static void Frame(){
     if(g_cfg.probe)Probe(pl,room);
     if(!g_on||!g_trail_on.load(std::memory_order_acquire))return;
     const double now_ms=link_runtime::sword_trail_log::Ms(GameNow(g_cmb_global_slot));
+    const uint32_t link_player=pl==0?CmbGet<uint32_t>(g_cmb_player_slot):0;
+    CompanionTick();   // the partner (Link as the player); the player's core may run it again this frame (deduplicated)
     LocalMemory memory;link_runtime::HealthState health;
     const bool read=pl==1&&link_runtime::ReadHealth(memory,g_cmb_player_slot,g_cmb_global_slot,health);
     const bool zelda=read&&link_runtime::ZeldaInPlay(health)&&SwordForeground();
@@ -164,9 +191,10 @@ static void Frame(){
         float face=std::numeric_limits<float>::quiet_NaN(),feet[3]{},at[3]{};
         const float own=zl::Facing(CmbGet<float>(health.player+0xA4));CmbMem fm;
         if(fm.Read(health.player+0x94,feet,12)&&std::isfinite(own)&&PickTarget(feet,own,at))face=zl::YawTo(feet,at[0],at[2]);
-        link_runtime::zelda_cast::Begin(now_ms,face);
+        link_runtime::zelda_cast::Begin(now_ms,face,g_cfg.cast_clip);
         CmbLog("zelda_cast face=%.2f own=%.2f target=%u",double(face),double(own),std::isfinite(face)?1U:0U);
-        if(link_runtime::zelda_cast::Active(now_ms)){g_cast.Begin(now_ms);CmbLog("zelda_cast begin");}
+        if(link_runtime::zelda_cast::Active(now_ms)){
+            g_cast.Begin(now_ms,link_runtime::zelda_cast::ClipCast());CmbLog("zelda_cast begin clip=%u",g_cast.Clip()?1U:0U);}
         else CmbLog("zelda_cast refused (busy, puzzle or damage)");
     }
     // The pose cancelled (damage, an event, a room change): the pending ray goes with it.
@@ -179,11 +207,14 @@ static void Frame(){
             const bool have_hand=link_runtime::zelda_cast::HandWorld(hand);   // her hand bone, last drawn frame
             if(have_hand)g_cast_hand={hand[0],hand[1],hand[2]};
             ::sword_trail::Vec3 impact{};
-            if(g_cast.FireDue(now_ms)){
+            double entries=0;   // the clip's release (zelda_cast_clip.h): its SEQ frame, or game time when unreadable
+            const bool known=g_cast.Clip()&&link_runtime::zelda_cast::ClipFrame(entries);
+            if(g_cast.FireDue(now_ms,g_cast.Clip()&&link_runtime::zelda_cast_clip::ReleaseDue(known,entries,g_cast.Age(now_ms)))){
+                if(g_cast.Clip())CmbLog("zelda_cast release age_ms=%.0f seq=%.2f known=%u",g_cast.Age(now_ms),entries,known?1U:0U);
                 if(!have_hand)CmbLog("zelda_cast no_hand: the ray is dropped");
                 else if(zelda&&Fire(now_ms,health.player,feet,yaw,room,g_cast_hand,impact))Sparks(now_ms,room,health.player,g_cast_hand,impact);
             }
-            if(have_hand)HandStar(g_cast.Age(now_ms),g_cast_hand,yaw);
+            if(have_hand)HandStar(g_cast.GlowAge(now_ms),g_cast_hand,yaw);
         }
     }
     // The sparks and the flash: this system's frames while the player is Ashley (Link's ParticlesFrame draws his own).
@@ -195,7 +226,7 @@ static void Frame(){
     static ::sword_trail::Quad quads[16];
     // The beam lives on through frames where the in-play gates blink (the knife press itself sets a native state bit):
     // only a room or player change ends it.
-    const int n=g_beam.Frame(now_ms,room,read?health.player:0,quads,0,16);
+    const int n=g_beam.Frame(now_ms,room,read?health.player:link_player,quads,0,16);
     if(n>0){
         const auto r=link_runtime::sword_trail::ot::runtime::Submit(quads,n,Style());
         CmbLogV("zelda_beam quads=%d submit=%d in_play=%u",n,int(r),zelda?1U:0U);   // LogLevel 2
@@ -214,6 +245,19 @@ static void Prepare(const wchar_t* directory,bool dispatch_up){
     // The cast pose (zelda_cast_pose_runtime.h): its hooks or no ray at all (an armless cast would fire from nowhere).
     if(!link_runtime::zelda_cast::Install(g_cmb_base,&Log)){Log("ZeldaLight disabled: cast pose hooks failed");return;}
     link_runtime::zelda_cast::detail::log=&CmbLog;   // its begin/end/applied lines come from the game thread: the combat ring
+    // zelda-companion-01: the TP cast clip (ZeldaCastClip=1, also the partner's arm with ZeldaCompanionRay=1) and the
+    // partner's rays. A missing or changed clip leaves the procedural pose (player) or an armless cast (partner).
+    unsigned extra=0;
+    CompanionPrepare(link_runtime::zelda_companion::ReadConfig([&](const wchar_t* key,wchar_t* out,unsigned count){
+        GetPrivateProfileStringW(L"ZeldaLight",key,L"",out,count,path);},extra));
+    if(g_cfg.cast_clip||g_comp_cfg.on){
+        namespace zcc=link_runtime::zelda_cast_clip;unsigned char* f=nullptr;unsigned char* q=nullptr;
+        const bool clip=CmbResident(directory,zcc::kFcvName,zcc::kFcvBytes,zcc::kFcvSha,f)&&CmbResident(directory,zcc::kSeqName,zcc::kSeqBytes,zcc::kSeqSha,q)&&
+            zcc::runtime::Prepare(g_cmb_base,f,q);
+        Log("ZeldaCastClip clip=%u requested=%u companion=%u (%s)",clip?1U:0U,g_cfg.cast_clip?1U:0U,g_comp_cfg.on?1U:0U,
+            clip?"TP hzelda attack_c on +0x2A8":"missing, changed or unpinned: procedural pose / armless partner cast");
+    }
+    g_cfg.problems+=extra;
     wchar_t wav[MAX_PATH]{};
     const bool sound=link_runtime::paths::Format(wav,L"%slink_zelda_light.wav",directory)>0&&g_voice.Load(wav,100,kSoundSha);
     g_on=true;

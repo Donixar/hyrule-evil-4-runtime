@@ -90,15 +90,16 @@ template <class Mem> bool Qualify(Mem& m, uint32_t base, Route r) {
         if (!native_pins::Matches(m, base, pins.data[i].rva, pins.data[i].hex)) return false;
     return true;
 }
-// on: the key's default when the INI lacks it. 3.2.1 ships every direct route off: they install and qualify in game
-// (29-oct, all pins matched) but no contact was reached live yet; the Novistador route is reserved.
+// on: the key's default when the INI lacks it. 3.2.1 shipped every direct route off; since 1-nov (the four P2 fixes of
+// the 29-oct bug hunt, docs/combate-2026-11-01.md) the Krauser kick, bat, cart and tree routes are on by default, as in
+// both INIs. They qualified in game on 29-oct (all pins matched); the Novistador route stays reserved (off).
 struct Spec {const char* name; const wchar_t* key; uint32_t site, skip, vtable; uint8_t id; bool on;};
 inline constexpr Spec kSpecs[] = {
-    {"krauser_kick_probe", L"ParryDirectKrauserKick", 0x146172, 0x146161, 0x7127CC, 0x39, false},
+    {"krauser_kick_probe", L"ParryDirectKrauserKick", 0x146172, 0x146161, 0x7127CC, 0x39, true},
     {"novistador", L"ParryDirectNovistador", 0, 0, 0x711888, 0x2D, false},
-    {"bat_swarm", L"ParryDirectBats", 0xA721E, 0xA7291, 0x7110A8, 0x29, false},
-    {"cart_contact", L"ParryDirectCart", 0x163F35, 0x163FB0, 0x712A60, 0x3B, false},
-    {"giant_tree_sector", L"ParryDirectGiantTree", 0xB506A, 0xB503D, 0x71140C, 0x2B, false}
+    {"bat_swarm", L"ParryDirectBats", 0xA721E, 0xA7291, 0x7110A8, 0x29, true},
+    {"cart_contact", L"ParryDirectCart", 0x163F35, 0x163FB0, 0x712A60, 0x3B, true},
+    {"giant_tree_sector", L"ParryDirectGiantTree", 0xB506A, 0xB503D, 0x71140C, 0x2B, true}
 };
 // Exactly the read-only part of em39GetCliffPos: pG+4F30 -> count, entries +8,
 // type byte, position +4/+8/+C, stride 0x40. Never call the native writer.

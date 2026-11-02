@@ -19,4 +19,9 @@ inline constexpr Clip back_slice_left{L"back_slice_left",835488,224,
     "bcd0e859632db55fceeb492e7efbf5a9b65862e8f34b5740719be04304bc3a56","7d3812aeee4bf2c613a1f77b5b4fcab45027d75c6eb9fb4e1c05b3a321eeff42",
     "83d175fbd8c37a4a5c262c81564af392889f4e72a50e728931c66aec3294ab30",49,L"back_slice"};
 inline constexpr unsigned back_slice_arc_ticks=40;
+inline constexpr Clip backflip{L"backflip",459392,128,
+    "f890317dc07f0ff6e3fd1971e69db428057faf7b5728e0c549ab95c0d6dc9751","7f8c62c99ec01f4a6ca00d2c60147a6ec4479222a5c3442b540b3fc7813253c6",
+    "233ee80255126c8023a63295e057116040e575e6fc4e9ac873c099c0b2cd277e",0};
+inline constexpr unsigned backflip_travel_ticks=26;
+inline constexpr unsigned backflip_land_ticks=30;
 }

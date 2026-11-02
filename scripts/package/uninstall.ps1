@@ -97,6 +97,35 @@ function Test-Reparse([string]$Path) {
     return (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
 }
 
+# A Steam folder moved with a junction is common; follow such links once, up front,
+# so the game root is the real folder and Get-SafePath can keep rejecting every link.
+function Get-CanonicalDirectory([string]$Path, [int]$Depth = 0) {
+    if ($Depth -gt 20) { throw 'Demasiados enlaces en la ruta del juego / too many directory links in the game path.' }
+    $full = [IO.Path]::GetFullPath($Path)
+    $current = [IO.Path]::GetPathRoot($full)
+    foreach ($piece in @($full.Substring($current.Length) -split '[\\/]' | Where-Object { $_ })) {
+        $current = Join-Path $current $piece
+        if (-not (Test-Reparse $current)) { continue }
+        $item = Get-Item -LiteralPath $current -Force
+        $targets = @()
+        if ($item.PSObject.Properties['Target']) { $targets = @($item.Target) }
+        if (-not $targets.Count -or -not $targets[0]) { throw "No pude seguir el enlace de la ruta del juego / could not resolve a link in the game path: $current" }
+        $target = [string]$targets[0]
+        if (-not [IO.Path]::IsPathRooted($target)) { $target = Join-Path ([IO.Path]::GetDirectoryName($current)) $target }
+        $Script:FollowedGameLink = $true
+        $current = Get-CanonicalDirectory $target ($Depth + 1)
+    }
+    return $current.TrimEnd('\', '/')
+}
+
+function Get-GameRoot([string]$Path) {
+    $alias = (Resolve-Path -LiteralPath $Path).ProviderPath.TrimEnd('\')
+    $Script:FollowedGameLink = $false
+    $real = Get-CanonicalDirectory $alias
+    if ($Script:FollowedGameLink) { Say ('Carpeta real (por un enlace): ' + $real) ('Real folder (through a link): ' + $real) }
+    return $real
+}
+
 # Relative names and every ancestor must stay local, including missing leaf files,
 # temporary files and the backup tree. Also used by the updater through LibraryOnly.
 function Get-SafePath([string]$Root, [string]$Rel) {
@@ -222,11 +251,11 @@ function Resolve-Game {
         if (-not (Test-GameFolder $GamePath)) {
             Fail $EXIT_GAME ('No encontré BIO4\ y Bin32\bio4.exe en: ' + $GamePath) ('BIO4\ and Bin32\bio4.exe not found in: ' + $GamePath)
         }
-        return (Resolve-Path -LiteralPath $GamePath).ProviderPath.TrimEnd('\')
+        return (Get-GameRoot $GamePath)
     }
     $parent = Split-Path -Parent $PSScriptRoot
     if ((Split-Path -Leaf $PSScriptRoot) -eq $BackupFolderName -and (Test-GameFolder $parent)) {
-        return (Resolve-Path -LiteralPath $parent).ProviderPath.TrimEnd('\')
+        return (Get-GameRoot $parent)
     }
     $found = Find-Game
     if ($found) {
@@ -244,7 +273,7 @@ function Resolve-Game {
         }
         $found = $typed
     }
-    return (Resolve-Path -LiteralPath $found).ProviderPath.TrimEnd('\')
+    return (Get-GameRoot $found)
 }
 
 # Only process names are read (no handles or memory of the game).

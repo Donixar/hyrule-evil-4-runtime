@@ -14,6 +14,7 @@
 #include "spin_bullets.h"
 #include "shield_bash_scan.h"
 #include "back_slice.h"
+#include "backflip.h"
 #include "sword_parts.h"
 #include "sword_hand.h"
 #include "sword_trail_log.h"
@@ -26,8 +27,10 @@ namespace sword=link_runtime::sword_actions;
 namespace spin=link_runtime::spin_attack;
 namespace ending=link_runtime::ending_blow;
 // Back: the Back Slice (back_slice.h), on the spin's clip. Bash: the Shield Bash's TP clip (spin-fix-01, ShieldBashMotion).
-enum class SwordKind {None,Spin,Ending,Back,Bash};
-static const char* SwordName(SwordKind k){return k==SwordKind::Spin?"spin":k==SwordKind::Back?"back_slice":k==SwordKind::Bash?"shield_bash":"ending";}
+// Flip: TP's backflip (backflip.h, backflip-01; Backflip=1), its own clip, no strike.
+enum class SwordKind {None,Spin,Ending,Back,Bash,Flip};
+static const char* SwordName(SwordKind k){return k==SwordKind::Spin?"spin":k==SwordKind::Back?"back_slice":k==SwordKind::Bash?"shield_bash":
+    k==SwordKind::Flip?"backflip":"ending";}
 static bool SwordSpinClip(SwordKind k){return k==SwordKind::Spin||k==SwordKind::Back;}
 struct SwordClip {unsigned char* fcv=nullptr;unsigned char* seq=nullptr;unsigned strike_tick=0;bool ready=false;};
 static SwordClip g_sword_spin_clip,g_sword_ending_clip,g_sword_bash_clip;
@@ -41,12 +44,18 @@ static mortal::voice::Mailbox g_sword_spin_voice,g_sword_ending_voice,g_sword_ba
 static mortal::voice::Consumer g_sword_spin_consumer,g_sword_ending_consumer,g_sword_back_consumer;
 static AlertVoice g_sword_spin_audio,g_sword_ending_audio,g_sword_bash_audio;   // bash: loaded with its clip, not played (link_shield_bash.wav is)
 static AlertVoice g_sword_back_audio;
+// backflip-01 (Backflip=1): TP's backflip clip (flip + landing) and its voice Z2SE_AL_V_BACKTEN; missing = no backflip.
+static SwordClip g_sword_flip_clip;
+static mortal::voice::Mailbox g_sword_flip_voice;
+static mortal::voice::Consumer g_sword_flip_consumer;
+static AlertVoice g_sword_flip_audio;
 struct SwordRequest {
     SwordKind kind=SwordKind::None;double time=0;uint32_t scene=0,player=0,weapon=0,frame=0;
     sword::target::Target target;
     sword::target::Bodies bodies;   // other Ganados at the press (leap body scan); empty with the leap off
     bool great=false;int hp=0,hp_max=0;   // Spin: the Great Spin (great_spin.h), decided at the release with full HP
     link_runtime::back_slice::Plan back;  // Back: the arc decided at the tap
+    link_runtime::backflip::Plan flip;    // Flip: the travel decided at the tap
 };
 struct SwordAction {
     SwordRequest request;uint64_t lease=0;double start=0;bool struck=false;unsigned strike_tick=0;
@@ -65,7 +74,7 @@ static bool SwordBusy(){return g_sword_action.lease||g_sword_request.kind!=Sword
 // hand-shield body is shown from the start request to the end of the clip.
 static bool SwordShieldInHand(){
     const SwordKind k=g_sword_action.lease?g_sword_action.request.kind:g_sword_starting;
-    return k==SwordKind::Bash||k==SwordKind::Back;
+    return k==SwordKind::Bash||k==SwordKind::Back||k==SwordKind::Flip;
 }
 static sword::target::Config SwordTargets(){
     sword::target::Config c;c.line_waiver=g_cmb.line_waiver;c.strike_radius=float(g_cmb.ending_strike_range);
@@ -128,7 +137,7 @@ static void ChargeEvent(spin::Event event,double time60,uint32_t player);   // t
 namespace bks=link_runtime::back_slice;
 static bks::Circle g_back_circle;
 static bool g_back_have_last=false;static double g_back_last=0;
-struct BackLock {bool valid=false;unsigned index=0;uint32_t pointer=0;uint8_t id=0,type=0;int side=0;};
+struct BackLock {bool valid=false;unsigned index=0;uint32_t pointer=0;uint8_t id=0,type=0;int side=0;bool back=false;};
 static BackLock g_back_lock;   // captured at the tap's press (the knife suspends the Z lock right after)
 // The Back Slice's checks reuse the spin's (Revalidate ending=false): reach = BackSlice reach, band 700.
 static sword::target::Config BackTargets(){auto c=SwordTargets();c.spin_radius=float(g_cmb.back.reach);c.vertical=g_cmb.back.band;return c;}
@@ -172,6 +181,28 @@ static void BackRequest(const sword::Input& input,const CmbPlayer& p,int side){
     g_sword_request.back=plan;
     CmbLog("back_slice request frame=%u side=%s actor=0x%08X id=0x%02X type=0x%02X d=%.0f dy=%.0f radius=%.0f sweep_deg=%.0f",frame,
         side<0?"right":"left",t.pointer,t.id,t.type,double(plan.d),double(plan.dy),double(plan.radius),double(plan.sweep)*57.29578);
+}
+// ---- Backflip (backflip.h; backflip-01, 30-oct) --------------------------------------------------------------------
+namespace bfl=link_runtime::backflip;
+static bfl::Move g_flip_move;
+static bool g_flip_have_last=false;static double g_flip_last=0;
+static constexpr unsigned kFlipNoStrike=0xFFFFFFFFU;   // strike tick past any lease: SwordDecide's strike never runs
+// The travel lasts the clip's flip (its travel ticks).
+static bfl::Config FlipConfig(){return bfl::WithClip(g_cmb.flip,sword::assets::backflip_travel_ticks,sword::assets::backflip_land_ticks);}
+// The tap with S held (BashArbiter, bfl::Pick): straight back from Link's facing, or away from the Z-locked Ganado.
+static void FlipRequest(const sword::Input& input,const CmbPlayer& p){
+    const uint32_t frame=static_cast<uint32_t>(input.frame);
+    if(!g_sword_flip_clip.ready){CmbLog("backflip abort frame=%u reason=no_clip",frame);return;}
+    sword::target::Target t;mtg::Raw r{};
+    bool locked=BackTarget(g_back_lock,t,r);
+    if(!locked)locked=BackTarget(BackCurrentLock(),t,r);
+    const float yaw=input.player?CmbGet<float>(p.player+0xA4):0.f;
+    const auto plan=bfl::Decide(FlipConfig(),{p.pos.x,p.pos.y,p.pos.z},yaw,locked,{r.pos.x,r.pos.y,r.pos.z},g_flip_have_last,g_flip_last,input.time);
+    if(plan.why!=bfl::Why::Ok){CmbLog("backflip abort frame=%u reason=%s locked=%u",frame,bfl::WhyName(plan.why),locked?1U:0U);return;}
+    g_sword_request={SwordKind::Flip,input.time,input.scene,input.player,input.weapon,frame,locked?t:sword::target::Target{}};
+    g_sword_request.flip=plan;
+    CmbLog("backflip request frame=%u locked=%u actor=0x%08X yaw=%.3f dir=%.3f,%.3f distance=%.0f",frame,locked?1U:0U,locked?t.pointer:0U,
+        double(plan.yaw0),double(plan.dir_x),double(plan.dir_z),double(plan.distance));
 }
 // The bash itself (shield_bash.h): Ganados in front take the native kick record (claimed: KnockbackDamage), the weapon
 // deflect window opens, the sound plays. pose: Link's parry reaction layer as the shove (the bash without its clip).
@@ -225,13 +256,20 @@ static void BashArbiter(const sword::Input& input,bool priority,bool occupied,co
     if(e!=sbash::Event::None&&e!=sbash::Event::Bash)
         CmbLogV("shield_bash_input frame=%u event=%s",static_cast<unsigned>(input.frame),sbash::EventName(e));
     // Back Slice (back_slice.h): A/D (or the stick sideways) at the press, else at the release, turns the tap into it.
+    // Backflip (backflip.h, Backflip=1): S (back) likewise; bfl::Pick decides (A/D with a target first).
     const int side_now=bks::Side(g_sword_sample.on);
-    if(e==sbash::Event::Pressed){g_back_lock=g_cmb.BackSlice()?BackCurrentLock():BackLock{};g_back_lock.side=side_now;}
+    const bool back_now=g_cmb.Backflip()&&bfl::Back(g_sword_sample.on);
+    if(e==sbash::Event::Pressed){
+        g_back_lock=g_cmb.BackSlice()||g_cmb.Backflip()?BackCurrentLock():BackLock{};g_back_lock.side=side_now;g_back_lock.back=back_now;}
     if(e!=sbash::Event::Bash)return;
     const int side=g_back_lock.side?g_back_lock.side:side_now;
+    const bool back=g_back_lock.back||back_now;
     // shield-guard-01: the Back Slice needs a real target to circle. Without one (neutral Z-target, or a lock lost
     // since the press) the A/D tap is the Shield Bash, so strafing and tapping in neutral always does something.
-    if(g_cmb.BackSlice()&&side&&(g_back_lock.valid||BackCurrentLock().valid)){BackRequest(input,p,side);g_back_lock={};return;}
+    const bool slice=g_cmb.BackSlice()&&side&&(g_back_lock.valid||BackCurrentLock().valid);
+    const auto tap=bfl::Pick(g_cmb.BackSlice(),side,slice,g_cmb.Backflip(),back);
+    if(tap==bfl::Tap::BackSlice){BackRequest(input,p,side);g_back_lock={};return;}
+    if(tap==bfl::Tap::Backflip){FlipRequest(input,p);g_back_lock={};return;}
     if(g_cmb.BackSlice()&&side)CmbLog("back_slice no_target frame=%u side=%d: shield bash instead",static_cast<unsigned>(input.frame),side);
     g_back_lock={};
     if(!g_cmb.ShieldBash())return;
@@ -373,6 +411,7 @@ static void SwordInterruptActive(const sword::Input& now,bool priority,bool endi
     // Arbiter/Scenario/EmMgr run before the player's dispatch. Withdraw only our
     // override now; cancel the owned animation later, inside its handler.
     a.hits.Cancel(g_cmb_adapter);g_sword_spin_voice.Stop(a.lease);g_sword_ending_voice.Stop(a.lease);g_sword_back_voice.Stop(a.lease);
+    g_sword_flip_voice.Stop(a.lease);
     CmbLog("%s_interrupt lease=%llu reason=%u override_withdrawn=1",SwordName(a.request.kind),a.lease,static_cast<unsigned>(a.interruption));
 }
 static void SwordBeforeResolve(){
@@ -392,7 +431,7 @@ static bool SwordChargeRoutine(uint32_t routine,bool knife){
 }
 // Game frames a queued request may wait for a startable routine: the Back Slice's tap releases mid knife draw, and the
 // native put-away runs before the clip can start (spin-fix-01); the spin and the Ending Blow keep 15.
-static double SwordRequestFrames(SwordKind k){return k==SwordKind::Back||k==SwordKind::Bash?30.0:15.0;}
+static double SwordRequestFrames(SwordKind k){return k==SwordKind::Back||k==SwordKind::Bash||k==SwordKind::Flip?30.0:15.0;}
 static void SwordDropRequest(const char* why){
     if(g_sword_request.kind!=SwordKind::None)CmbLog("%s_request cancelled=%s",SwordName(g_sword_request.kind),why);
     g_sword_request={};
@@ -1054,6 +1093,7 @@ static bool SwordLifecycle(mortal::dispatch::Event event,uint64_t token){
             g_gssb_sound.fetch_or(1,std::memory_order_acq_rel);
         // TP's Back Slice: its own roll voice, then the twirl's shout and sword swing at the twirl (one WAV).
         else if(g_sword_starting==SwordKind::Back&&g_back_motion)g_sword_back_voice.Start(token);
+        else if(g_sword_starting==SwordKind::Flip)g_sword_flip_voice.Start(token);   // TP's BACKTEN shout
         else if(g_sword_starting!=SwordKind::Bash)voice.Start(token);   // the bash's sound plays at its impact (BashFire)
         SwordPartsBegin(token,g_sword_action.request.player);
         SwordHandBegin(token,g_sword_starting);
@@ -1077,9 +1117,12 @@ static bool SwordLifecycle(mortal::dispatch::Event event,uint64_t token){
     }
     if(g_back_circle.lease()==token&&g_back_circle.Abort(bks::Stop::Interrupted)){
         char line[sizeof(CmbLine::text)];if(bks::FormatEnd(line,sizeof(line),g_back_circle.summary())>0)CmbLog("%s",line);}
+    if(g_flip_move.lease()==token&&g_flip_move.Abort(bfl::Stop::Interrupted)){
+        char line[sizeof(CmbLine::text)];if(bfl::FormatEnd(line,sizeof(line),g_flip_move.summary())>0)CmbLog("%s",line);}
     link_runtime::ztarget::runtime::LiftLeaseEnd(token,event==mortal::dispatch::Event::Finished);   // its ending_cam_lift line
     link_runtime::ztarget::runtime::OrbitLeaseEnd(token,event==mortal::dispatch::Event::Finished);  // the Back Slice camera eases back
     a.hits.Cancel(g_cmb_adapter);g_sword_spin_voice.Stop(token);g_sword_ending_voice.Stop(token);g_sword_back_voice.Stop(token);
+    g_sword_flip_voice.Stop(token);
     const char* why=event==mortal::dispatch::Event::Finished?"finished":event==mortal::dispatch::Event::Cancelled?"cancelled":"abandoned";
     SwordHandEnd(token,why);
     SwordTrailEnd(token,why);
@@ -1199,6 +1242,13 @@ static void SwordDecide(mortal::dispatch::Runtime& run,void* player){
            now<a.start||!run.active||run.lease.token!=a.lease){
             const auto token=a.lease;if(!run.Cancel(token))SwordLifecycle(mortal::dispatch::Event::Abandoned,token);return;
         }
+        // backflip-02: control back at TP's land cancel point (backflip.h Release), a normal finish of the lease.
+        if(a.request.kind==SwordKind::Flip&&bfl::Release(FlipConfig(),now-a.start)){
+            const auto token=a.lease;
+            CmbLog("backflip land_release lease=%llu frame=%u e=%.1f release_tick=%.0f",token,frame,now-a.start,bfl::ReleaseTick(FlipConfig()));
+            if(!run.Finish(token))SwordLifecycle(mortal::dispatch::Event::Abandoned,token);
+            return;
+        }
         if(!a.struck&&link_runtime::game_clock::Reached(now-a.start,double(a.strike_tick))){
             a.struck=true;sword::target::List targets;
             if(a.request.kind==SwordKind::Bash){
@@ -1255,7 +1305,7 @@ static void SwordDecide(mortal::dispatch::Runtime& run,void* player){
         if(!v.reachable){BackAbort(frame,!v.same?"target_lost":"target_out_of_reach");SwordDropRequest("back_target");return;}
     }
     const bool back_tp=request.kind==SwordKind::Back&&g_back_motion;   // TP's Back Slice clip for the press's side
-    const auto& clip=request.kind==SwordKind::Bash?g_sword_bash_clip:back_tp?BackClip(request.back.side):
+    const auto& clip=request.kind==SwordKind::Bash?g_sword_bash_clip:request.kind==SwordKind::Flip?g_sword_flip_clip:back_tp?BackClip(request.back.side):
         SwordSpinClip(request.kind)?g_sword_spin_clip:g_sword_ending_clip;
     const auto token=clip.ready?mortal::resident_assets::ReserveToken():0;
     const mortal::dispatch::Lease lease{token,clip.fcv,clip.seq,clip.seq?clip.seq+4:nullptr};
@@ -1263,11 +1313,13 @@ static void SwordDecide(mortal::dispatch::Runtime& run,void* player){
         mortal::dispatch::StartFrom::NormalMove:mortal::dispatch::StartFrom::NormalIdle;
     g_sword_action={};g_sword_action.request=request;g_sword_action.start=now;
     g_sword_action.strike_tick=request.kind==SwordKind::Back?BackConfig().StrikeTick(clip.strike_tick):clip.strike_tick;
+    if(request.kind==SwordKind::Flip)g_sword_action.strike_tick=kFlipNoStrike;   // the backflip never strikes (no hit list)
     g_sword_action.grounded=request.kind==SwordKind::Ending;   // the pre-start check required Grounded or Rising (lethal on rise)
     g_sword_starting=request.kind;
     const auto result=token?mortal::trial::TryStartClip(run,g_mortal_native,lease,from):mortal::trial::Attempt{mortal::trial::Status::AssetsMissing};
     g_sword_starting=SwordKind::None;g_sword_request={};
     if(result.status!=mortal::trial::Status::Started&&request.kind==SwordKind::Back)BackAbort(frame,"start_failed");
+    if(result.status!=mortal::trial::Status::Started&&request.kind==SwordKind::Flip)CmbLog("backflip abort frame=%u reason=start_failed",frame);
     // The bash without its clip: it still lands now (with the parry reaction as the shove), as before spin-fix-01.
     if(result.status!=mortal::trial::Status::Started&&request.kind==SwordKind::Bash)BashFire(frame,now,g_cmb_epoch,p,true);
     if(result.status!=mortal::trial::Status::Started){g_sword_action={};CmbLog("%s_start failed status=%u native_fire_masked=0 native_transitioned=%u",SwordName(request.kind),static_cast<unsigned>(result.status),run.transitioned?1U:0U);return;}
@@ -1286,6 +1338,13 @@ static void SwordDecide(mortal::dispatch::Runtime& run,void* player){
         CmbLog("back_slice start lease=%llu frame=%u side=%d d=%.0f radius=%.0f sweep_deg=%.0f arc_frames=%u strike_tick=%u permille=%u arc=%u "
             "motion=%s",token,frame,request.back.side,double(request.back.d),double(request.back.radius),double(request.back.sweep)*57.29578,
             bc.arc_frames,g_sword_action.strike_tick,g_cmb.back.permille,begun?1U:0U,back_tp?(bks::ClipRoll(request.back.side)==bks::Roll::Right?"tp_right":"tp_left"):"spin");
+    }
+    if(request.kind==SwordKind::Flip){
+        g_flip_have_last=true;g_flip_last=now;
+        g_flip_move=bfl::Move(FlipConfig());
+        const bool begun=g_flip_move.Begin(token,request.flip,now,{p.pos.x,p.pos.y,p.pos.z});
+        CmbLog("backflip start lease=%llu frame=%u locked=%u distance=%.0f travel_ticks=%u travel=%u",token,frame,request.flip.locked?1U:0U,
+            double(request.flip.distance),g_flip_move.config().travel_ticks,begun?1U:0U);
     }
     CmbLog("%s_start started lease=%llu frame=%u strike_tick=%u from_knife=%u voice=TP root_travel=%.0f%s",SwordName(request.kind),token,frame,
         clip.strike_tick,knife?1U:0U,travel,request.kind==SwordKind::Ending&&g_cmb.ending_leap?(request.target.locked?" prefer=lock":" prefer=near"):"");
@@ -1357,6 +1416,15 @@ static void SwordPrepare(const wchar_t* directory,bool dispatch_up,bool move_up)
                 g_back_motion?"tp":"spin",bc.curve==bks::Curve::Tp?"tp_turn":"smootherstep",
                 bc.StrikeTick(g_back_motion?g_sword_back_right.strike_tick:g_sword_spin_clip.strike_tick));
         }else if(g_cmb.spin_attack)Log("BackSlice ready=0 (BackSlice=0)");
+        // backflip-01: only with Backflip=1 (default off: nothing loaded, the tap as before).
+        if(g_cmb.Backflip()){
+            if(SwordLoad(directory,sword::assets::backflip,g_sword_flip_clip,g_sword_flip_audio)){
+                g_bash_ready=true;   // the backflip reads the Shield Bash's knife tap
+                Log("Backflip ready=1 key=ZTarget+S(or stick back)+knife_tap cooldown_ms=1000 distance=%u travel_ticks=%u land_frames=%u "
+                    "release_tick=%.0f early=%u iframes=0",g_cmb.flip.distance,FlipConfig().travel_ticks,FlipConfig().land_frames,
+                    bfl::ReleaseTick(FlipConfig()),bfl::EarlyRelease(FlipConfig())?1U:0U);
+            }else Log("Backflip ready=0 (clip or voice missing/changed: link_backflip.fcv/.seq/_voice.wav)");
+        }
         if(g_cmb.ShieldBash()){
             link_runtime::parry::general::Memory pm;
             g_bash_deflect_ok=g_cmb.bash.deflect_ms&&sbash::thrown::Qualify(pm,g_cmb_base);
@@ -1382,7 +1450,7 @@ static void SwordPrepare(const wchar_t* directory,bool dispatch_up,bool move_up)
 }
 static void SwordPollAudio(){
     if(!SwordForeground()){g_sword_spin_voice.Stop(g_sword_spin_voice.Current());g_sword_ending_voice.Stop(g_sword_ending_voice.Current());
-        g_sword_back_voice.Stop(g_sword_back_voice.Current());}
+        g_sword_back_voice.Stop(g_sword_back_voice.Current());g_sword_flip_voice.Stop(g_sword_flip_voice.Current());}
     if(const unsigned s=g_gssb_sound.exchange(0,std::memory_order_acq_rel);s&&SwordForeground()){
         if(s&1)g_great_spin_sound.Play();
         if(s&2)g_shield_bash_sound.Play();
@@ -1391,4 +1459,5 @@ static void SwordPollAudio(){
     if(g_sword_spin_clip.ready)g_sword_spin_consumer.Poll(g_sword_spin_voice,g_sword_spin_audio);
     if(g_sword_ending_clip.ready)g_sword_ending_consumer.Poll(g_sword_ending_voice,g_sword_ending_audio);
     if(g_back_motion)g_sword_back_consumer.Poll(g_sword_back_voice,g_sword_back_audio);
+    if(g_sword_flip_clip.ready)g_sword_flip_consumer.Poll(g_sword_flip_voice,g_sword_flip_audio);
 }

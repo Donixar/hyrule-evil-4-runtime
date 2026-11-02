@@ -67,6 +67,12 @@
 //                       hook for it)
 //   BackSliceCameraMs   the orbit spring, ms, 30..200 (default 40)
 //   BackSliceCameraLift vertical follow percent for the roll and the twirl jump, 0..150 (default 100; 0 = orbit only)
+// Backflip (backflip-01, 30-oct, backflip.h; read with SpinAttack=1, the dispatch it plays through), in gs_sb_problems:
+//   Backflip            exact 1 = on (default off): Z held + S + knife tap = TP's backflip (else the tap is as before)
+//   BackflipDistance    mm Link travels straight back during the flip, 1000..4000 (default 2500; read only with
+//                       Backflip=1)
+//   BackflipLandFrames  game frames (60 Hz) of the landing before control returns, 0..30 (default 2 = TP's land cancel
+//                       point; 30 = the whole landing clip as backflip-01; read only with Backflip=1)
 // Sword in hand (sword-hand-01, 19-oct; sword_hand.h; read with SpinAttack=1 or EndingBlow=1), counted in gs_sb_problems:
 //   SwordInHand         missing or 1 = during a sword action started outside the knife routine (Back Slice, Shield
 //                       Bash, spin / Great Spin, Ending Blow and its leap) the right hand shows the Master Sword (the
@@ -81,6 +87,7 @@
 #include "shield_guard_config.h"
 #include "shield_bash.h"
 #include "back_slice.h"
+#include "backflip.h"
 #include <cstddef>
 #include <cstdint>
 #include <cwchar>
@@ -106,6 +113,7 @@ struct Config {
     back_slice::Config back;        // read with SpinAttack=1 only (back.on stays true but unused otherwise)
     bool back_camera = true;        // BackSliceCamera (read with SpinAttack=1)
     unsigned back_camera_ms = 40, back_camera_lift = 100;   // BackSliceCameraMs, BackSliceCameraLift
+    backflip::Config flip;          // Backflip / BackflipDistance (read with SpinAttack=1; flip.on default off)
     bool sword_hand = true;         // SwordInHand (read with SpinAttack=1 or EndingBlow=1)
     bool spin_breakables = true;    // SpinBreakables (read with SpinAttack=1): spins break boxes and boards (sword_breakables.h)
     spin_bullets::Config bullets;   // SpinBullets* (read with SpinAttack=1): spins fire free shots all around (spin_bullets.h)
@@ -115,6 +123,7 @@ struct Config {
     bool GreatSpin() const { return spin_attack && great.on; }
     bool ShieldBash() const { return SwordActions() && bash.on; }
     bool BackSlice() const { return spin_attack && back.on; }
+    bool Backflip() const { return spin_attack && flip.on; }
     unsigned leap_problems = 0;  // invalid Ending Blow leap values (logged; their defaults kept)
     unsigned problems = 0;  // invalid values or unmet dependencies (logged; the feature stays off)
     bool MortalTargeting() const { return hitpart_observe || md_observe || md_contextual; }
@@ -208,6 +217,11 @@ template <class Get> Config ReadConfig(Get&& get, bool parry_active) {
             c.back_camera = flag(L"BackSliceCamera");
             c.back_camera_ms = number(L"BackSliceCameraMs", 40, 30, 200);
             c.back_camera_lift = number(L"BackSliceCameraLift", 100, 0, 150);
+            c.flip.on = on(L"Backflip");
+            if (c.flip.on) {
+                c.flip.distance = number(L"BackflipDistance", backflip::kDefaultDistance, backflip::kMinDistance, backflip::kMaxDistance);
+                c.flip.land_frames = number(L"BackflipLandFrames", backflip::kLandCancelFrames, 0, backflip::kMaxLandFrames);
+            }
         }
         c.bash.on = flag(L"ShieldBash");
         c.bash.motion = flag(L"ShieldBashMotion");

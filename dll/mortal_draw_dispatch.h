@@ -116,6 +116,11 @@ struct Runtime {
         if(!busy||!current||token!=lease.token||!Owns(current))return false;
         return EndOwned(current,Event::Cancelled);
     }
+    // A clip released before its own end as a normal finish (backflip-02: TP's land cancel point), from decide only.
+    bool Finish(uint64_t token){
+        if(!busy||observing||!current||token!=lease.token||!Owns(current))return false;
+        return EndOwned(current,Event::Finished);
+    }
     // Before a non-owned evaluation: once the player's primary motion is a clip that is not ours (the native
     // damage/grab/death/event clip that took the model from our lease), reset what our last clip left, one attempt
     // per lease. Our own clip still on the model (the lease or its abandoned remains) waits; a null clip waits too.

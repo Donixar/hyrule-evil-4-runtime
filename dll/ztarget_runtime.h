@@ -146,8 +146,11 @@ inline void RecordNeutral(NeutralEvent e,const char* reason){
 //   zt same_frame frame=%u phase=%s                    Begin returned early on a repeated frame with the lock input held
 //   zt hit_skew delta=%d snapshot=%u frame=%u admitted=%u                  hitCheck's frame differs from Begin's snapshot
 //   zt hit_unsafe reason=%s frame=%u suspended=%u      hitCheck's fresh read not safe after a safe Begin (28-oct)
-enum class Diag:uint8_t {Unsafe,Gap,Same,Skew,HitUnsafe};
-inline UnsafeLog unsafe_log,hit_unsafe_log;inline DiagLog gap_log,same_log,skew_log;
+//   zt hit_suspend reason=%s frame=%u streak=%u        the hit path suspended a lock Begin left active for a reason
+//                                                      no other line names (matrix, offsets, level, adjust, busy,
+//                                                      unfocused, focus_latch, args; zt-flicker-01, 1-nov)
+enum class Diag:uint8_t {Unsafe,Gap,Same,Skew,HitUnsafe,HitSuspend};
+inline UnsafeLog unsafe_log,hit_unsafe_log,hit_suspend_log;inline DiagLog gap_log,same_log,skew_log;
 struct DiagRecord {Diag kind;const char* reason;uint32_t a,b;int32_t delta;uint8_t flag;Phase phase;};
 inline DiagRecord diag_records[16];inline std::atomic<unsigned> diag_read{0},diag_write{0};
 inline void RecordDiag(const DiagRecord& d){
@@ -170,6 +173,7 @@ inline void LogDiag(Logger log,const DiagRecord& d){
     case Diag::Same:log("zt same_frame frame=%u phase=%s",d.a,Name(d.phase));break;
     case Diag::Skew:log("zt hit_skew delta=%d snapshot=%u frame=%u admitted=%u",d.delta,d.a,d.b,unsigned(d.flag));break;
     case Diag::HitUnsafe:log("zt hit_unsafe reason=%s frame=%u suspended=%u",d.reason?d.reason:"-",d.a,unsigned(d.flag));break;
+    case Diag::HitSuspend:log("zt hit_suspend reason=%s frame=%u streak=%u",d.reason?d.reason:"-",d.a,unsigned(d.flag));break;
     }
 }
 inline bool NeutralNow(){return neutral.active&&controller.phase==Phase::Recenter&&controller.held;}
@@ -309,6 +313,41 @@ inline bool ResumeMatch(const Candidate& c,const Resume& r){
     return c.identity==r.identity||(c.raw.id==r.id&&c.raw.type==r.type&&c.raw.hp_max==r.hp_max&&c.raw.hp>0&&c.raw.hp<=r.hp);
 }
 inline bool ResumePending(){return resume.identity&&resume.epoch==epoch;}
+// Resume guard (zt-flicker-01, 1-nov: link_runtime.log of the `ztresume` bot at r100's axe Ganado, DLL ec3c6185). The
+// axe broke the held lock, it came back, and `zt locked reason=resume` followed on 588 game frames in a row until the key
+// went up: each of those hits passed every hitCheck gate and Adjust refused the base matrix (Link knocked back onto a
+// slope), a silent suspend Begin cannot see, so the next Begin resumed it. Damage, busy or focus seen by the hit only
+// would loop the same way. Now a suspension the hit path makes on a lock Begin left Active (or FrontDetour's
+// no_shoulder_call) holds the resume until a hit reads clear with a camera Adjust can rotate: the lock stays suspended
+// until the condition is over, as Begin's own unsafe frames do. A lock that such a suspend breaks again less than
+// kChurnSeconds after it came back (a condition flickering at the hit) waits Backoff(streak) safe seconds before the next
+// resume, so a resume line cannot repeat faster than about once a second. Key up, a hard release, a scene, no frame or a
+// new press clear it; it never delays the first resume after a Begin-side suspension (knife, kick, damage, prompt).
+struct ResumeGuard {
+    bool hold=false;      // a hit-side suspension not yet followed by a clear hit
+    unsigned streak=0;    // hit-side suspensions in a row, each less than kChurnSeconds after the lock came back
+    float active=0;       // safe seconds Active (held) since the lock came back or was pressed
+    float waited=0;       // safe seconds suspended since the last hit-side suspension
+};
+inline ResumeGuard guard;
+constexpr float kChurnSeconds=0.5f;
+inline float Backoff(unsigned streak){return streak<2?0.f:streak>=5?1.f:0.125f*float(1u<<(streak-2));}
+inline bool ResumeReady(){return !guard.hold&&guard.waited>=Backoff(guard.streak);}
+// resumes: lock and neutral resumes; hit_suspends: hit-side suspensions of an Active lock; resume_held: Begin frames a
+// pending resume waited on the guard (`ZTarget stats2`).
+inline std::atomic<unsigned> resumes{0},hit_suspends{0},resume_held{0};
+// The hit path is suspending a lock that was Active. `diag`: the `zt hit_suspend` reason (null: another line names it).
+inline void NoteHitSuspend(const char* diag,uint32_t frame){
+    guard.streak=guard.active<kChurnSeconds?(guard.streak<255?guard.streak+1:255):1;
+    guard.hold=true;guard.waited=0;hit_suspends.fetch_add(1);
+    if(diag&&hit_suspend_log.Step(diag,GetTickCount()))
+        RecordDiag({Diag::HitSuspend,diag,frame,0,0,uint8_t(guard.streak),controller.phase});
+}
+inline void HitSuspend(const char* diag,uint32_t frame){if(controller.Active())NoteHitSuspend(diag,frame);Suspend();}
+// FrontDetour after the native front: a lock left Active without a hitCheck call this frame.
+inline void NoShoulderCall(){
+    if(!hit_seen&&controller.Active()){HitSuspend(nullptr,snapshot.frame);RecordState("no_shoulder_call");}
+}
 // FaceWith frames that only skipped the yaw write and kept the lock (routine transition, frame gap).
 inline std::atomic<unsigned> face_skipped{0};
 inline void FaceStop(const char* why){
@@ -388,6 +427,7 @@ inline const char* TransitionReason(Phase before,Phase now,bool scene){
     return "other";
 }
 inline void Begin(){
+    if(controller.phase!=Phase::Suspended)guard.hold=false;   // a hold only lasts while its suspension does
     Memory m;Frame f;const bool read=ReadFrame(m,base,f);
     const bool focus=Focus()&&!focus_lost.exchange(false,std::memory_order_acq_rel);
     const bool same=read&&have_snapshot&&snapshot.frame==f.frame&&SameScene(snapshot,f);
@@ -411,14 +451,14 @@ inline void Begin(){
     }
     const ButtonState key=buttons.Read(focus,pad::LockHeld(key_now,pad_enabled,pad_mode,toggle_now,ps.hold),
         (GetAsyncKeyState('V')&0x8000)!=0,ps.stick,!same);
-    if(!read){if(have_snapshot){++epoch;pool.Reset(epoch);}have_snapshot=false;knife_latch={};resume={};Suspend();
+    if(!read){if(have_snapshot){++epoch;pool.Reset(epoch);}have_snapshot=false;knife_latch={};resume={};guard={};Suspend();
         RecordNeutral(neutral.Step(controller.phase,false,0.f,epoch,false,true),"no_frame");return;}
     const bool safe=CameraSafe(f)&&focus&&!Busy();
     const bool scene=have_snapshot&&!SameScene(snapshot,f);
-    if(scene){++epoch;pool.Reset(epoch);have_view=false;resume={};}
+    if(scene){++epoch;pool.Reset(epoch);have_view=false;resume={};guard={};}
     snapshot=f;have_snapshot=true;input={safe,key.hold,f.frame,epoch,f.dt};
     KnifeLatchAge(f);
-    if(hard||!key.hold)resume={};
+    if(hard||!key.hold){resume={};guard={};}
     if(hard)neutral.resume=false;
     if(!safe){KnifeLatchCapture(f);const Phase old=controller.phase;controller.Begin(input,false);NoteGap(f.frame);locked={};have_view=false;
         const char* why_unsafe=!focus?"focus":unsafe_why!=Unsafe::None?UnsafeName(unsafe_why):"busy";
@@ -440,13 +480,19 @@ inline void Begin(){
     const bool want_notice=notice_on&&admitted&&!key.hold&&!controller.held&&controller.phase==Phase::Idle;
     if(key.hold||want_notice)pool.Read(m,base,epoch,f.pos,view);
     const char* why=nullptr;bool resumed=false;
+    // A resume the guard holds (hit-side suspension not over, or backing off) waits suspended: no match, no expiry.
+    const bool pending=controller.phase==Phase::Suspended&&key.hold&&(ResumePending()||neutral.resume);
+    if(pending)guard.waited+=seconds;
+    const bool ready=!pending||ResumeReady();
+    if(!ready)resume_held.fetch_add(1);
     // Soft suspension over, lock input still held: the same target comes back (Resume), never another one.
-    if(controller.phase==Phase::Suspended&&key.hold&&ResumePending()){
+    if(controller.phase==Phase::Suspended&&key.hold&&ResumePending()&&ready){
         int n=-1;
         if(resume.index<pool.count&&ResumeMatch(pool.candidates[resume.index],resume))n=int(resume.index);
         if(n>=0&&admitted&&LineTo(f.pos,pool.candidates[n].raw.pos)==los::Result::Clear){
             locked=pool.candidates[n];los_hold.Start(locked.identity,f.frame);resumed=true;why="resume";
             controller.phase=Phase::Locked;controller.held=true;controller.filter.Reset();controller.release_s=0;
+            guard.active=0;resumes.fetch_add(1);
         }else if((resume.waited+=seconds)>kResumeSeconds){
             // Gone (dead, out of reach or out of sight) for the whole window: neutral Z-target, never another lock.
             resume={};controller.phase=Phase::Recenter;controller.held=true;controller.filter.Reset();controller.release_s=0;
@@ -454,11 +500,13 @@ inline void Begin(){
         }
     }
     // Neutral (no target) soft-suspended by the knife, input still held: neutral comes back, never a new lock.
-    if(controller.phase==Phase::Suspended&&key.hold&&!ResumePending()&&neutral.Pending(epoch,seconds)){
+    if(controller.phase==Phase::Suspended&&key.hold&&!ResumePending()&&ready&&neutral.Pending(epoch,seconds)){
         controller.phase=Phase::Recenter;controller.held=true;controller.filter.Reset();controller.release_s=0;why="neutral_resume";
+        guard.active=0;resumes.fetch_add(1);
     }
     const bool press=key.hold&&!controller.held&&controller.phase!=Phase::Suspended;
     if(press){
+        guard={};
         const bool any=Pick(pool.candidates,pool.count,-1,0)>=0;
         const int picked=admitted?PickClear(&LineTo,f.pos,-1,0):-1;
         locked=picked>=0?pool.candidates[picked]:Candidate{};
@@ -478,6 +526,8 @@ inline void Begin(){
     }
     controller.Begin(input,locked.identity!=0);NoteGap(f.frame);
     if(controller.phase!=Phase::Locked){locked={};los_hold.Reset();}
+    // The lock held kChurnSeconds since it came back: no churn.
+    if(controller.Active()&&controller.held&&guard.active<kChurnSeconds&&(guard.active+=seconds)>=kChurnSeconds)guard.streak=0;
     // Safe frame: a frame gap or a hit-side suspend (no_shoulder_call, a non-rigid matrix) is soft, as for a lock; a
     // scene is hard (the lock's resume is cleared on it too).
     RecordNeutral(neutral.Step(controller.phase,controller.held,f.yaw,epoch,!scene,false),
@@ -906,7 +956,7 @@ inline void __cdecl FrontDetour(){
     original_front();
     const DWORD after=GetLastError();std::fegetenv(&env);
     if(zt){
-        if(!hit_seen&&controller.Active()){Suspend();RecordState("no_shoulder_call");}
+        NoShoulderCall();
         CaptureView();hud::Publish();ArrowPublish();
     }
     if(lift)LiftAfterFront();
@@ -954,10 +1004,15 @@ template<class Mem,class FocusFn> bool PrepareHitWith(Mem& m,FocusFn focused,voi
         const bool suspend=!soft&&(why>=5||unsafe||busy_now||unfocused||latch)&&controller.phase!=Phase::Idle;
         if(unsafe&&controller.phase!=Phase::Idle&&hit_unsafe_log.Step(UnsafeName(hit_why),GetTickCount()))
             RecordDiag({Diag::HitUnsafe,UnsafeName(hit_why),f.frame,0,0,uint8_t(suspend?1:0),controller.phase});
-        if(suspend)Suspend();
+        // zt-flicker-01: a lock still Active is suspended here, not by Begin: its resume waits for a clear hit.
+        if(suspend)HitSuspend(unsafe?nullptr:busy_now?"busy":unfocused?"unfocused":latch?"focus_latch":"args",f.frame);
         return false;
     }
     hit_unsafe_log.Step(nullptr,0);
+    // zt-flicker-01: a clear read with a camera Adjust can rotate ends the hold of a hit-side suspension (Begin then
+    // resumes on its next safe frame); a non-rigid base matrix (a slope) keeps it.
+    const char* bend=HitGeometry(mat,in);
+    if(!bend)guard.hold=false;
     float desired=f.yaw;
     if(controller.phase==Phase::Locked){
         Vec target;
@@ -967,9 +1022,15 @@ template<class Mem,class FocusFn> bool PrepareHitWith(Mem& m,FocusFn focused,voi
         }
     }
     input.safe=true;input.dt=f.dt;
+    const bool active=controller.Active();
     if(!Adjust(controller,input,mat,in,desired,smooth_ms,local)){
-        if(controller.phase==Phase::Suspended){Suspend();rejected.fetch_add(1);}return false;
+        if(controller.phase==Phase::Suspended){
+            if(active)NoteHitSuspend(bend?bend:"adjust",f.frame);   // 1-nov: "matrix" on every resumed frame
+            Suspend();rejected.fetch_add(1);
+        }
+        return false;
     }
+    hit_suspend_log.Step(nullptr,0);   // the lock wrote: the next hit-side suspension is logged again
     return !observe;
 }
 inline bool PrepareHit(void* self,uint32_t caller,const Matrix* matrix,Offset* offsets,Offset& local){
@@ -1235,8 +1296,9 @@ inline void Poll(){
         if(zt){stats("ZTarget stats fronts=%u hits=%u writes=%u rejected=%u dropped=%u why=%u/%u/%u/%u/%u/%u/%u/%u/%u face_writes=%u face_rejected=%u face_faults=%u face_skipped=%u lift_writes=%u lift_dry=%u lift_rejects=%u",fronts.load(),hits.load(),writes.load(),rejected.load(),dropped.load(),
                 reject_why[1].load(),reject_why[2].load(),reject_why[3].load(),reject_why[4].load(),reject_why[5].load(),reject_why[6].load(),reject_why[7].load(),reject_why[8].load(),reject_why[9].load(),face_writes.load(),face_rejected.load(),face_faults.load(),face_skipped.load(),
                 lift_writes.load(),lift_dry.load(),lift_rejects.load());
-            stats("ZTarget stats2 unsafe=%u busy=%u unfocused=%u latch=%u skew1=%u",hit_unsafe.load(),hit_busy.load(),
-                hit_unfocused.load(),hit_latch.load(),hit_skew1.load());
+            stats("ZTarget stats2 unsafe=%u busy=%u unfocused=%u latch=%u skew1=%u resumes=%u hit_suspends=%u resume_held=%u",
+                hit_unsafe.load(),hit_busy.load(),hit_unfocused.load(),hit_latch.load(),hit_skew1.load(),resumes.load(),
+                hit_suspends.load(),resume_held.load());
             stats("ZTarget los calls=%u clear=%u blocked=%u faults=%u refused=%u lost=%u skipped=%u sounds=%u",los::calls.load(),
                 los::clear.load(),los::blocked.load(),los::faults.load(),los_refused.load(),los_lost.load(),los_skipped.load(),voices.played.load());
             hud::Poll(stats);

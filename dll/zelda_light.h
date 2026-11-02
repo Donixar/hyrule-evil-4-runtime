@@ -20,7 +20,11 @@
 //   CooldownMs    100..3000 (default 400)
 //   GanadoDamage  1..5000 (default 1300; the game scales it by difficulty: live 23-oct 600 took 283 hp)
 //   KnightDamage  1..1000 (default 350)
+//   ZeldaCastClip exact 1 = the cast plays the TP clip (zelda_cast_clip.h) and eases the turn; missing or 0 = the 23-oct
+//                 procedural pose and snap
+//   ZeldaCompanionRay, ZeldaCompanionCooldownMin/Max: the partner's own rays (zelda_companion.h)
 #include "spin_bullets.h"
+#include "zelda_cast_clip.h"
 #include "sword_trail.h"
 #include <cmath>
 #include <cstdint>
@@ -52,7 +56,7 @@ constexpr uint32_t protect = 0x400;            // Be_flg: em3cDmCk returns befor
 }  // namespace layout
 
 struct Config {
-    bool on = true, probe = false;
+    bool on = true, probe = false, cast_clip = false;
     float range = 15000.f;
     unsigned cooldown_ms = 400, ganado = 1300, knight = 350, problems = 0;
 };
@@ -74,6 +78,8 @@ template <class Get> Config ReadConfig(Get&& get) {
     if (v[0]) {if ((v[0] == L'0' || v[0] == L'1') && !v[1]) c.on = v[0] == L'1'; else ++c.problems;}
     v[0] = 0; get(L"Probe", v, 32);
     c.probe = v[0] == L'1' && !v[1];
+    v[0] = 0; get(L"ZeldaCastClip", v, 32);
+    c.cast_clip = v[0] == L'1' && !v[1];
     c.range = float(number(L"Range", 15000, 2000, 30000));
     c.cooldown_ms = number(L"CooldownMs", 400, 100, 3000);
     c.ganado = number(L"GanadoDamage", 1300, 1, 5000);
@@ -135,15 +141,22 @@ inline bool Trigger(Press& p, bool raw, bool allowed, double now, unsigned coold
 // glows for kChargeMs, the ray fires once, the glow fades by kGlowEndMs, and a new cast can start after kCastMs (the arm
 // pose of zelda_cast_pose.h runs over the same 600 ms).
 constexpr double kChargeMs = 150.0, kGlowEndMs = 450.0, kCastMs = 600.0;
+// clip (zelda-companion-01): the TP clip's cast lasts zelda_cast_clip::kClipMs and fires when the caller says the clip
+// reached its release (FireDue's clip_due), the star peaking there instead of at kChargeMs.
 class Cast {
-    double t0_ = 0; bool on_ = false, fired_ = false;
+    double t0_ = 0, length_ = kCastMs; bool on_ = false, fired_ = false, clip_ = false;
 public:
-    void Begin(double now) {t0_ = now; on_ = true; fired_ = false;}
-    bool Busy(double now) const {return on_ && now >= t0_ && now - t0_ < kCastMs;}
+    void Begin(double now, bool clip = false) {
+        t0_ = now; on_ = true; fired_ = false; clip_ = clip; length_ = clip ? zelda_cast_clip::kClipMs : kCastMs;
+    }
+    bool Busy(double now) const {return on_ && now >= t0_ && now - t0_ < length_;}
+    bool Clip() const {return clip_;}
     double Age(double now) const {return now - t0_;}
-    // True on the first frame at or past kChargeMs (once per cast).
-    bool FireDue(double now) {
-        if (!on_ || fired_ || now - t0_ < kChargeMs) return false;
+    // The hand star's age: the clip's star peaks at its release.
+    double GlowAge(double now) const {return clip_ ? now - t0_ - (zelda_cast_clip::kReleaseMs - kChargeMs) : now - t0_;}
+    // True on the first frame at or past kChargeMs (once per cast); a clip cast waits for clip_due.
+    bool FireDue(double now, bool clip_due = false) {
+        if (!on_ || fired_ || (clip_ ? !clip_due : now - t0_ < kChargeMs)) return false;
         fired_ = true; return true;
     }
 };

@@ -15,6 +15,11 @@ namespace link_runtime::case_items {
 //     (vanilla, or another mod's) keeps the native jar / herb models: no member is read as the wrong type.
 //  3. When the case opens (pzlPlayer init, thiscall, before it reads the records) every saved record of these
 //     items laid out 1 x 2 gets a quarter turn (MigrateRecord): the same cells under the 2 x 1 shape.
+//  4. A mix (2-nov-2026): cItemMgr::combine only changes the id of the piece it lands on, so a heart made on a herb
+//     or jar kept its 1 x 2 row: footprint and cursor upright, the 2 x 1 model drawn half a cell off, until the case
+//     was reopened (MigrateRecord). Both mixes (the drop at 0x38C826 and the Combine menu at 0x38D3BD) then call
+//     pieceModelSet (cdecl, piece) for the piece whose id changed; before it a heart piece on another row gets its
+//     heart row and a quarter turn: the same cells (the init, new-item and Merchant calls find the heart row already).
 // No hook is installed here: the functions are pure over injected memory (see the wiring in the doc).
 constexpr uint8_t kDefaultCase = 0x07;     // pieceTblInit switch: model = id
 struct Item {
@@ -44,13 +49,22 @@ constexpr uint32_t kItemMgr = 0x870FD4;       // ItemMgr global (preferred VA 0x
 constexpr uint32_t kItemArray = 0x14, kItemCount = 0x1C;   // cItem* and int, offsets in ItemMgr
 constexpr uint32_t kWkDat = 0x1E0;            // SUB_SCREEN::pSwitchDat
 constexpr uint32_t kPreferredBase = 0x400000;
+constexpr uint32_t kModelSet = 0x389AE0;      // void __cdecl pieceModelSet(piece): the model of piece+0x24's id
+constexpr uint32_t kSetDir = 0x289AA0;        // thiscall (ecx = piece, s8 turn), ret 4: centre from the row, rotated
 }
+// pzlPlayer piece (0x2C bytes): +4 the row's size field (row + 4), +0x20 turn, +0x24 the cItem.
+constexpr uint32_t kPieceRowLink = 4, kPieceRow = 0x04, kPieceTurn = 0x20, kPieceItem = 0x24;
 // Bytes that do not move under relocation (absolute operands left out).
 constexpr uint8_t kTblInitHead[16] = {0x55, 0x8B, 0xEC, 0x51, 0x33, 0xC0, 0xB9, 0xFF,
                                       0xFF, 0x00, 0x00, 0x89, 0x45, 0xFC, 0x66, 0x39};
 constexpr uint8_t kDatLoad[6] = {0x8B, 0xBA, 0xE0, 0x01, 0x00, 0x00};
 constexpr uint8_t kDefaultCode[2] = {0x8B, 0xCB};
 constexpr uint8_t kPzlInitHead[6] = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x0C};
+constexpr uint8_t kModelSetHead[7] = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x1C, 0xA1};   // then the cookie's address
+constexpr uint8_t kModelSetTail[12] = {0x33, 0xC5, 0x89, 0x45, 0xFC, 0x56, 0x8B, 0x75, 0x08, 0x8B, 0x46, 0x24};
+constexpr uint32_t kModelSetTailAt = 0x0B;
+constexpr uint8_t kSetDirHead[16] = {0x55, 0x8B, 0xEC, 0x8B, 0x41, 0x04, 0xD9, 0x40,
+                                     0x04, 0x53, 0x8A, 0x5D, 0x08, 0xD9, 0x59, 0x0C};
 constexpr size_t kRowCheck = 18;           // id, size, centre, shape "11"
 constexpr size_t kRowWrite = 12;           // +4: size_x, size_y, pad, centre_x, centre_y
 constexpr uint32_t kRowWriteAt = 4;
@@ -214,5 +228,34 @@ inline unsigned MigrateAll(uint8_t* array, int count) {
     unsigned changed = 0;
     for (int i = 0; i < count; ++i) changed += MigrateRecord(array + kItemSize * size_t(i)) ? 1 : 0;
     return changed;
+}
+
+// --- 4. a mix ----------------------------------------------------------------------------------------------------
+template<class Mem> bool QualifyCombine(const Mem& m) {
+    uint8_t buf[16];
+    return m.Read(rva::kModelSet, buf, sizeof kModelSetHead) && !std::memcmp(buf, kModelSetHead, sizeof kModelSetHead) &&
+           m.Read(rva::kModelSet + kModelSetTailAt, buf, sizeof kModelSetTail) &&
+           !std::memcmp(buf, kModelSetTail, sizeof kModelSetTail) &&
+           m.Read(rva::kSetDir, buf, sizeof kSetDirHead) && !std::memcmp(buf, kSetDirHead, sizeof kSetDirHead);
+}
+struct CombineFix {
+    bool row = false;        // write row_ptr into the piece (+4)
+    bool turn = false;       // then setDir(dir): a 1 x 2 at turn d and a 2 x 1 at turn d ^ 1 cover the same cells
+    uint32_t row_ptr = 0;
+    int8_t dir = 0;
+};
+// id: the result's item; row_ptr: the piece's +4 (row + 4); size: the bytes it points at; dir: the piece's turn.
+inline CombineFix DecideCombineFix(uint16_t id, uint32_t row_ptr, int8_t size_x, int8_t size_y, int dir, uint32_t base) {
+    CombineFix f;
+    if (!row_ptr || dir < 0 || dir > 7) return f;
+    for (const Item& it : kItems) {
+        if (it.id != id) continue;
+        const uint32_t want = base + it.row_rva + kPieceRowLink;
+        if (row_ptr == want) return f;
+        f.row = true; f.row_ptr = want;
+        if (size_x == 1 && size_y == 2) { f.turn = true; f.dir = int8_t(dir ^ 1); }
+        return f;
+    }
+    return f;
 }
 }

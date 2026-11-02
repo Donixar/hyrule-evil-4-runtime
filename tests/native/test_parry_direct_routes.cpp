@@ -8,6 +8,8 @@ namespace defense = link_runtime::defense;
 struct DirectSources : Fake {
     defense::ParryWindow window{};
     bool safe = true;
+    double game = 1000.0;   // game time in 60 Hz frames (the cart's continuity clock)
+    double Game() {return game;}
     DirectSources() {
         defense::UpdateParryButton(window, false, true, 990, 750);
         defense::UpdateParryButton(window, true, true, 1000, 750);
@@ -209,6 +211,7 @@ static void CartRunFollow() {
     Check(d::Run(s, c, context, f).cancel, "fresh frontal cart run consumes press");
     for (unsigned i = 0; i != 16; ++i) {
         s.now += 90;
+        s.game += 5.4;   // 90 ms at 60 FPS
         ++context.frame;
         Check(d::Run(s, c, context, f).follow, "continuous cart run remains blocked past 500 ms");
     }
@@ -231,7 +234,8 @@ static void CartRunFollow() {
         auto ctx = context;
         Check(d::Run(n, changed, ctx, slots).cancel, "arm cart isolation case");
         n.now += 6;
-        if (bad == 0) n.now += 95;
+        n.game += 0.36;
+        if (bad == 0) n.game += 6.0;   // more than 6 frames of game time since the last contact
         if (bad == 1) ++changed.actor.guid;
         if (bad == 2) ++ctx.room;
         if (bad == 3) ++n.resource.resource;
@@ -241,6 +245,103 @@ static void CartRunFollow() {
         if (bad == 7) ++changed.actor.parts;
         if (bad == 8) ++changed.actor.owner;
         Check(!d::Run(n, changed, ctx, slots).cancel, "cart follow rejects gaps and changed context or instance");
+    }
+}
+// hunt-findings P2-2: the blocked run's continuity is game time, not wall clock.
+static void CartGameTime() {
+    auto c = CartContact();
+    p::input::Sample context{};
+    {
+        ComposedSources s; d::Follows f;
+        Check(d::Run(s, c, context, f).cancel, "arm: fresh frontal cart run");
+        s.now += 5000; s.game += 0.36; ++context.frame;   // the pause menu: wall time passes, game time does not
+        Check(d::Run(s, c, context, f).follow, "a pause inside the run keeps it blocked");
+        s.now += 400; s.game += 1.0; ++context.frame;      // one hitched frame
+        Check(d::Run(s, c, context, f).follow, "a hitched frame keeps it blocked");
+        for (unsigned i = 0; i != 40; ++i) {               // re4_fps 165: a contact every tick
+            s.now += 6; s.game += 2.0 * 30.0 / 165.0; ++context.frame;
+            Check(d::Run(s, c, context, f).follow, "165 FPS contacts every tick stay blocked");
+        }
+        s.now += 6; s.game += 5.9; ++context.frame;
+        Check(d::Run(s, c, context, f).follow, "a gap just under 6 frames of game time still follows");
+        c.actor.routine[1] = 6; c.actor.routine[2] = 0; s.now += 2000; s.game += 0.5; ++context.frame;
+        Check(d::Run(s, c, context, f).follow, "the final 500-damage contact after a pause still follows the run");
+    }
+    c = CartContact();
+    {
+        ComposedSources s; d::Follows f;
+        Check(d::Run(s, c, context, f).cancel, "arm: second run");
+        s.now += 20; s.game += 6.2; ++context.frame;
+        Check(!d::Run(s, c, context, f).cancel && s.consumes == 1, "a real gap (over 6 frames of game time) needs a new press");
+    }
+    {
+        ComposedSources s; d::Follows f;
+        Check(d::Run(s, c, context, f).cancel, "arm: third run");
+        s.now += 6; s.game -= 3.0; ++context.frame;
+        Check(!d::Run(s, c, context, f).cancel, "a game clock that went back ends the run");
+    }
+    {
+        ComposedSources s; d::Follows f;
+        Check(d::Run(s, c, context, f).cancel, "arm: fourth run");
+        s.now += 6; s.game = NAN; ++context.frame;
+        Check(!d::Run(s, c, context, f).cancel, "an unknown game time fails closed (native damage)");
+    }
+}
+// hunt-findings P2-1: box first. em39 tests the box (0x146172) before the leg spheres (0x15585F) in each frame; a box
+// block must cover the same kick's sphere samples, which reach tier 2 with the press already spent.
+static void KickBoxFirst() {
+    auto krauser = [] {
+        d::Contact c{};
+        c.route = d::Route::Krauser;
+        c.actor.owner = 0x10000;
+        c.actor.routine[0] = 1;
+        c.actor.routine[1] = 0x2B;
+        return c;
+    };
+    auto sphere = [](uint32_t esi) {auto h = Hit(0x15585F); h.producer_esi = esi; return h;};
+    p::input::Sample context{};
+    {
+        ComposedSources s; d::Follows f; const auto c = krauser();
+        auto box = d::Run(s, c, context, f);
+        Check(box.cancel && !box.follow && s.consumes == 1, "the box contact is blocked first with the press");
+        d::FollowSlot* slot = nullptr;
+        Check(d::FollowKick(s, sphere(c.actor.owner), c, context, f, &slot) && slot && slot->kick && s.consumes == 1,
+              "the same frame's sphere sample follows the box block without a press");
+        s.At(0, -500); s.now += 15;
+        Check(d::FollowKick(s, sphere(c.actor.owner), c, context, f), "a later sphere sample at Link's back is the same kick");
+        s.now += 333;
+        Check(d::FollowKick(s, sphere(c.actor.owner), c, context, f), "kick gap: 333 ms later still the same kick");
+        s.At(0, 500);
+        Check(d::Run(s, c, context, f).follow, "and the box route still follows it too");
+        s.now += 600;
+        Check(d::FollowKick(s, sphere(c.actor.owner), c, context, f), "600 ms after the last contact: inside the 700 ms kick gap");
+        s.now = 1000 + 1500;
+        Check(d::FollowKick(s, sphere(c.actor.owner), c, context, f), "kick age includes 1500 ms");
+        ++s.now;
+        Check(!d::FollowKick(s, sphere(c.actor.owner), c, context, f), "a kick cannot renew its absolute lifetime");
+    }
+    for (unsigned bad = 0; bad != 11; ++bad) {
+        ComposedSources s; d::Follows f; auto c = krauser(); auto ctx = context;
+        Check(d::Run(s, c, ctx, f).cancel, "arm box-first case");
+        auto h = sphere(c.actor.owner);
+        s.now += 20;
+        if (bad == 0) ++h.outer_caller;               // another producer
+        if (bad == 1) ++h.producer_esi;               // another Krauser
+        if (bad == 2) c.actor.routine[1] = 0x2C;      // another kick
+        if (bad == 3) ++c.actor.guid;                 // another instance
+        if (bad == 4) ++ctx.room;                     // another room
+        if (bad == 5) ++s.resource.resource;          // another Link resource
+        if (bad == 6) s.safe = false;
+        if (bad == 7) s.blocked = true;
+        if (bad == 8) s.now += 701;                   // past the kick gap
+        if (bad == 9) c.actor.routine[1] = 0x10;      // not a kick routine
+        if (bad == 10) c.route = d::Route::Bats;
+        Check(!d::FollowKick(s, h, c, ctx, f) && s.consumes == 1, "box-first bridge rejects other producers, kicks, contexts and gaps");
+    }
+    {   // A box block of a non-kick contact never arms the bridge; a box follow-up alone is not a sphere follow.
+        ComposedSources s; d::Follows f; auto c = krauser(); c.actor.routine[1] = 0x10;
+        Check(d::Run(s, c, context, f).cancel, "non-kick box contact blocks");
+        Check(!d::FollowKick(s, sphere(c.actor.owner), c, context, f), "but arms no kick bridge");
     }
 }
 static void ActorContracts() {
@@ -343,9 +444,11 @@ int main(int argc, char** argv) {
     DirectFollow();
     DirectComposition();
     CartRunFollow();
+    CartGameTime();
+    KickBoxFirst();
     KickGap();
     ActorContracts();
     if (argc == 2) DirectPins(argv[1]);
-    std::printf("parry direct routes: %u checks passed\n", checks);
+    std::printf("parry direct routes: %u checks passed%s\n", checks, argc == 2 ? " (pinned image: route pins checked)" : " (no image: pin checks skipped)");
     return 0;
 }

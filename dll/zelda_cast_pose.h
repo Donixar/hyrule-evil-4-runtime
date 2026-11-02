@@ -14,17 +14,19 @@ inline double Weight(double age_ms) {
     const double t = (age_ms - 450) / 150;
     return 1 - t*t*(3 - 2*t);
 }
+// duration: kDurationMs for the procedural pose, the clip's length for the clip cast (zelda_cast_clip.h).
 class Timeline {
-    double start_ = 0;
+    double start_ = 0, duration_ = kDurationMs;
     bool armed_ = false;
 public:
     bool Active(double now) const {
-        return armed_ && std::isfinite(now) && now >= start_ && now-start_ < kDurationMs;
+        return armed_ && std::isfinite(now) && now >= start_ && now-start_ < duration_;
     }
-    bool Begin(double now) {
-        if (!std::isfinite(now) || now < 0 || Active(now)) return false;
-        start_ = now; armed_ = true; return true;
+    bool Begin(double now, double duration = kDurationMs) {
+        if (!std::isfinite(now) || now < 0 || Active(now) || !std::isfinite(duration) || duration <= 0 || duration > 5000) return false;
+        start_ = now; duration_ = duration; armed_ = true; return true;
     }
+    double Duration() const { return duration_; }
     double Age(double now) const { return now-start_; }
     void Cancel() { armed_ = false; }
 };

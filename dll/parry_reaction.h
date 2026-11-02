@@ -25,6 +25,8 @@
 //         NOT gated: it starts a new player action, normally together with a
 //         primary MotionSet that detaches us anyway; it ends as lost_owner.
 //    On exit the CAS gives 2A8 back to player+474 and the neck resumes.
+//  - slot-guard-01 (1-nov): the exit gives back the stance work only while it is still the player's live
+//    blend, and the guard's work only while that layer is active; otherwise 0 (secondary_slot.h HandBack).
 //  - Non-looping SEQ reports work+42 == 4 at its end and holds the last pose; the
 //    native code never detaches it, so the exit is ours.
 // Units: one Tick per player MotionMove (game logic frame). The schedule below is in 60 Hz
@@ -35,6 +37,7 @@
 #include <atomic>
 #include <cstdint>
 #include "game_clock.h"
+#include "secondary_slot.h"
 
 namespace link_runtime::parry::reaction {
 inline constexpr uint32_t kNeckWorkOffset=0x474;  // 27CAC0: LEA EDI,[ESI+474h]
@@ -73,15 +76,32 @@ struct World {
     uint32_t image_base=0;       // bio4.exe base (ASLR); 0 = unknown: the stance work is not accepted
     uint32_t guest=0;            // shield-guard-01: the guard layer's work (shield_guard.h); accepted like the
                                  // neck/stance, and the exit CAS gives 2A8 back to it (0 = none)
+    bool stance_live=false;      // slot-guard-01: the stance work is still the player's live blend right now
+                                 // (secondary_slot::Check == Live). The exit gives 2A8 back to the stance only then,
+                                 // and to the guest only while it is still the active guard's work; else 0.
     bool Blocked() const {return !player||damaged||grabbed||dead||scene||mortal_draw||ocarina||weapon_switch||disabled;}
 };
 struct Stats {
     unsigned starts=0,completed=0,cancelled=0,lost_owner=0,dropped=0,refused=0;
     unsigned install_failed=0,ignored_overlap=0,foreign_weight=0,timeouts=0;
     unsigned neck_suppressed=0,repeated_frame=0;
+    unsigned cleared=0;          // slot-guard-01: exits that gave 2A8 back as 0 (the previous owner was stale)
     uint32_t owner_id=0;         // owner+100/+101 (id | type<<8) of the last commit, for the log
 };
 enum class Phase {Idle,In,Hold,Out,Zero};
+// slot-guard-01: how the last reaction ended and what it gave 2A8 back to (for the log line of a live repro).
+enum class Exit : uint8_t {None,Completed,Cancelled,LostOwner,Dropped,Timeout};
+inline const char* ExitName(Exit e){
+    switch(e){case Exit::Completed:return "completed";case Exit::Cancelled:return "cancelled";case Exit::LostOwner:return "lost_owner";
+    case Exit::Dropped:return "dropped";case Exit::Timeout:return "timeout";default:return "none";}
+}
+struct HandBack {
+    Exit exit=Exit::None;
+    uint32_t previous=0;         // what 2A8 held at install
+    uint32_t restored=0;         // what the exit wrote (only meaningful with wrote)
+    bool wrote=false;            // the exit's compare-exchange won (2A8 was still ours)
+    bool cleared=false;          // previous was stale: 0 written instead
+};
 
 // Port contract (all on the game thread):
 //  bool     Install(player, out work)  native init of OUR work (override mode,
@@ -99,9 +119,16 @@ class Reaction {
     float last_=0.f,out_from_=1.f;
     Phase phase_=Phase::Idle;
     Stats stats_;
+    HandBack exit_;
     void Idle(){phase_=Phase::Idle;player_=work_=previous_=frame_=0;tick_=out_tick_=0;}
-    template<class Port> void Give(Port& port){
-        if(port.ReplaceSecondary(player_,work_,previous_))return;
+    void Left(Exit why){exit_=HandBack{};exit_.exit=why;exit_.previous=previous_;}
+    // slot-guard-01: previous_ only while it is still a live owner (secondary_slot::HandBack), else 0.
+    template<class Port> void Give(Port& port,const World& w,Exit why){
+        Left(why);
+        bool cleared=false;
+        const uint32_t back=link_runtime::secondary_slot::HandBack(previous_,player_,w.image_base,w.stance_live,w.guest,cleared);
+        exit_.restored=back;exit_.cleared=cleared;
+        if(port.ReplaceSecondary(player_,work_,back)){exit_.wrote=true;if(cleared)++stats_.cleared;return;}
         ++stats_.lost_owner;
     }
     template<class Port> void Write(Port& port,float w){
@@ -112,6 +139,8 @@ public:
     explicit Reaction(Config c):config_(Sanitize(c)){}
     const Config& config() const {return config_;}
     const Stats& stats() const {return stats_;}
+    const HandBack& last_exit() const {return exit_;}
+    uint32_t previous() const {return previous_;}   // what 2A8 held at install (0 while idle)
     bool Active() const {return phase_!=Phase::Idle;}
     // Called once per Committed parry (commit::Result::Committed) with a
     // nonzero serial that changes per commit. Never touches native state.
@@ -152,12 +181,12 @@ public:
             ++stats_.ignored_overlap;
         }
         frame_=world.frame;
-        if(world.player!=player_){++stats_.dropped;Idle();return;}           // never write through an old player
-        if(port.Secondary(player_)!=work_){++stats_.lost_owner;Idle();return;} // native detach or neck takeover
-        if(world.Blocked()){++stats_.cancelled;Give(port);Idle();return;}
+        if(world.player!=player_){++stats_.dropped;Left(Exit::Dropped);Idle();return;}           // never write through an old player
+        if(port.Secondary(player_)!=work_){++stats_.lost_owner;Left(Exit::LostOwner);Idle();return;} // native detach or neck takeover
+        if(world.Blocked()){++stats_.cancelled;Give(port,world,Exit::Cancelled);Idle();return;}
         namespace gc=link_runtime::game_clock;
         const double step=std::isfinite(world.step)&&world.step>0.f?double(world.step):1.0;
-        if(gc::Reached(tick_,double(config_.max_ticks))){++stats_.timeouts;Give(port);Idle();return;}
+        if(gc::Reached(tick_,double(config_.max_ticks))){++stats_.timeouts;Give(port,world,Exit::Timeout);Idle();return;}
         if((phase_==Phase::In||phase_==Phase::Hold)&&
            (gc::Reached(tick_,double(config_.ramp_out_start))||port.Status(work_)==kSeqEnded)){phase_=Phase::Out;out_tick_=0;out_from_=last_;}
         switch(phase_){
@@ -178,7 +207,7 @@ public:
             break;}
         case Phase::Zero:
             // The previous tick ran MotionMove at weight 0 (exact primary pose).
-            Give(port);++stats_.completed;Idle();return;
+            Give(port,world,Exit::Completed);++stats_.completed;Idle();return;
         default:break;
         }
         tick_+=step;

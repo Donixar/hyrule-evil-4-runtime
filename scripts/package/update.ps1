@@ -386,7 +386,7 @@ function Invoke-LinkUpdate($Options, [string]$RunDir) {
         }
     }
     if (-not (Test-GameFolder $game)) { throw 'No encontré el juego. Selecciona la carpeta Resident Evil 4 que contiene BIO4 y Bin32.' }
-    $game=[IO.Path]::GetFullPath($game).TrimEnd('\')
+    $game=Get-CanonicalDirectory $game
     [void](Get-UpdatePath $game 'Bin32/bio4.exe')
     if (Test-GameRunning) { throw 'Resident Evil 4 está abierto. Ciérralo y vuelve a ejecutar el actualizador.' }
     $hashTool=[Security.Cryptography.SHA256]::Create()

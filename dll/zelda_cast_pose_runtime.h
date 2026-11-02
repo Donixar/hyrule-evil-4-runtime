@@ -3,6 +3,7 @@
 // Game thread only: Begin/Active/HandWorld. Install once after MinHook initialization.
 // Hooks are independent of the existing combat dispatch and MotionMove hooks.
 #include "zelda_cast_pose.h"
+#include "zelda_cast_clip_runtime.h"   // zelda-companion-01: the TP cast clip on +0x2A8 (ZeldaCastClip=1)
 #include "native_pins.h"
 #include "link_runtime_health.h"
 #include "thread_binding.h"
@@ -76,6 +77,12 @@ inline Scene hand_scene;
 inline Vec hand;
 inline ULONGLONG hand_stamp=0;
 inline unsigned applied=0,drawn=0;
+// zelda-companion-01: the cast plays the TP clip on +0x2A8 instead of the procedural arm (clip_mode), and the facing
+// eases from her own yaw to the target's over zelda_cast_clip::kTurnMs instead of snapping on the first frame.
+namespace zcc=link_runtime::zelda_cast_clip;
+inline bool clip_mode=false,eased=false,clip_yield_logged=false,clip_rig_logged=false;   // eased: ZeldaCastClip=1 asked
+inline zcc::runtime::Layer player_layer;
+inline float own_yaw=0,face_yaw=std::numeric_limits<float>::quiet_NaN();
 inline bool OwnedThread() { return ready.load(std::memory_order_acquire) && thread.load(std::memory_order_acquire)==GetCurrentThreadId(); }
 
 struct Failure {
@@ -104,6 +111,8 @@ inline void Cancel(const char* reason,const Failure* failure=nullptr) {
         else if(log) log("zelda_cast end=%s applied=%u drawn=%u",reason,applied,drawn);
     }
     running=false; timeline.Cancel(); hand_known=false;
+    if(clip_mode) zcc::runtime::Release(player_layer);
+    clip_mode=false;
 }
 inline bool Same(const Scene& a,const Scene& b) {
     return a.player==b.player && a.global==b.global && a.guid==b.guid && a.parts==b.parts && a.room==b.room;
@@ -204,9 +213,14 @@ inline void WorldAt(void* self,uintptr_t caller) {
     }
     Rig rig; Mat posed[kChain],world[kChain],old_mat,old_local; Vec old_pos,old_ang;
     Failure failure; PoseDiagnostic pose_problem;
+    if(eased) anchor_ang.y=zcc::EaseYaw(own_yaw,face_yaw,timeline.Age(now_ms));
     const Mat root=Euler(anchor_ang.x,anchor_ang.y,anchor_ang.z,anchor_pos);
-    if(!ReadRig(s,rig,&failure)) { Cancel(failure.reason,&failure); world_original(self); return; }
-    if(!BuildPose(root,rig.local,Weight(timeline.Age(now_ms)),posed,world,rig.add_rot,&pose_problem)) {
+    if(!ReadRig(s,rig,&failure)) {
+        // The clip owns the arm: a rig this reader does not accept (a blended frame) only skips the anchor this frame.
+        if(clip_mode) { if(!clip_rig_logged&&log) { clip_rig_logged=true; LogFailure("clip_rig_skip",failure); } world_original(self); return; }
+        Cancel(failure.reason,&failure); world_original(self); return;
+    }
+    if(!BuildPose(root,rig.local,clip_mode?0.:Weight(timeline.Age(now_ms)),posed,world,rig.add_rot,&pose_problem)) {
         failure=Failure{};
         Reject(&failure,"build_pose",pose_problem.bone); failure.detail=pose_problem.detail; failure.matrix=pose_problem.matrix;
         Cancel(failure.reason,&failure); world_original(self); return;
@@ -244,6 +258,11 @@ inline void __fastcall MoveDetour(void* self,void*) {
     const bool freeze=reinterpret_cast<uintptr_t>(self)==owner.player && Tick(s);
     const bool keys=freeze && Read(base+kHeld,held) && Read(base+kPressed,pressed);
     if(freeze && !keys) Cancel("input_read");
+    // The clip's weight before cPlayer::move runs MotBase->move (MotionMove blends +0x2A8), Neck->move comes after it.
+    if(keys && clip_mode && !zcc::runtime::Tick(player_layer,timeline.Age(now_ms)) && !clip_yield_logged) {
+        clip_yield_logged=true;
+        if(log) log("zelda_cast clip=yielded age_ms=%.0f (a native layer took +0x2A8; the stop, the turn and the ray go on)",timeline.Age(now_ms));
+    }
     if(keys) {
         // Only direction bits 0..3. Keep knife, action, menus and the run/action bit native.
         const uint32_t h=held&~15U,p=pressed&~15U;
@@ -279,9 +298,10 @@ inline void __cdecl RenderDetour(void* self) {
 }
 } // namespace detail
 
-// face_yaw (finite): the facing she turns to for the whole cast, so the extended arm points at the target (goal 23-oct);
-// NaN keeps her own facing.
-inline void Begin(double now,float face_yaw=std::numeric_limits<float>::quiet_NaN()) {
+// face_yaw (finite): the facing she turns to (eased over zelda_cast_clip::kTurnMs), so the arm throws at the target
+// (goal 23-oct); NaN keeps her own facing. clip: play the TP cast clip on +0x2A8 (ZeldaCastClip=1); when the clip is not
+// loaded or the slot is busy the procedural pose runs instead (600 ms).
+inline void Begin(double now,float face=std::numeric_limits<float>::quiet_NaN(),bool clip=false) {
     using namespace detail;
     if(!ready.load(std::memory_order_acquire)) return;
     const auto claim=binding.Take();
@@ -306,10 +326,15 @@ inline void Begin(double now,float face_yaw=std::numeric_limits<float>::quiet_Na
         Reject(&failure,"build_pose"); failure.detail="model"; LogFailure("begin_refused",failure); return;
     }
     if(timeline.Active(now) && Same(owner,s)) return;
-    timeline.Cancel(); timeline.Begin(now); running=true; owner=s; anchor_pos=pos; anchor_ang=ang;
-    if(std::isfinite(face_yaw)) anchor_ang.y=face_yaw;
+    if(clip_mode) zcc::runtime::Release(player_layer);
+    clip_mode=clip && zcc::runtime::Ready() && zcc::runtime::Install(player_layer,s.player,s.player+zcc::kNeckWork);
+    if(clip && !clip_mode && log) log("zelda_cast clip=refused ready=%u (the procedural pose runs)",zcc::runtime::Ready()?1U:0U);
+    clip_yield_logged=clip_rig_logged=false;
+    timeline.Cancel(); timeline.Begin(now,clip_mode?zcc::kClipMs:kDurationMs); running=true; owner=s; anchor_pos=pos; anchor_ang=ang;
+    own_yaw=ang.y; face_yaw=face; eased=clip;
+    if(!eased && std::isfinite(face)) anchor_ang.y=face;   // ZeldaCastClip=0: the 23-oct snap, unchanged
     now_ms=now; clock_frame=s.frame; applied=drawn=0; hand_known=false;
-    if(log) log("zelda_cast begin player=0x%X room=0x%X duration=600",s.player,unsigned(s.room));
+    if(log) log("zelda_cast begin player=0x%X room=0x%X duration=%.0f clip=%u",s.player,unsigned(s.room),timeline.Duration(),clip_mode?1U:0U);
 }
 inline bool Active(double now) {
     using namespace detail;
@@ -321,6 +346,9 @@ inline bool Active(double now) {
     if(!timeline.Active(now)) { Cancel("complete"); return false; }
     return true;
 }
+// The cast plays the clip (chosen at Begin) and, while +0x2A8 is still ours, where it is (SEQ entries).
+inline bool ClipCast() { return detail::clip_mode; }
+inline bool ClipFrame(double& entries) { return detail::clip_mode && zelda_cast_clip::runtime::SeqFrame(detail::player_layer,entries); }
 inline bool HandWorld(float out[3]) {
     using namespace detail;
     Scene s;

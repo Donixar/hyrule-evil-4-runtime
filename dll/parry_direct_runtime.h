@@ -1,5 +1,7 @@
 #pragma once
 #include "parry_direct_routes.h"
+#include "game_clock.h"
+#include <cmath>
 
 namespace link_runtime::parry::direct {
 // Fixed-damage contacts share the line adapter's input, pose and cone sources.
@@ -84,6 +86,13 @@ inline bool Same(const ResourceStamp& a, const ResourceStamp& b) {
     return a.info == b.info && a.resource == b.resource && a.part0 == b.part0 &&
         a.part10 == b.part10 && a.profile == b.profile && a.player_guid == b.player_guid;
 }
+// When a contact happens: wall-clock ms and game time in 60 Hz frames (game_clock.h: paused with the game, the same at
+// 60 and 165 FPS). A plain ms converts implicitly with an unknown game time (NaN).
+struct When {
+    uint64_t ms = 0;
+    double game = NAN;
+    When(uint64_t wall = 0, double game_time = NAN) : ms(wall), game(game_time) {}
+};
 struct FollowSlot {
     bool armed = false;
     Route route{};
@@ -92,7 +101,15 @@ struct FollowSlot {
     ResourceStamp resource{};
     uint64_t start = 0, last = 0;
     bool kick = false;
+    double game_last = NAN;   // the cart run's continuity (game time of the last contact)
+    bool bridged = false;     // a sphere sample of this kick was already followed (one log line per kick)
 };
+// The continuity of a blocked cart run (hunt-findings P2-2, 1-nov): contacts at most 6 frames of game time apart (the
+// old 100 ms at 60 FPS), with no cap on the whole run. It was 100 ms of wall clock: a hitched frame or the pause menu
+// broke the blocked run and its 500-damage contact landed after the parry.
+inline constexpr double kCartGapFrames = 6.0;
+// Krauser's high (0x2B) and low (0x2C) kick routines: the attack both the box and the leg spheres belong to.
+inline bool KickRoutine(const Actor& a) {return a.routine[0] == 1 && (a.routine[1] == 0x2B || a.routine[1] == 0x2C);}
 inline bool CartRunning(const Actor& a) {return a.routine[0] == 1 && a.routine[1] == 4 && a.routine[2] == 1;}
 inline bool CartFinal(const Actor& a) {return a.routine[0] == 1 && a.routine[1] == 6 && a.routine[2] == 0;}
 inline bool SameCart(const Actor& armed, const Actor& current) {
@@ -102,53 +119,77 @@ inline bool SameCart(const Actor& armed, const Actor& current) {
     normalized.routine[2] = armed.routine[2];
     return Same(armed, normalized);
 }
-inline bool Expired(const FollowSlot& s, uint64_t now) {
+inline bool Expired(const FollowSlot& s, const When& now) {
+    if (s.route == Route::Cart)   // game time only; an unknown or backwards clock ends the run (fail to native damage)
+        return !std::isfinite(now.game) || !std::isfinite(s.game_last) || now.game + game_clock::kEpsilon < s.game_last ||
+               game_clock::Exceeded(now.game - s.game_last, kCartGapFrames);
     const uint64_t gap = s.kick ? general::Follow::kSwingGapMs : 100;
     const uint64_t age = s.kick ? general::Follow::kSwingMaxMs : 500;
-    return now < s.last || now - s.last > gap || (s.route != Route::Cart && now - s.start > age);
+    return now.ms < s.last || now.ms - s.last > gap || now.ms - s.start > age;
 }
 struct Follows {
     FollowSlot slots[8]{};
     void Retire(uint32_t who) {
         for (auto& s : slots) if (s.actor.owner == who) s.armed = false;
     }
-    bool Match(const Contact& c, const input::Sample& context, uint64_t now, const ResourceStamp& resource = {}) {
+    // kick_only: only a slot armed for a whole Krauser kick (the box/sphere bridge in either order).
+    // matched (optional): the slot that matched.
+    bool Match(const Contact& c, const input::Sample& context, const When& now, const ResourceStamp& resource = {},
+               bool kick_only = false, FollowSlot** matched = nullptr) {
         for (auto& s : slots) {
             if (!s.armed) continue;
             if (Expired(s, now) ||
                 !input::Context(s.context, context) || !Same(s.resource, resource) || context.frame < s.context.frame) {s.armed = false; continue;}
             if (s.actor.owner != c.actor.owner) continue;
+            if (kick_only && !s.kick) continue;
             if (s.route != c.route || !(c.route == Route::Cart ? SameCart(s.actor, c.actor) : Same(s.actor, c.actor))) {
                 s.armed = false;
                 continue;
             }
-            s.last = now;
+            s.last = now.ms;
+            s.game_last = now.game;
             s.context.frame = context.frame;
             if (c.route == Route::Cart && CartFinal(c.actor)) s.armed = false;
+            if (matched) *matched = &s;
             return true;
         }
         return false;
     }
-    void Arm(const Contact& c, const input::Sample& context, uint64_t now, const ResourceStamp& resource = {}, bool kick = false) {
+    void Arm(const Contact& c, const input::Sample& context, const When& now, const ResourceStamp& resource = {}, bool kick = false) {
         unsigned slot = 0;
         for (unsigned i = 0; i < std::size(slots); ++i) {
             if (!slots[i].armed || Expired(slots[i], now)) {slot = i; break;}
             if (slots[i].start < slots[slot].start) slot = i;
         }
-        slots[slot] = {true, c.route, c.actor, context, resource, now, now, kick};
+        slots[slot] = {true, c.route, c.actor, context, resource, now.ms, now.ms, kick, now.game, false};
     }
 };
+// Sources: When Clock() = {Now() ms, Game() frames}.
+template <class Sources> When Clock(Sources& s) {return When{s.Now(), s.Game()};}
 // Only a fresh tier-2 press block may bridge the sphere and box windows of one kick.
 template <class Sources> bool ShareKick(Sources& s, const Candidate& candidate, const general::Applied& applied,
                                       const Contact& c, const input::Sample& context, Follows& following) {
     if (!applied.cancel || !applied.effects || applied.grace ||
         candidate.outer_caller - s.ImageBase() != 0x15585F || c.route != Route::Krauser ||
-        !c.actor.owner || c.actor.owner != candidate.producer_esi || c.actor.routine[0] != 1 ||
-        (c.actor.routine[1] != 0x2B && c.actor.routine[1] != 0x2C)) return false;
+        !c.actor.owner || c.actor.owner != candidate.producer_esi || !KickRoutine(c.actor)) return false;
     ResourceStamp resource{};
     if (s.Blocked() || !s.Resource(resource) || !s.Safe()) return false;
-    following.Arm(c, context, s.Now(), resource, true);
+    following.Arm(c, context, Clock(s), resource, true);
     return true;
+}
+// The other order (hunt-findings P2-1, 1-nov): em39's dispatcher tests the box contact (0x146172) before the leg spheres
+// (0x15585F) in each frame, so a kick can be press-blocked on the box first. Its sphere samples then reached tier 2 with
+// the press already spent and no follow-up of their own: the parry showed and the damage landed. A sphere sample by the
+// same Krauser (ESI), still in that kick (same routine and identity), in the same input context and Link resource,
+// inside the kick bounds of a slot that kick armed (the box block, or ShareKick) is that kick: cancelled silently (no
+// press, sparks or voice), wherever it lands, like tier 2's owner follow-ups.
+template <class Sources> bool FollowKick(Sources& s, const Candidate& candidate, const Contact& c, const input::Sample& context,
+                                        Follows& following, FollowSlot** matched = nullptr) {
+    if (candidate.outer_caller - s.ImageBase() != 0x15585F || c.route != Route::Krauser || !c.actor.owner ||
+        c.actor.owner != candidate.producer_esi || !KickRoutine(c.actor)) return false;
+    ResourceStamp resource{};
+    if (s.Blocked() || !s.Resource(resource) || !s.Safe()) return false;
+    return following.Match(c, context, Clock(s), resource, true, matched);
 }
 struct Result : line::Outcome {bool follow = false;};
 template <class Sources> Result Run(Sources& s, const Contact& c, const input::Sample& context, Follows& following) {
@@ -165,7 +206,7 @@ template <class Sources> Result Run(Sources& s, const Contact& c, const input::S
     if (!s.Safe()) {following = {}; return o;}
     // The same run can push Link along or pass beside him after the initial block.
     if (c.route == Route::Cart) {
-        if (following.Match(c, context, s.Now(), resource)) {
+        if (following.Match(c, context, Clock(s), resource)) {
             o.cancel = o.follow = true;
             o.reason = line::Reason::Blocked;
             return o;
@@ -176,14 +217,15 @@ template <class Sources> Result Run(Sources& s, const Contact& c, const input::S
     if (!s.Front(c.candidate, o.front)) {following.Retire(c.actor.owner); return o;}
     o.reason = line::Reason::Rear;
     if (!general::Parryable(o.front)) {following.Retire(c.actor.owner); return o;}
-    if (c.route != Route::Cart && following.Match(c, context, s.Now(), resource)) {
+    if (c.route != Route::Cart && following.Match(c, context, Clock(s), resource)) {
         o.cancel = true;
         o.follow = true;
         o.reason = line::Reason::Blocked;
         return o;
     }
     static_cast<line::Outcome&>(o) = direct::Decide(s, c.candidate);
-    if (o.cancel) following.Arm(c, context, s.Now(), resource);
+    // A Krauser kick's box block arms a slot for the whole kick, so its later sphere samples follow it (FollowKick).
+    if (o.cancel) following.Arm(c, context, Clock(s), resource, c.route == Route::Krauser && KickRoutine(c.actor));
     return o;
 }
 struct Hook {volatile LONG active = 0; void* target = nullptr; void* original = nullptr; uint32_t skip = 0;};
@@ -218,6 +260,8 @@ struct NativeSources : line::NativeSources {
     ResourceStamp resource{};
     bool resource_known = false;
     NativeSources(general::Runtime& r, const Contact& c, const input::Sample& ctx) : line::NativeSources(r), contact(c), context(ctx) {}
+    // Game time in 60 Hz frames (the runtime's game clock); without it the logic frame counter (= game time at 60 FPS).
+    double Game() {return r.game_now ? r.game_now() : double(context.frame);}
     bool Resource(ResourceStamp& out) {
         general::Memory m;
         sword::reader::Observation found{};
@@ -257,6 +301,34 @@ inline void ShareTierTwo(general::Runtime& r, const Candidate& candidate, const 
         NativeSources s{r, c, context};
         ShareKick(s, candidate, applied, c, context, follows);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+// Tier-2 entry of the box-first kick bridge (FollowKick): a sphere sample (ret 0x15585F) of a kick the Krauser box
+// route already blocked is cancelled silently before tier 2 looks for a press. Game thread, inside ResolveParry.
+// One log line per bridged kick (its first sphere sample).
+inline bool FollowTierTwo(general::Runtime& r, const Candidate& candidate) {
+    if (r.settings.mode != general::Mode::Active || !r.settings.bosses || candidate.outer_caller - r.access.image_base != 0x15585F ||
+        image_base != r.access.image_base || !InterlockedCompareExchange(&hooks[0].active, 0, 0)) return false;
+    bool follow = false, first = false;
+    uint64_t age = 0;
+    uint32_t owner = 0;
+    __try {
+        general::Memory m;
+        Contact c{};
+        c.route = Route::Krauser;
+        input::Sample context{};
+        if (!ReadActor(m, image_base, Route::Krauser, candidate.producer_esi, c.actor) ||
+            !input::Read(m, r.access, context) || !context.valid || !context.gameplay) return false;
+        NativeSources s{r, c, context};
+        FollowSlot* slot = nullptr;
+        follow = FollowKick(s, candidate, c, context, follows, &slot);
+        if (follow && slot) {
+            owner = c.actor.owner; age = slot->last - slot->start;
+            first = !slot->bridged; slot->bridged = true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {follow = false;}
+    if (follow && first) general::Log("parry direct follow route=krauser_kick_probe via=sphere producer=0x15585F owner=0x%08X since_block_ms=%llu",
+                                      owner, age);
+    return follow;
 }
 inline bool __cdecl Resolve(const Contact& c) {
     if (!runtime || runtime->settings.mode != general::Mode::Active ||

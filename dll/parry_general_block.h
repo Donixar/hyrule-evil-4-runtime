@@ -66,6 +66,8 @@ inline const char* VerdictName(Verdict v) {
 // that attack: the follow-up then allows kSwingGapMs between contacts, up to kSwingMaxMs. 28-oct
 // (play-20261028/tests/05-flail.log): the chain came back behind Link 453 ms after the block, past the
 // old 400 ms gap, and landed; the routine check still ends the follow on a new swing.
+// A hidden-pose sample of the blocked swing, unknown owner, in the parryable arc (U3 30-oct: 0 ms after the block).
+constexpr uint64_t kPoseFreeFollowMs = 100;
 struct Swing {bool known = false; uint8_t routine[2]{};};
 inline bool SameSwing(const Swing& a, const Swing& b) {return a.known && b.known && a.routine[0] == b.routine[0] && a.routine[1] == b.routine[1];}
 struct Follow {
@@ -243,14 +245,17 @@ template <class S> Outcome Decide(S& s, const Candidate& c, const Settings& set,
     // and position gates; one matched by distance only (owner unknown) waits for them, so another
     // attacker of the same kind at Link's back is never taken for it.
     Swing swing{};
-    auto follow_up = [&](bool by_owner) {
+    // The press-blocked swing only (the main Follow); follow_up adds the grace-blocked ones.
+    auto follow_only = [&](bool by_owner) {
         follow.Expire(now);
-        if (follow.Matches(o.function, o.owner, o.front.sample, now, by_owner, &swing)) {
-            o.follow = true; o.reason = Reason::Blocked; o.long_follow = follow.Long(now);
-            o.follow_gap_ms = now - follow.last; o.follow_age_ms = now - follow.start;
-            if (set.mode == Mode::Active) {follow.Touch(o.front.sample, now); o.cancel = true;}
-            return true;
-        }
+        if (!follow.Matches(o.function, o.owner, o.front.sample, now, by_owner, &swing)) return false;
+        o.follow = true; o.reason = Reason::Blocked; o.long_follow = follow.Long(now);
+        o.follow_gap_ms = now - follow.last; o.follow_age_ms = now - follow.start;
+        if (set.mode == Mode::Active) {follow.Touch(o.front.sample, now); o.cancel = true;}
+        return true;
+    };
+    auto follow_up = [&](bool by_owner) {
+        if (follow_only(by_owner)) return true;
         if (grace && set.mode == Mode::Active && grace->FollowSwing(o.function, o.owner, o.front.sample, now, by_owner, &swing, &o.long_follow)) {
             o.follow = o.grace = true; o.cancel = true; o.reason = Reason::Blocked;
             return true;
@@ -261,9 +266,20 @@ template <class S> Outcome Decide(S& s, const Candidate& c, const Settings& set,
         o.owner = s.Owner(c);
         if (o.owner) swing.known = s.Routine(o.owner, swing.routine);
         if (follow_up(true)) return o;
+        // Same swing, unknown owner, wherever it lands (Krauser r31c, Donald 31-oct: blocked, then 15-32 ms later the
+        // arm sweep sampled at Link's side/back and landed 1000). A distance follow-up of the press-blocked swing within
+        // kPoseFreeFollowMs of the block skips the pose and rear gates; later ones still go through them.
+        if (follow.armed && now >= follow.start && now - follow.start <= kPoseFreeFollowMs && follow_only(false)) return o;
     }
     o.reason = Reason::Pose;
     if (!posed) {
+        // Same swing, unknown owner, no sword pose (U3, room 0x31B, Donald 30-oct: a pose-fallback block at
+        // producer 0x10A43B, power 1100, then 0 ms later a second sample at Link's side passed as `pose` and left
+        // him at 1 hp). A distance follow-up in the parryable arc within kPoseFreeFollowMs of the block is that
+        // swing; later, or at the back, the gates still apply (no press-free extension of a hidden-pose follow).
+        // The press-blocked swing only: a grace-blocked swing seen with a hidden pose is never borrowed here.
+        if (located && Parryable(o.front) && follow.armed && now >= follow.start && now - follow.start <= kPoseFreeFollowMs &&
+            follow_only(false)) return o;
         // A hidden/non-rigid draw pose is not blade geometry. Admit only a new held press,
         // with the same stable player/model/resource guards; never borrow grace or a handoff.
         if (!located || !Parryable(o.front) || handoff || !s.Guard(set.mode == Mode::Active)) return o;

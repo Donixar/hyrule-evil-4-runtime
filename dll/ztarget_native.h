@@ -71,13 +71,22 @@ template<class Mem> bool ReadFrame(Mem& m,uint32_t base,Frame& f){
     f=a;return true;
 }
 inline bool SameScene(const Frame& a,const Frame& b){return a.player==b.player&&a.global==b.global&&a.room==b.room&&a.costume==b.costume;}
-inline bool Adjust(Controller& c,const Input& i,const Matrix& m,const Offset& in,float desired,float tau,Offset& out){
-    Offset checked;
-    if(!c.Active())return false;   // an Idle controller is never suspended here (a press must not be lost)
-    if(!i.safe||!ValidDt(i.dt)||!std::isfinite(desired)||!Rotate(m,in,0,checked)){c.Suspend();return false;}
+// Why Adjust cannot rotate hitCheck's camera (null: it can). "matrix": the base matrix is not rigid (outside kamae
+// calcBaseMatrix tilts its up axis to the floor normal without renormalising, so on a slope from ~5.7 degrees);
+// "offsets": a non-finite camera offset; "level": the camera looks straight down. Read-only: the hit path also asks it
+// to tell when such a suspension is over (zt-flicker-01).
+inline const char* HitGeometry(const Matrix& m,const Offset& in){
+    if(!Rigid(m))return "matrix";
+    Offset checked;if(!Rotate(m,in,0,checked))return "offsets";
     const Vec diff{in.target.x-in.campos[0].x,in.target.y-in.campos[0].y,in.target.z-in.campos[0].z};
     const Vec world=World(m,diff);
-    if(!Finite(world)||world.x*world.x+world.z*world.z<1.f){c.Suspend();return false;}
+    return !Finite(world)||world.x*world.x+world.z*world.z<1.f?"level":nullptr;
+}
+inline bool Adjust(Controller& c,const Input& i,const Matrix& m,const Offset& in,float desired,float tau,Offset& out){
+    if(!c.Active())return false;   // an Idle controller is never suspended here (a press must not be lost)
+    if(!i.safe||!ValidDt(i.dt)||!std::isfinite(desired)||HitGeometry(m,in)){c.Suspend();return false;}
+    const Vec diff{in.target.x-in.campos[0].x,in.target.y-in.campos[0].y,in.target.z-in.campos[0].z};
+    const Vec world=World(m,diff);
     const float native=std::atan2(world.x,world.z);const bool release=c.phase==Phase::Release;
     const float q=c.filter.Step(i.frame,i.dt,native,release?native:desired,release,tau);
     if(release&&std::fabs(Turn(q,native))<0.00872665f){c.phase=Phase::Idle;c.filter.Reset();return false;}

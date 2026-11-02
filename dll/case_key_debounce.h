@@ -204,6 +204,9 @@ inline const char* Name(Verdict v) { return v == Verdict::Installed ? "installed
 
 #if defined(_MSC_VER) && defined(_M_IX86)
 inline void(__cdecl* g_original)() = nullptr;   // MinHook trampoline of PadRead
+// Run after each PadRead, menus included (2-nov: the TP hearts drop their units in the case, where the player frame
+// that pauses them does not run). Set by the DLL; must not throw.
+inline void(*g_after)() = nullptr;
 struct LiveMemory {
     bool Read(uint32_t at, void* out, size_t n) {
         __try { std::memcpy(out, reinterpret_cast<const void*>(static_cast<uintptr_t>(at)), n); return true; }
@@ -220,6 +223,7 @@ __declspec(noinline) inline void __cdecl Detour() {
     const DWORD error = GetLastError();
     LiveMemory m;
     Tick(m);
+    if (g_after) g_after();
     SetLastError(error);
 }
 // All pins or nothing, then `hook(target, detour, original_slot)` creates and enables the hook

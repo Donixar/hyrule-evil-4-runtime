@@ -59,6 +59,28 @@ static void Overshoot() {
     old[2] = 25;
     GeometrySources centre(r);
     Check(line::Decide(centre, c).cancel, "near-centre incoming side keeps native current-old direction");
+    // hunt-findings P2-4: a short step (< 100 units, the native short rule) near Link's centre. The bolt's own travel
+    // decides: one from the front whose step already passed his centre still blocks; one from behind never does.
+    old[0] = 0; old[2] = 30; current[0] = 0; current[2] = -40;
+    GeometrySources short_front(r);
+    Check(line::Decide(short_front, c).cancel, "short frontal step past the centre still blocks (travel, not Link - current)");
+    old[2] = -30; current[2] = 40;
+    GeometrySources short_rear(r);
+    Check(!line::Decide(short_rear, c).cancel, "short step from behind past the centre keeps native damage");
+    old[2] = 20; current[2] = 20; current[0] = 0.5f;   // no horizontal travel: from where it was, toward Link
+    GeometrySources still_front(r);
+    Check(line::Decide(still_front, c).cancel, "no travel, in front of the centre: frontal");
+    old[2] = -20; current[2] = -20;
+    GeometrySources still_rear(r);
+    Check(!line::Decide(still_rear, c).cancel, "no travel, behind the centre: rear");
+    {   // The geometry itself: travel mode vs the native short rule on the same short step.
+        const float position[3]{}, angles[3]{}, from[3] = {0, 0, 30}, to[3] = {0, 0, -40};
+        p::front_math::Result native, travel;
+        Check(p::front_math::Evaluate(&RotateFixture, to, from, position, angles, native) && native.short_direction && !native.frontal,
+              "native short rule: Link - current reads this frontal bolt as rear");
+        Check(p::front_math::Evaluate(&RotateFixture, to, from, position, angles, travel, nullptr, true) && !travel.short_direction &&
+              travel.frontal && travel.dot < 0, "travel mode: current - old, frontal");
+    }
     VirtualFree(image, 0, MEM_RELEASE);
 }
 static void Policy() {
@@ -343,6 +365,6 @@ int main(int argc, char** argv) {
     if (argc == 2) Pins(argv[1]);
     Transport();
     DisabledPins();
-    std::printf("parry line: %u checks passed\n", checks);
+    std::printf("parry line: %u checks passed%s\n", checks, argc == 2 ? " (pinned image: Shot and deflection pins checked)" : " (no image: pin checks skipped)");
     return 0;
 }

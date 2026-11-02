@@ -29,6 +29,7 @@
 #include "parry_audio.h"
 #include "parry_spark_runtime.h"
 #include "parry_general_runtime.h"
+#include "parry_pushback.h"
 #include "parry_line.h"
 #include "parry_direct_runtime.h"
 #include "ocarina_session.h"
@@ -42,6 +43,7 @@
 #include "ocarina_runtime.h"
 #include "ocarina_songs.h"
 #include "ocarina_staff.h"
+#include "hud_tp.h"
 #include "ocarina_song_effects.h"
 #include "save_anywhere.h"
 #include "combat_runtime.h"
@@ -358,6 +360,7 @@ static bool __cdecl ResolveParryLine(const link_runtime::parry::Candidate& candi
 static uint32_t g_parry_window_ms=link_runtime::defense::kParryWindowDefault;   // ParryWindowMs, read before the transport starts
 static void CombatCommitted(const link_runtime::parry::Candidate& candidate,LONG serial);
 static void CombatGeneralBlocked(uint32_t serial,uint32_t owner_id);
+static void ParryHeavyBlock(const link_runtime::parry::general::Applied& applied);   // parry-heavy-01
 static bool GuardResolve(const link_runtime::parry::Candidate& candidate);   // tier 3, shield-guard-01
 // Order (section 2.1): tier 1 first. Committed ends it; PartialFailure keeps the damage and skips
 // tier 2 for this invocation; NotCommitted falls to tier 2, which may use the same press only when
@@ -387,11 +390,14 @@ static bool __cdecl ResolveParry(const link_runtime::parry::Candidate& candidate
     }
     bool handoff=false;
     if(g_gen.settings.mode!=g::Mode::Off&&g::TierTwoRuns(tier_one,handoff)){
+        // hunt-findings P2-1: a leg-sphere sample of a Krauser kick the box route already blocked is that kick (silent).
+        if(link_runtime::parry::direct::FollowTierTwo(g_gen,candidate))return true;
         const auto applied=g::Resolve(g_gen,candidate,handoff);
         link_runtime::parry::direct::ShareTierTwo(g_gen,candidate,applied);
         if(applied.cancel&&applied.effects&&!applied.grace){   // a grace block is the same parry: sparks only
             g_parry_audio.Publish(true,GetTickCount64());
             CombatGeneralBlocked(applied.serial,applied.owner_id);   // Link's reaction only; no riposte, no stagger
+            ParryHeavyBlock(applied);   // power >= ParryHeavyPower: Link slides back (TP)
         }
         if(applied.cancel)return true;
     }
@@ -2206,13 +2212,15 @@ struct CmbLine {char text[768];};   // md_strike carries strike-time geometry an
 static CmbLine g_cmb_lines[128];
 static std::atomic<unsigned> g_cmb_write{0},g_cmb_read{0},g_cmb_dropped{0};
 // A line the configured LogLevel would not write never takes a ring slot (link_runtime_log.h).
-static void CmbPush(unsigned line_level,const char* format,va_list args){
-    if(!g_cmb.AnyOn()||!link_runtime::log::Writes(g_log_level,line_level))return;
+// The ring is also the TP HUD's (HudLog): its lines are written with only [Hud] on (PollCombat runs for either).
+static void CmbRing(unsigned line_level,const char* format,va_list args){
+    if(!link_runtime::log::Writes(g_log_level,line_level))return;
     const unsigned w=g_cmb_write.load(std::memory_order_relaxed),r=g_cmb_read.load(std::memory_order_acquire);
     if(w-r==128){g_cmb_dropped.fetch_add(1);return;}
     vsnprintf_s(g_cmb_lines[w%128].text,sizeof(g_cmb_lines[0].text),_TRUNCATE,format,args);
     g_cmb_write.store(w+1,std::memory_order_release);
 }
+static void CmbPush(unsigned line_level,const char* format,va_list args){if(g_cmb.AnyOn())CmbRing(line_level,format,args);}
 // Feature events (LogLevel 1 and 2).
 static void CmbLog(const char* format,...){va_list args;va_start(args,format);CmbPush(link_runtime::log::kNormal,format,args);va_end(args);}
 // Periodic stats and the MortalDrawObserve census/decisions (LogLevel 2 only).
@@ -2259,9 +2267,14 @@ static bool CmbStartRoutine(uint32_t routine){
 // Link's facts for the trigger and the policy. player_free: normal routine (r0 0, r1 0; with
 // g_cmb_move_start also walk/back/run/turn) and no pending damage; sword_sheathed: the knife slot is hidden (cPlBody m_pKnife flags bit 8 clear).
 struct CmbPlayer {uint32_t player=0,routine=0;mtg::Vec3 pos;mdr::PlayerFacts facts;bool damaged=false;};
+// STA_INTO_SHOP (status2 0x40000) can stay latched after the Merchant (r11c, r31d 31-oct): with it every combat skill
+// read "no_gameplay" (shield guard, sword actions). CombatShopFlagFix=1 (absent = 1) reads past that one bit, as
+// LowHealthShopFlagFix does; a real shop or case is still gated by SSCRN/SUSPEND/STOP and the other shared bits.
+static bool g_cmb_shop_flag_fix=true;
 static bool CmbReadPlayer(CmbPlayer& out){
     out=CmbPlayer{};LocalMemory memory;link_runtime::HealthState health;
-    if(!link_runtime::ReadHealth(memory,g_cmb_player_slot,g_cmb_global_slot,health)||!link_runtime::IsPointer(health.player))return false;
+    if(!link_runtime::low_health::ReadHealth(memory,g_cmb_player_slot,g_cmb_global_slot,g_cmb_shop_flag_fix,health)||
+        !link_runtime::IsPointer(health.player))return false;
     out.player=health.player;CmbMem m;float pos[3]{};
     if(!m.Read(out.player+0x94,pos,12))return false;
     out.pos={pos[0],pos[1],pos[2]};out.routine=CmbGet<uint32_t>(out.player+0xFC);
@@ -2288,13 +2301,13 @@ static mtg::Config CmbTargetConfig(){
 // ---- shared native-hit adapter -----------------------------------------------------------------
 static mdmg::Adapter g_cmb_adapter;
 static bool g_cmb_adapter_on=false;   // set before the GetWepDmVal detour is enabled; then constant
-enum class CmbCaller {None,Mortal,Riposte,Sword};
+enum class CmbCaller {None,Mortal,Riposte,Sword,Zelda};   // Zelda: the partner's ray (zelda_companion_runtime.h)
 static CmbCaller g_cmb_caller=CmbCaller::None;   // who is inside NativeHit (decoder by call site)
 static bool g_cmb_mortal_same=false;             // target::Revalidate of this frame (Mortal Draw)
 static uint64_t g_cmb_mortal_identity=0;
 static bool CmbFacts(void*,const mdmg::HitTarget& t,mdmg::Facts& out){
     CmbMem m;bool same=false;
-    if(g_cmb_caller==CmbCaller::Mortal||g_cmb_caller==CmbCaller::Sword)same=g_cmb_mortal_same&&t.identity==g_cmb_mortal_identity;
+    if(g_cmb_caller==CmbCaller::Mortal||g_cmb_caller==CmbCaller::Sword||g_cmb_caller==CmbCaller::Zelda)same=g_cmb_mortal_same&&t.identity==g_cmb_mortal_identity;
     else if(g_cmb_caller==CmbCaller::Riposte&&(t.identity>>56)==prp::kIdentityTag){
         // Riposte identity (review I2 minor 4: decoded because the riposte is the caller, not by tag):
         // the parried owner's actor, id and type, re-read now.
@@ -2516,6 +2529,63 @@ static void GuardPlace(sg::Placement want,unsigned costume){
     }
     g_sg_shown=now;
 }
+// ---- secondary slot guard (slot-guard-01, secondary_slot.h) ----------------------------------------
+// Game thread, from the MotionMove detour: the stance check our layers' hand-back uses, the watchdog that releases a
+// stale stance or an orphaned work of ours from player+2A8, and the read-only arm probe (31-oct: no arms after a parry
+// against Krauser). Only the watchdog writes: a compare-exchange of 2A8 to 0.
+namespace ssl=link_runtime::secondary_slot;
+struct SlotMemory {
+    bool Read32(uint32_t a,uint32_t& v){CmbMem m;return m.Read(a,&v,4);}
+    bool Read(uint32_t a,void* out,size_t n){CmbMem m;return m.Read(a,out,n);}
+};
+static ssl::Watchdog g_slot_dog;
+static uint32_t g_slot_foreign=0;   // last foreign 2A8 value logged (once per value)
+static uint32_t g_arm_frame=0,g_arm_logged=0;static unsigned g_arm_part=0;
+static ssl::arm::Health g_arm_last=ssl::arm::Health::Ok;
+static ssl::Works SlotWorks(){return {reinterpret_cast<uint32_t>(g_rx_work),reinterpret_cast<uint32_t>(g_sg_work)};}
+static const char* SlotKind(uint32_t value,uint32_t player){return ssl::Name(ssl::Classify(value,player,g_cmb_base,SlotWorks()));}
+static ssl::StanceState SlotStance(uint32_t player){SlotMemory m;return ssl::Check(ssl::ReadStance(m,g_cmb_base,player),player);}
+static bool SlotStanceLive(uint32_t player){return SlotStance(player)==ssl::StanceState::Live;}
+static bool BadArm(ssl::arm::Health h){return h!=ssl::arm::Health::Ok&&h!=ssl::arm::Health::Unread;}
+static void SlotWatch(uint32_t frame,const CmbPlayer& p,bool player,void* model){
+    if(!player||!model)return;
+    const uint32_t who=reinterpret_cast<uint32_t>(model);
+    const uint32_t slot=CmbGet<uint32_t>(who+ssl::kSlot);
+    ssl::Watch w;w.player=who;w.slot=slot;w.image_base=g_cmb_base;w.frame=frame;w.works=SlotWorks();
+    w.reaction_active=g_rx&&g_rx->Active();w.guard_active=g_sg_layer&&g_sg_layer->Active();
+    SlotMemory mem;ssl::Stance stance{};
+    if(ssl::Classify(slot,who,g_cmb_base,w.works)==ssl::Kind::Stance){stance=ssl::ReadStance(mem,g_cmb_base,who);w.stance=ssl::Check(stance,who);}
+    ssl::Verdict verdict=ssl::Verdict::Owned;
+    if(g_slot_dog.Release(w,verdict)){
+        LocalMemory lm;const bool won=lm.Compare32(who+ssl::kSlot,slot,0);
+        if(won)g_slot_dog.Released(verdict);
+        CmbLog("secondary_slot release why=%s slot=0x%08X won=%u frame=%u routine=0x%08X stance=%s mot3_model=0x%08X mot0=0x%08X clip=0x%08X "
+            "mot1=0x%08X mot2=0x%08X primary=0x%08X weight=%.3f reaction=%u guard=%u releases=%u",
+            ssl::Name(verdict),slot,won?1U:0U,frame,p.routine,ssl::Name(w.stance),stance.model,stance.mot0,stance.clip,stance.mot1,stance.mot2,
+            CmbGet<uint32_t>(who+ssl::kPrimaryMotion),CmbGet<float>(slot+ssl::kWeight),w.reaction_active?1U:0U,w.guard_active?1U:0U,
+            g_slot_dog.stats().releases);
+    }else if(verdict==ssl::Verdict::Foreign&&slot!=g_slot_foreign){
+        g_slot_foreign=slot;
+        CmbLog("secondary_slot foreign slot=0x%08X weight=%.3f frame=%u routine=0x%08X primary=0x%08X (not ours: left alone)",
+            slot,CmbGet<float>(slot+ssl::kWeight),frame,p.routine,CmbGet<uint32_t>(who+ssl::kPrimaryMotion));
+    }
+    // Arm probe (read-only), every 8 frames in gameplay: a line when an arm bone goes bad, changes, recovers, and every
+    // ~3000 frames while it stays bad, with what 2A8 holds.
+    if(!p.facts.gameplay||(frame-g_arm_frame<8&&frame>=g_arm_frame))return;
+    g_arm_frame=frame;
+    ssl::arm::Part parts[ssl::arm::kLast+1]{};ssl::arm::Report r;
+    if(ssl::arm::ReadParts(mem,who,parts))r=ssl::arm::Judge(parts);
+    if(r.health==ssl::arm::Health::Unread)return;
+    const bool bad=BadArm(r.health),was=BadArm(g_arm_last);
+    const bool log=(bad&&(!was||r.health!=g_arm_last||r.part!=g_arm_part))||(!bad&&was)||(bad&&frame-g_arm_logged>=3000);
+    g_arm_last=r.health;g_arm_part=bad?r.part:0;
+    if(!log)return;
+    g_arm_logged=frame;
+    const uint32_t now=CmbGet<uint32_t>(who+ssl::kSlot);
+    CmbLog("arm_probe health=%s part=%u value=%.3f flags=0x%08X scale=%.3f,%.3f,%.3f slot=0x%08X (%s) weight=%.3f primary=0x%08X routine=0x%08X "
+        "frame=%u releases=%u",ssl::arm::Name(r.health),r.part,r.value,r.flags,r.scale[0],r.scale[1],r.scale[2],now,SlotKind(now,who),
+        now?CmbGet<float>(now+ssl::kWeight):0.f,CmbGet<uint32_t>(who+ssl::kPrimaryMotion),p.routine,frame,g_slot_dog.stats().releases);
+}
 static bool SwordShieldInHand();   // spin_attack_runtime.h (shield-guard-02: Shield Bash / Back Slice hold the shield)
 static void GuardTick(uint32_t frame,const CmbPlayer& p,bool player,void* model){
     if(!g_sg_on||!g_sg_layer)return;
@@ -2539,7 +2609,7 @@ static void GuardTick(uint32_t frame,const CmbPlayer& p,bool player,void* model)
     const bool scene=room!=g_sg_room||p.player!=g_sg_player;
     g_sg_wanted=g_sg_supported&&lock&&!knife&&!broken&&!p.damaged;
     sg::LayerWorld w;w.player=reinterpret_cast<uint32_t>(model);w.frame=frame;w.step=static_cast<float>(step);w.image_base=g_cmb_base;
-    w.wanted=g_sg_wanted;
+    w.wanted=g_sg_wanted;w.stance_live=player&&SlotStanceLive(w.player);   // slot-guard-01: the exit's stance check
     // sword-hand-01: the clips drive the left hand as the native arm IK target; only over a primary with that chain.
     CmbMem arm_mem;const int arm_ik=player?sg::PrimaryArmIk(arm_mem,reinterpret_cast<uint32_t>(model)):-1;
     if(player&&g_sg_wanted&&arm_ik!=g_sg_arm_ik_logged){
@@ -2555,7 +2625,14 @@ static void GuardTick(uint32_t frame,const CmbPlayer& p,bool player,void* model)
     GuardPort port;
     w.lent=g_rx&&g_rx->Active()&&port.Secondary(w.player)!=g_sg_layer->Work();
     const sg::Phase before=g_sg_layer->phase();const sg::Clip clip_before=g_sg_layer->clip();
+    const unsigned gives_before=g_sg_layer->stats().completed+g_sg_layer->stats().cancelled;
     g_sg_layer->Tick(w,port);g_sg_last_tick=GetTickCount64();
+    if(g_sg_layer->stats().completed+g_sg_layer->stats().cancelled!=gives_before){   // slot-guard-01: what the exit gave 2A8 back to
+        const auto& e=g_sg_layer->last_exit();
+        CmbLog("shield_guard layer exit previous=0x%08X (%s) restored=0x%08X (%s) wrote=%u cleared=%u stance=%s frame=%u",
+            e.previous,SlotKind(e.previous,w.player),e.restored,SlotKind(e.restored,w.player),e.wrote?1U:0U,e.cleared?1U:0U,
+            ssl::Name(SlotStance(w.player)),frame);
+    }
     if(before!=g_sg_layer->phase()||clip_before!=g_sg_layer->clip()){
         const auto& s=g_sg_layer->stats();
         CmbLog("shield_guard layer %s->%s clip=%s variant=%s frame=%u installs=%u lost=%u refused=%u failed=%u lent=%u contested=%u",
@@ -2988,16 +3065,19 @@ static void CombatLifecycle(mortal::dispatch::Event event,uint64_t token){
 }
 // ---- per-frame pump and the MotionMove / neck detours ------------------------------------------
 static uint32_t g_cmb_pump_frame=0xFFFFFFFF,g_cmb_stats_frame=0;
-static char g_cmb_stats_last[480]{};
+static char g_cmb_stats_last[720]{};
 static void CmbStats(uint32_t frame){
     if(frame-g_cmb_stats_frame<300)return;
-    g_cmb_stats_frame=frame;char text[480]{};int k=0;
+    g_cmb_stats_frame=frame;char text[720]{};int k=0;
     if(g_cmb_md){const auto& s=g_cmb_md->stats();
         k+=_snprintf_s(text+k,sizeof(text)-k,_TRUNCATE,"md presses=%u requests=%u expired=%u refused=%u starts=%u start_failed=%u strikes=%u lethal=%u ordinary=%u published=%u applied=%u unconfirmed=%u; ",
             s.presses,s.requests,s.expired,s.refused,s.starts,s.start_failed,s.strikes,s.lethal,s.ordinary,s.published,s.applied,s.unconfirmed);}
     if(g_rx&&k>=0){const auto& s=g_rx->stats();
-        k+=_snprintf_s(text+k,sizeof(text)-k,_TRUNCATE,"reaction starts=%u completed=%u cancelled=%u lost_owner=%u dropped=%u refused=%u install_failed=%u overlap=%u foreign_weight=%u timeouts=%u neck_suppressed=%u repeated_frame=%u owner_id=0x%X; ",
-            s.starts,s.completed,s.cancelled,s.lost_owner,s.dropped,s.refused,s.install_failed,s.ignored_overlap,s.foreign_weight,s.timeouts,s.neck_suppressed,s.repeated_frame,s.owner_id);}
+        k+=_snprintf_s(text+k,sizeof(text)-k,_TRUNCATE,"reaction starts=%u completed=%u cancelled=%u lost_owner=%u dropped=%u refused=%u install_failed=%u overlap=%u foreign_weight=%u timeouts=%u neck_suppressed=%u repeated_frame=%u cleared=%u owner_id=0x%X; ",
+            s.starts,s.completed,s.cancelled,s.lost_owner,s.dropped,s.refused,s.install_failed,s.ignored_overlap,s.foreign_weight,s.timeouts,s.neck_suppressed,s.repeated_frame,s.cleared,s.owner_id);}
+    if(k>=0){const auto& s=g_slot_dog.stats();   // slot-guard-01
+        if(s.releases||s.foreign)k+=_snprintf_s(text+k,sizeof(text)-k,_TRUNCATE,"slot releases=%u stale_stance=%u orphan_reaction=%u orphan_guard=%u foreign=%u; ",
+            s.releases,s.stale_stance,s.orphan_reaction,s.orphan_guard,s.foreign);}
     if(g_rip&&k>=0){const auto& s=g_rip->stats();
         k+=_snprintf_s(text+k,sizeof(text)-k,_TRUNCATE,"riposte armed=%u published=%u applied=%u unconfirmed=%u expired=%u busy=%u no_hitpart=%u no_record=%u identity=%u dead=%u excluded=%u rejected=%u lost=%u owner_id=0x%X last_status=%s last_outcome=%s verdict=%s expired_flags=0x%X/0x%X",
             s.armed,s.published,s.applied,s.unconfirmed,s.expired,s.busy,s.no_hitpart,s.no_record,s.identity,s.dead,s.excluded,s.rejected,s.lost,
@@ -3021,7 +3101,7 @@ static void CmbPlayerMove(void* model){
     if(frame!=g_cmb_pump_frame){g_cmb_pump_frame=frame;CmbPump(frame,p,player);}
     GuardTick(frame,p,player,model);   // shield-guard-01: before the reaction, which may borrow 2A8 from it
     SwordHandTick(p,player);           // sword-hand-01: hand the gun back the frame a sword action stops being valid
-    if(!g_rx)return;
+    if(!g_rx){SlotWatch(frame,p,player,model);return;}
     // Contract 1 (parry_reaction.h): the weight is written right before the original MotionMove.
     const uint32_t g=CmbGet<uint32_t>(g_cmb_global_slot);
     const uint8_t weapon=link_runtime::IsPointer(g)?CmbGet<uint8_t>(g+0x4FC0):0;
@@ -3032,9 +3112,23 @@ static void CmbPlayerMove(void* model){
     w.scene=room!=g_rx_room;w.weapon_switch=weapon!=g_rx_weapon;w.image_base=g_cmb_base;
     w.mortal_draw=mortal::dispatch_hooks::runtime.active;w.ocarina=g_oca_session.state()!=oca::State::Idle;
     w.guest=g_sg_layer&&g_sg_layer->Active()?g_sg_layer->Work():0;
+    w.stance_live=player&&SlotStanceLive(w.player);   // slot-guard-01: the exit gives the stance back only while it is live
     const bool was=g_rx->Active();CmbReactionPort port;g_rx->Tick(w,port);
     g_rx_last_tick=GetTickCount64();
-    if(was!=g_rx->Active())CmbLog("parry reaction %s frame=%u owner_id=0x%X",g_rx->Active()?"start":"end",frame,g_rx->stats().owner_id);
+    if(was!=g_rx->Active()){
+        if(g_rx->Active())
+            CmbLog("parry reaction start frame=%u owner_id=0x%X previous=0x%08X (%s) primary=0x%08X routine=0x%08X",frame,g_rx->stats().owner_id,
+                g_rx->previous(),SlotKind(g_rx->previous(),w.player),CmbGet<uint32_t>(w.player+ssl::kPrimaryMotion),p.routine);
+        else{
+            // slot-guard-01: how it ended and what 2A8 went back to (a stale stance or guest is given back as 0).
+            const auto& e=g_rx->last_exit();const uint32_t now=CmbGet<uint32_t>(w.player+ssl::kSlot);
+            CmbLog("parry reaction end frame=%u owner_id=0x%X exit=%s previous=0x%08X (%s) restored=0x%08X (%s) wrote=%u cleared=%u stance=%s "
+                "slot=0x%08X (%s) primary=0x%08X routine=0x%08X",frame,g_rx->stats().owner_id,prx::ExitName(e.exit),e.previous,
+                SlotKind(e.previous,w.player),e.restored,SlotKind(e.restored,w.player),e.wrote?1U:0U,e.cleared?1U:0U,ssl::Name(SlotStance(w.player)),
+                now,SlotKind(now,w.player),CmbGet<uint32_t>(w.player+ssl::kPrimaryMotion),p.routine);
+        }
+    }
+    SlotWatch(frame,p,player,model);   // slot-guard-01: after both layers, right before the original MotionMove
 }
 // Magnet gate: this MotionMove is the dispatch's own api.move (0x25CFD0 -> thunk 0x6BF9 -> 0x262B90)
 // inside Runtime::Handle, for the lease our controller and the magnet hold. Other models, other
@@ -3144,6 +3238,67 @@ static int CmbBackMove(void* model){
     SetLastError(error);
     return result;
 }
+// Backflip travel gate (backflip.h), as CmbBackOwns: the dispatch's own api.move of our backflip lease.
+static bool CmbFlipOwns(void* model){
+    const auto& a=g_sword_action;
+    return g_flip_move.Active()&&a.lease&&a.request.kind==SwordKind::Flip&&g_flip_move.lease()==a.lease&&
+        ending::leap::MoveOwner(mortal::dispatch_hooks::runtime,model,a.lease);
+}
+// Around the original MotionMove, as CmbBackMove: Link before/after, the locked Ganado (yaw only), then X/Z and the yaw
+// of this tick's travel point, written before cPlayer::move runs the native collision on it.
+static int CmbFlipMove(void* model){
+    namespace lp=ending::leap;
+    const uint32_t player=reinterpret_cast<uint32_t>(model);
+    CmbMem m;lp::Body before,after;
+    const bool have_before=lp::ReadPos(m,player,before);
+    const int result=g_cmb_move_original(model);
+    const DWORD error=GetLastError();
+    bfl::Frame f;f.frame=CmbFrame();f.time=GameNow(g_cmb_global_slot);f.step=static_cast<float>(GameStep(g_cmb_global_slot));
+    const bool have_after=lp::ReadPos(m,player,after);
+    f.before=have_before&&have_after?bfl::Vec{before.x,before.y,before.z}:bfl::Vec{NAN,NAN,NAN};
+    f.after=have_after?bfl::Vec{after.x,after.y,after.z}:bfl::Vec{NAN,NAN,NAN};
+    f.collision=lp::ReadCollision(m,player);
+    const auto& t=g_sword_action.request.target;mtg::Raw raw;
+    f.target_ok=t.pointer&&mtg::ReadRaw(m,t.pointer,raw)==mtg::Reject::None&&(raw.be_flag&0x201)==1&&raw.id==t.id&&raw.type==t.type&&raw.hp>0;
+    if(f.target_ok)f.target={raw.pos.x,raw.pos.y,raw.pos.z};
+    const bfl::Output o=g_flip_move.Step(f);
+    link_runtime::ztarget::runtime::Memory w;
+    if(o.write&&!bks::Apply(w,player,o))g_flip_move.Abort(bfl::Stop::WriteFailed);
+    if(!g_flip_move.Active()){char line[sizeof(CmbLine::text)];if(bfl::FormatEnd(line,sizeof(line),g_flip_move.summary())>0)CmbLog("%s",line);}
+    SetLastError(error);
+    return result;
+}
+// parry-heavy-01 (Donald 31-oct): a blocked hit with power >= ParryHeavyPower still does nothing to Link, but he slides
+// back TP-style, away from the hit point (parry_pushback.h). Game thread: ParryHeavyBlock runs in the damage resolver,
+// CmbPushMove around the player's MotionMove when no sword action owns the move; the X/Z written there go through the
+// native collision of cPlayer::move like the backflip's.
+namespace ppb=link_runtime::parry::pushback;
+static ppb::Config g_push_cfg;
+static ppb::Slide g_push;
+static void ParryHeavyBlock(const link_runtime::parry::general::Applied& applied){
+    if(!ppb::Heavy(g_push_cfg,applied.power))return;
+    const uint32_t player=CmbGet<uint32_t>(g_cmb_player_slot);
+    if(!link_runtime::IsPointer(player))return;
+    float ux=0,uz=0;
+    if(!ppb::Direction(applied.hit,applied.player,CmbGet<float>(player+0xA4),ux,uz)||!g_push.Start(g_push_cfg,player,ux,uz))return;
+    CmbLog("parry heavy pushback serial=0x%08X power=%u distance=%.0f frames=%.0f dir=%.2f,%.2f",applied.serial,applied.power,
+        static_cast<double>(g_push_cfg.distance),static_cast<double>(g_push_cfg.frames),static_cast<double>(ux),static_cast<double>(uz));
+}
+static int CmbPushMove(void* model){
+    const uint32_t player=reinterpret_cast<uint32_t>(model);
+    const int result=g_cmb_move_original(model);
+    const DWORD error=GetLastError();
+    const uint32_t routine=CmbGet<uint32_t>(player+0xFC);
+    if((routine&0xFF)!=0)g_push.Abort(ppb::Stop::Damaged);   // damage / death routine: the native reaction moves Link
+    float dx=0,dz=0;
+    if(g_push.Step(player,static_cast<float>(GameStep(g_cmb_global_slot)),dx,dz)){
+        link_runtime::ztarget::runtime::Memory w;
+        if(!ppb::Apply(w,player,dx,dz))g_push.Abort(ppb::Stop::Write);
+    }
+    if(!g_push.Active())CmbLog("parry heavy pushback end stop=%s moved=%.0f",ppb::StopName(g_push.stop()),static_cast<double>(g_push.moved()));
+    SetLastError(error);
+    return result;
+}
 static int __cdecl CmbMoveDetour(void* model){
     const bool player=model&&reinterpret_cast<uint32_t>(model)==CmbGet<uint32_t>(g_cmb_player_slot);
     if(player){
@@ -3152,7 +3307,8 @@ static int __cdecl CmbMoveDetour(void* model){
     if(!player)return g_cmb_move_original(model);
     // Magnet first, then the leap: exclusive by lease kind.
     if(!CmbMagnetOwns(model))return CmbLeapOwns(model)?CmbLeapMove(model):CmbBackOwns(model)?CmbBackMove(model):
-        CmbLeapSettleOwns(model)?CmbLeapMove(model):g_cmb_move_original(model);
+        CmbFlipOwns(model)?CmbFlipMove(model):CmbLeapSettleOwns(model)?CmbLeapMove(model):
+        g_push.Active()?CmbPushMove(model):g_cmb_move_original(model);
     CmbMem m;mmag::Vec2 before;float yaw_before=0.f;
     const bool have_before=mmag::ReadPlayer(m,reinterpret_cast<uint32_t>(model),before,yaw_before);
     const int result=g_cmb_move_original(model);
@@ -3391,6 +3547,117 @@ static void UserIniPoll(){
     UserIniReload();
 }
 // --- end user-ini-01
+// ---- TP HUD (hud_tp.h, docs/hud-tp-2026-10-30.md) -------------------------------------------------
+// [Hud] TpHearts / TpShieldMeter draw TP's hearts and the shield meter with native IdSys units (the staff's path,
+// class 0x3D, tex 0xEE, owner 0xCA2, Bin32/link_hud_tp.eff); HideNativeLife hides Leon's ring groups while the hearts
+// are shown. Game thread only: HudFrame runs once per native logic frame (global+0x530C) from the player's core
+// (dispatch_hooks::player_frame: damage and death frames included) and from CombinedDecide. Worker: StartHud. Lines go
+// through the combat ring (HudLog: written with combat off too). Every key 0: nothing is read, loaded or written.
+namespace htp=link_runtime::hud_tp;
+static htp::Config g_hud_cfg;
+static std::atomic<bool> g_hud_ready{false};
+static bool g_hud_on=false;   // worker: StartHud succeeded (poll / exit checks)
+static htp::Hud g_hud;
+static uint32_t g_hud_base=0,g_hud_player_slot=0,g_hud_global_slot=0,g_hud_frame=0xFFFFFFFFu;
+static unsigned g_hud_miss=0;
+static htp::Inputs g_hud_in;
+// scripts/hud_tp.py build: 10 frames whose TPL points at 07000000 entries 391..400 (after the staff 363..368 and the
+// chromatic frames 369..390). A different pack count gives a different block: rebuild both (hud_tp.py freeze checks).
+static const OcaFile kHudBlock={L"link_hud_tp.eff",864,"6b4d30d538452fc8ad60d3925d70edefef28f3bfcb765f2b1a8166988350c8d6"};
+struct HudNative {   // the staff's IdSys / IdTex calls (ocarina_staff.h layout) with our class, tex id and owner
+    uint32_t base=g_hud_base;
+    bool Read(uint32_t a,void* out,size_t n){return a&&OcaCopy(a,static_cast<unsigned char*>(out),n);}
+    bool Write(uint32_t a,const void* in,size_t n){if(!a)return false;__try{std::memcpy(reinterpret_cast<void*>(a),in,n);return true;}__except(EXCEPTION_EXECUTE_HANDLER){return false;}}
+    bool TexLoad(void* block){__try{return reinterpret_cast<int(__cdecl*)(void*,int)>(base+htp::layout::tex_load_thunk_rva)(block,int(htp::layout::tex_owner))!=0;}__except(EXCEPTION_EXECUTE_HANDLER){return false;}}
+    void TexRelease(){__try{reinterpret_cast<void(__cdecl*)(int)>(base+htp::layout::tex_release_thunk_rva)(int(htp::layout::tex_owner));}__except(EXCEPTION_EXECUTE_HANDLER){}}
+    void Set(const void* table){__try{reinterpret_cast<void(__thiscall*)(void*,const void*,uint8_t,int,uint8_t,uint8_t,uint32_t)>(base+htp::layout::set_thunk_rva)(
+        reinterpret_cast<void*>(base+htp::layout::idsys_rva),table,0xFF,htp::layout::id_class,htp::layout::ot_type,htp::layout::ot_no,0);}__except(EXCEPTION_EXECUTE_HANDLER){}}
+    void Kill(){__try{reinterpret_cast<void(__thiscall*)(void*,uint8_t,int)>(base+htp::layout::kill_thunk_rva)(reinterpret_cast<void*>(base+htp::layout::idsys_rva),0xFF,htp::layout::id_class);}__except(EXCEPTION_EXECUTE_HANDLER){}}
+    uint32_t UnitPtr(uint8_t mark){__try{return reinterpret_cast<uint32_t(__thiscall*)(void*,uint8_t,int)>(base+htp::layout::unit_ptr_thunk_rva)(reinterpret_cast<void*>(base+htp::layout::idsys_rva),mark,htp::layout::id_class);}__except(EXCEPTION_EXECUTE_HANDLER){return 0;}}
+};
+static htp::Painter<HudNative> g_hud_painter;
+static htp::RingHide<HudNative> g_hud_ring;
+static htp::PaintWhy g_hud_why=htp::PaintWhy::Idle;
+static void HudLog(const char* format,...){va_list args;va_start(args,format);CmbRing(link_runtime::log::kNormal,format,args);va_end(args);}
+// hud-pause-01 (31-oct, Donald's r31c crash, bio4+0x55B729 on taking the second crest, gone with the HUD off): outside
+// play (item get, case, menus, events, death; the in_play gates of link_runtime_health.h) the painter drops its units and
+// releases its HD texture, so the native screens get that memory back, and re-arms when play resumes. Leon's ring stays
+// hidden meanwhile (the hearts come back) instead of flashing on.
+static bool g_hud_play=true;
+static void HudFrame(){
+    if(!g_hud_ready.load(std::memory_order_acquire))return;
+    LocalMemory m;uint32_t g=0,frame=0;
+    if(!m.Read32(g_hud_global_slot,g)||!link_runtime::IsPointer(g)||!m.Read32(g+0x530C,frame)||frame==g_hud_frame)return;
+    g_hud_frame=frame;
+    link_runtime::HealthState health;
+    if(link_runtime::low_health::ReadHealth(m,g_hud_player_slot,g_hud_global_slot,g_cmb_shop_flag_fix,health)){   // past a latched STA_INTO_SHOP
+        g_hud_miss=0;g_hud_in.leon=health.character==0;g_hud_in.hp=health.hp;g_hud_in.max_hp=health.max_hp;
+        g_hud_play=health.in_play;
+    }else if(++g_hud_miss>=30)g_hud_in.leon=false;   // a transient unreadable frame keeps the last view (no re-arm flicker)
+    // The meter follows shield_guard's own state (GuardTick, MotionMove): drawn only with a shield costume and ShieldGuard ready.
+    htp::MeterState& mt=g_hud_in.meter;
+    mt.on=g_sg_on&&g_sg_supported;mt.left=g_sg_dur.Left();mt.max=g_sg_dur.Max();mt.broken=g_sg_dur.Broken();
+    mt.remaining=g_sg_dur.Remaining(g_sg_clock.Now());mt.regen=g_sg_dur.RegenFrames();
+    g_hud.Update(g_hud_in,GameStep(g_hud_global_slot));
+    HudNative n;
+    uint32_t room=0xFFFFFFFFu;   // the room (TrailRoom's u16 at +0x4FAC): a new one retries a failed paint
+    if(m.Read32(g+0x4FAC,room))room&=0xFFFFu;
+    g_hud_painter.Scene(room);
+    const htp::PaintWhy why=g_hud_painter.Tick(n,g_hud,g_hud_play);
+    // Leon's ring hides only while our hearts are (being) drawn; any failure or the Zelda segment puts it back.
+    const bool failed=why==htp::PaintWhy::NoBlock||why==htp::PaintWhy::TexTaken||why==htp::PaintWhy::TexFailed||
+        why==htp::PaintWhy::ClassTaken||why==htp::PaintWhy::SetFailed||(why==htp::PaintWhy::Idle&&!g_hud_painter.Live()&&g_hud_play);
+    const bool hide=g_hud_cfg.hide_native&&g_hud.HeartsShown()&&!failed;
+    const int ring=g_hud_ring.Apply(n,hide,g_hud_cfg.hide_disc);
+    if(why!=g_hud_why&&why!=htp::PaintWhy::Shown){
+        const auto& geo=g_hud_painter.geometry();
+        HudLog("hud_tp paint=%s units=%d hearts=%d quarters=%d hp=%d/%d meter=%u %u/%u broken=%u y0=%.1f crop=%.3f screen=%u",ostf::PaintWhyName(why),
+            g_hud_painter.units(),g_hud.hearts(),g_hud.quarters(),g_hud_in.hp,g_hud_in.max_hp,g_hud.MeterShown()?1U:0U,mt.left,mt.max,mt.broken?1U:0U,
+            static_cast<double>(geo.y0),static_cast<double>(g_hud_painter.post_y()),g_hud_painter.from_screen()?1U:0U);
+    }
+    if(ring)HudLog("hud_tp native_ring %s units=%d disc=%u",hide?"hidden":"restored",ring,g_hud_cfg.hide_disc?1U:0U);
+    g_hud_why=why;
+}
+// 2-nov: the player frame does not run while the case or a menu is up, so HudFrame never saw in_play go false there
+// and the hearts stayed drawn over the case (live, r100). After each PadRead (menus included) a frame outside play
+// drops the units and the texture as HudFrame's pause would; play re-arms them through HudFrame as before.
+static void HudMenuFrame(){
+    if(!g_hud_ready.load(std::memory_order_acquire)||!g_hud_painter.Live())return;
+    __try{
+        LocalMemory m;link_runtime::HealthState health;
+        if(!link_runtime::low_health::ReadHealth(m,g_hud_player_slot,g_hud_global_slot,g_cmb_shop_flag_fix,health)||health.in_play)return;
+        HudNative n;
+        const htp::PaintWhy why=g_hud_painter.Tick(n,g_hud,false);
+        g_hud_play=false;
+        if(why!=g_hud_why)HudLog("hud_tp paint=%s units=%d (outside play, from PadRead)",ostf::PaintWhyName(why),g_hud_painter.units());
+        g_hud_why=why;
+    }__except(EXCEPTION_EXECUTE_HANDLER){}
+}
+// dispatch_hooks::player_frame: once the player's core has run, Normal, damage and death frames alike. Each part is
+// inert until its own startup succeeded (g_hud_ready; zlr g_on and the companion's g_comp_on) and runs once per native
+// frame however often it is called (CombinedDecide runs both too). Published only when [Hud] or the companion is asked for.
+static void __cdecl PlayerFrame(void*){
+    HudFrame();
+    zlr::CompanionTick();   // the partner's cast and ray keep going while Link is hit (review 30-oct)
+}
+// Worker, after StartCombat (the meter reads ShieldGuard). player_frame was published before Observe; HudFrame stays
+// inert until g_hud_ready.
+static void StartHud(unsigned char* base,uint32_t player_slot,uint32_t global_slot,bool dispatch_up,const wchar_t* directory){
+    if(!g_hud_cfg.Any()){Log("Hud TpHearts=0 TpShieldMeter=0; no HUD block, units or ring writes");return;}
+    if(!dispatch_up||!player_slot||!global_slot||!directory){Log("Hud disabled: player dispatch not running or player/global slot missing");return;}
+    g_hud_base=reinterpret_cast<uint32_t>(base);g_hud_player_slot=player_slot;g_hud_global_slot=global_slot;
+    if(!PinsAt(g_hud_base,htp::kPins)){Log("Hud disabled: IdSys native pins (base 0x%X)",g_hud_base);return;}
+    unsigned char* block=OcaResident(directory,kHudBlock);
+    if(!block){Log("Hud disabled: link_hud_tp.eff missing or changed");return;}
+    g_hud_painter.SetBlock(block);g_hud.Configure(g_hud_cfg);
+    g_hud_on=true;g_hud_ready.store(true,std::memory_order_release);
+    link_runtime::case_key_debounce::g_after=&HudMenuFrame;   // inert without CaseKeyDebounce (no PadRead hook)
+    Log("Hud ready: hearts=%u meter=%u hide_native=%u disc=%u heart_life=%u class=0x%02X tex=0x%02X owner=0x%X core_frame=%u shield_guard=%u",
+        g_hud_cfg.hearts?1U:0U,g_hud_cfg.meter?1U:0U,g_hud_cfg.hide_native?1U:0U,g_hud_cfg.hide_disc?1U:0U,g_hud_cfg.heart_life,
+        htp::layout::id_class,htp::layout::tex_id,htp::layout::tex_owner,mortal::dispatch_hooks::player_frame?1U:0U,g_sg_on?1U:0U);
+    if(g_hud_cfg.meter&&!g_sg_on)Log("Hud shield meter idle: ShieldGuard is not ready (the meter draws only with it)");
+    if(g_hud_cfg.hide_native&&!g_hud_cfg.hearts)Log("Hud HideNativeLife ignored: TpHearts=0 (Leon's ring stays)");
+}
 static void __cdecl CombinedDecide(mortal::dispatch::Runtime& run,void* player){
     UserIniApply();   // user-ini-01: a new cosmetic snapshot from the worker, before this dispatch's readers (the arbiter and the lifecycle may read the previous one for one frame: same thread, cosmetic)
     zlr::Frame();   // Zelda's light ray: shares the freshly applied particle switch and gain
@@ -3405,6 +3672,7 @@ static void __cdecl CombinedDecide(mortal::dispatch::Runtime& run,void* player){
     ChargeFrame();     // charge-glow-01: no-op unless SwordCharge is on and a charge shows or fades
     ParticlesFrame();  // sword-particles-01: no-op unless SwordParticles is on and a move or a particle is live
     link_runtime::ztarget::runtime::ArrowFrame();   // ztarget-3d-01: no-op unless Reticle3D=1 is live
+    HudFrame();        // hud-tp-01: no-op unless [Hud] is on; once per logic frame (the core may have run it already)
     if(g_oca_save_request)OcaOpenSave();   // last: nothing of this frame runs after the menu closes
 }
 // Worker-thread setup before any hook is enabled: resident files, audio and native pins.
@@ -3776,7 +4044,11 @@ using CasePzlInit=void*(__fastcall*)(void*,void*,int);      // thiscall, one int
 static CaseTblInit g_case_tbl=nullptr;
 static CasePzlInit g_case_pzl=nullptr;
 static unsigned char* g_case_base=nullptr;
-static volatile LONG g_case_models=-1,g_case_turned=0;
+static volatile LONG g_case_models=-1,g_case_turned=0,g_case_mixed=0;
+using CaseModelSet=void(__cdecl*)(void*);
+using CaseSetDir=void(__fastcall*)(void*,void*,int);       // thiscall (piece, s8 turn), ret 4
+static CaseModelSet g_case_modelset=nullptr;
+static CaseSetDir g_case_setdir=nullptr;
 static void __cdecl CaseTblInitDetour(void* wk){
     g_case_tbl(wk);
     __try{
@@ -3800,6 +4072,26 @@ static void* __fastcall CasePzlInitDetour(void* self,void* edx,int kind){
     }__except(EXCEPTION_EXECUTE_HANDLER){}
     return g_case_pzl(self,edx,kind);
 }
+// A heart mixed on a herb or jar: before its model is set the piece takes the heart row and a quarter turn
+// (case_items.h, part 4).
+static void __cdecl CaseModelSetDetour(void* piece_ptr){
+    __try{
+        uint8_t* piece=static_cast<uint8_t*>(piece_ptr);
+        const uint8_t* item=piece?*reinterpret_cast<uint8_t**>(piece+cit::kPieceItem):nullptr;
+        const uint8_t* row=piece?*reinterpret_cast<uint8_t**>(piece+cit::kPieceRow):nullptr;
+        if(item&&row){
+            const cit::CombineFix f=cit::DecideCombineFix(*reinterpret_cast<const uint16_t*>(item),
+                reinterpret_cast<uint32_t>(row),static_cast<int8_t>(row[0]),static_cast<int8_t>(row[1]),
+                static_cast<int8_t>(piece[cit::kPieceTurn]),reinterpret_cast<uint32_t>(g_case_base));
+            if(f.row){
+                *reinterpret_cast<uint32_t*>(piece+cit::kPieceRow)=f.row_ptr;
+                if(f.turn)g_case_setdir(piece,nullptr,f.dir);
+                InterlockedIncrement(&g_case_mixed);
+            }
+        }
+    }__except(EXCEPTION_EXECUTE_HANDLER){}
+    g_case_modelset(piece_ptr);
+}
 static bool StartCaseItems(unsigned char* base,unsigned size){
     CaseImage image{base,size};
     const cit::Plan plan=cit::Qualify(image,reinterpret_cast<uint32_t>(base));
@@ -3816,12 +4108,22 @@ static bool StartCaseItems(unsigned char* base,unsigned size){
         MH_DisableHook(tbl);MH_DisableHook(pzl);MH_RemoveHook(tbl);MH_RemoveHook(pzl);
         Log("CaseHeartItems disabled: enable");return false;
     }
+    // the mix fix is optional: its pins missing leave the rest as before
+    void* mix=nullptr;
+    if(cit::QualifyCombine(image)){
+        mix=base+cit::rva::kModelSet;
+        g_case_setdir=reinterpret_cast<CaseSetDir>(base+cit::rva::kSetDir);
+        if(MH_CreateHook(mix,reinterpret_cast<void*>(&CaseModelSetDetour),reinterpret_cast<void**>(&g_case_modelset))!=MH_OK){
+            mix=nullptr;Log("CaseHeartItems mix fix off: hook");
+        }else if(MH_EnableHook(mix)!=MH_OK){MH_RemoveHook(mix);mix=nullptr;Log("CaseHeartItems mix fix off: enable");}
+    }else Log("CaseHeartItems mix fix off: pieceModelSet/setDir pins");
     // rows last: once they are 2 x 1, the models and the save turn are already live
     if(!cit::ApplyRows(image,plan)){
         MH_DisableHook(tbl);MH_DisableHook(pzl);MH_RemoveHook(tbl);MH_RemoveHook(pzl);
+        if(mix){MH_DisableHook(mix);MH_RemoveHook(mix);}
         Log("CaseHeartItems disabled: row write");return false;
     }
-    Log("CaseHeartItems ready: rows=0x%X (bit = 0x1C,0x15,0x16,0xA8 written now) tbl=%p pzl=%p",plan.write_mask,tbl,pzl);
+    Log("CaseHeartItems ready: rows=0x%X (bit = 0x1C,0x15,0x16,0xA8 written now) tbl=%p pzl=%p mix=%p",plan.write_mask,tbl,pzl,mix);
     return true;
 }
 static void PollCaseItems(){
@@ -3830,6 +4132,8 @@ static void PollCaseItems(){
     if(m!=last&&m!=-1){Log("CaseHeartItems models=0x%lX%s",m&0xF,m&0x100?" (DAT read fault)":"");last=m;}
     const LONG t=InterlockedExchange(&g_case_turned,0);
     if(t)Log("CaseHeartItems turned %ld saved record(s) to 2 x 1",t);
+    const LONG x=InterlockedExchange(&g_case_mixed,0);
+    if(x)Log("CaseHeartItems mix: %ld heart piece(s) given the heart row",x);
 }
 // MortalDrawPrompt/Key/PadButton/MaskCheck ([LinkRuntime], read only with MortalDrawContextual=1) and
 // BIO4/input.ini (read only) for the key resolution. Pins are checked in the worker once the base is known.
@@ -4140,6 +4444,8 @@ static DWORD WINAPI Worker(LPVOID) {
     bool enabled = GetPrivateProfileIntW(L"LinkRuntime", L"SwordSheath", 0, path) == 1;
     bool low_health = GetPrivateProfileIntW(L"LinkRuntime", L"LowHealth", 0, path) == 1;
     const bool low_health_shop_fix = GetPrivateProfileIntW(L"LinkRuntime", L"LowHealthShopFlagFix", 1, path) == 1;
+    g_cmb_shop_flag_fix = GetPrivateProfileIntW(L"LinkRuntime", L"CombatShopFlagFix", 1, path) == 1;
+    Log("combat shop_flag_fix=%u (CombatShopFlagFix)", g_cmb_shop_flag_fix ? 1U : 0U);
     bool trace = GetPrivateProfileIntW(L"LinkRuntime", L"TraceKnife", 0, path) == 1;
     link_runtime::chapter::Config chapter_settings;
     chapter_settings.enabled=ChapterIniSwitch(path,L"ChapterProgression");
@@ -4152,11 +4458,18 @@ static DWORD WINAPI Worker(LPVOID) {
     const bool parry_requested=defense_requested||ChapterIniSwitch(path,L"ParryObserve");
     for(unsigned i=0;i<link_runtime::parry::direct::kCount;++i)
         link_runtime::parry::direct::requested[i]=GetPrivateProfileIntW(L"LinkRuntime",link_runtime::parry::direct::kSpecs[i].key,link_runtime::parry::direct::kSpecs[i].on?1:0,path)==1;
-    g_parry_line_requested=GetPrivateProfileIntW(L"LinkRuntime",L"ParryLineBlock",0,path)==1;   // 3.2.1: off until checked live
+    g_parry_line_requested=GetPrivateProfileIntW(L"LinkRuntime",L"ParryLineBlock",1,path)==1;   // 1-nov: on (missing = on), as both INIs
     unsigned general_problems=0;
     g_gen.settings=link_runtime::parry::general::ReadSettings([&](const wchar_t* key,wchar_t* out,size_t count){
         GetPrivateProfileStringW(L"LinkRuntime",key,L"",out,static_cast<DWORD>(count),path);},defense_requested,parry_requested,general_problems);
     if(general_problems)Log("ParryGeneral: invalid ParryGeneralBlock/Bosses/Thrown value or unmet dependency (1 needs ParryActive=1, 2 needs the parry transport); tier 2 off");
+    {   // Heavy parry pushback (parry-heavy-01): ParryHeavyPower / ParryHeavyPushback / ParryHeavyFrames
+        unsigned push_problems=0;
+        g_push_cfg=link_runtime::parry::pushback::ReadConfig([&](const wchar_t* key,wchar_t* out,size_t count){
+            GetPrivateProfileStringW(L"LinkRuntime",key,L"",out,static_cast<DWORD>(count),path);},push_problems);
+        Log("ParryHeavy power>=%u pushback=%.0f frames=%.0f problems=%u",g_push_cfg.heavy_power,static_cast<double>(g_push_cfg.distance),
+            static_cast<double>(g_push_cfg.frames),push_problems);
+    }
     {   // Post-parry grace window (game time; 0 = off; only with ParryGeneralBlock=1)
         const unsigned grace_raw=GetPrivateProfileIntW(L"LinkRuntime",L"ParryGraceMs",200,path);
         g_gen.grace.Configure(grace_raw);
@@ -4192,6 +4505,8 @@ static DWORD WINAPI Worker(LPVOID) {
     if(g_oca_song_cfg.problems)Log("Ocarina songs: %u invalid values (radius / OcarinaSongPlayback); defaults kept",g_oca_song_cfg.problems);
     g_oca_staff_on=GetPrivateProfileIntW(L"Ocarina",L"Staff",0,path)==1;
     g_oca_manual_on=GetPrivateProfileIntW(L"Ocarina",L"Manual",1,path)==1;   // default on; needs Item=1
+    g_hud_cfg=htp::ReadConfig([&](const wchar_t* key,unsigned fallback){return static_cast<unsigned>(GetPrivateProfileIntW(L"Hud",key,static_cast<INT>(fallback),path));});
+    if(g_hud_cfg.problems)Log("Hud: %u invalid values (switches take only exact 1; HeartLife 40..600, multiple of 4); those keep 0 / 120",g_hud_cfg.problems);
     g_cmb=cmb::ReadConfig([&](const wchar_t* key,wchar_t* out,size_t count){
         GetPrivateProfileStringW(L"LinkRuntime",key,L"",out,static_cast<DWORD>(count),path);},defense_requested);
     if(g_cmb.problems)Log("Combat: %u invalid values or unmet dependencies (Damage needs Contextual, parry keys need ParryActive); switches, unmet dependencies and a bad ParryRiposteMilli stay off, other numbers keep their defaults",g_cmb.problems);
@@ -4284,7 +4599,7 @@ static DWORD WINAPI Worker(LPVOID) {
     StartEm3fAttackTimer(path);
     StartCaseKeyDebounce(path);
     if (!enabled && !low_health && !trace && !shield_settings.enabled &&
-        !chapter_settings.enabled && !chapter_settings.trace && !g_oca_cfg.enabled && !g_cmb.AnyOn() && !fairy_requested && !rupees_requested && !case_items && !ztarget_requested && !boss_duck_requested && !sheath_requested) { Log("all features off; forwarding only"); return 0; }
+        !chapter_settings.enabled && !chapter_settings.trace && !g_oca_cfg.enabled && !g_cmb.AnyOn() && !fairy_requested && !rupees_requested && !case_items && !ztarget_requested && !boss_duck_requested && !sheath_requested && !g_hud_cfg.Any()) { Log("all features off; forwarding only"); return 0; }
     auto base = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
     auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_I386 ||
@@ -4322,7 +4637,7 @@ static DWORD WINAPI Worker(LPVOID) {
         }
         g_cmb_plan=cmb::MakePlan(g_cmb,trace,g_oca_cfg.enabled);
     } else Log("Combat keys all 0; no combat hooks, files or adapter");
-    const bool mortal_native=(g_oca_cfg.enabled||g_cmb.md_contextual||g_cmb.SwordActions()||ztarget_face_requested)&&CaptureMortalNative(base,nt->OptionalHeader.SizeOfImage);
+    const bool mortal_native=(g_oca_cfg.enabled||g_cmb.md_contextual||g_cmb.SwordActions()||ztarget_face_requested||g_hud_cfg.Any())&&CaptureMortalNative(base,nt->OptionalHeader.SizeOfImage);
     if(g_oca_cfg.enabled&&!mortal_native)Log("Ocarina disabled: pre-hook native capture");
     bool chapter=false;
     if(chapter_settings.enabled||chapter_settings.trace)chapter=StartChapterHooks(base,nt->OptionalHeader.SizeOfImage,chapter_settings);
@@ -4347,8 +4662,12 @@ static DWORD WINAPI Worker(LPVOID) {
     AlertVoice mortal_audio; mortal::voice::Consumer mortal_consumer;
     wchar_t mortal_directory[MAX_PATH]{};const bool directory_ok=link_runtime::paths::Copy(mortal_directory,path)==0;
     wchar_t* mortal_name=directory_ok?std::wcsrchr(mortal_directory,L'\\'):nullptr;if(mortal_name)mortal_name[1]=0;
+    // Published before Observe; inert until StartHud / zlr::Prepare. Null when neither the HUD nor the companion is asked for.
+    const bool companion_frame=g_cmb.AnyOn()&&zlr::CompanionRequested(path);
+    if(g_hud_cfg.Any()||companion_frame)mortal::dispatch_hooks::player_frame=&PlayerFrame;
     const bool dispatch_up=mortal_native&&mortal_name&&StartMortalTrial(base,nt->OptionalHeader.SizeOfImage,mortal_directory,mortal_audio,g_oca_cfg.enabled,g_cmb.md_contextual,g_cmb.SwordActions(),ztarget_face_requested,ztarget_strafe_requested);
     const bool combat=g_cmb.AnyOn()&&mortal_name&&StartCombat(mortal_directory,dispatch_up);
+    StartHud(base,slot,global_slot,dispatch_up,mortal_name?mortal_directory:nullptr);   // after StartCombat: the meter reads ShieldGuard
     if(sword_trail_probe_requested)StartSwordTrailProbe(base,slot,global_slot,dispatch_up,sword_trail_probe_ot22,sword_trail_probe_restore);
     StartSwordTrail(base,slot,global_slot,dispatch_up);
     StartSwordCharge(base,slot,global_slot,dispatch_up,mortal_name?mortal_directory:nullptr);
@@ -4390,7 +4709,7 @@ static DWORD WINAPI Worker(LPVOID) {
         fairy_sound=link_runtime::paths::Copy(name + 1, MAX_PATH - static_cast<size_t>(name + 1 - path), L"link_fairy_revive.wav")==0&&fairy_audio.Load(path,fairy_volume);
         Log("FairyRevive sound ready=%u volume=%u",fairy_sound?1U:0U,fairy_volume);
     }
-    if (!enabled && !low_health && !shield && !(chapter&&chapter_settings.trace) && !ocarina && !combat && !g_cmb.AnyOn() && !fairy_up && !rupees && !case_items_on && !camera_interp && !ztarget && !boss_duck && !sheath) return 0;
+    if (!enabled && !low_health && !shield && !(chapter&&chapter_settings.trace) && !ocarina && !combat && !g_cmb.AnyOn() && !fairy_up && !rupees && !case_items_on && !camera_interp && !ztarget && !boss_duck && !sheath && !g_hud_on) return 0;
     LocalMemory memory;
     unsigned changes = 0;
     link_runtime::AlertClock clock;
@@ -4425,7 +4744,7 @@ static DWORD WINAPI Worker(LPVOID) {
                 (InterlockedCompareExchange(&g_parry_defense_active,0,0)!=0||g_gen.settings.mode==link_runtime::parry::general::Mode::Active),parry_audio);
         }
         if(mortal_voice)PollMortalTrial(mortal_consumer,mortal_audio);
-        if(g_cmb.AnyOn())PollCombat();
+        if(g_cmb.AnyOn()||g_hud_on)PollCombat();
         if(g_cmb.SwordActions())SwordPollAudio();
         zlr::PollAudio();
         if(g_sg_on)GuardPollAudio();

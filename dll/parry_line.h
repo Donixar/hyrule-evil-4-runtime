@@ -124,8 +124,10 @@ struct NativeSources : general::NativeSources {
             !m.Read(r.access.image_base + static_cast<uint32_t>(r.access.code.player_slot_rva), &player, 4) ||
             !shield::Range(player, 0xAC) || !m.Read(player + 0x94, pa, sizeof(pa))) return false;
         front_math::Result res;
-        // Keep the native current-old direction for contacts close to Link's centre.
-        if (!front_native::Evaluate(r.front, r.access, o, pa, pa + 3, res, forward)) return false;
+        // Close to Link's centre the bolt's own travel decides (current - old, at any step length; hunt-findings P2-4):
+        // the native short rule (Link - current under 100 units) flipped front and back for a bolt whose short step
+        // had already passed his centre.
+        if (!front_native::Evaluate(r.front, r.access, o, pa, pa + 3, res, forward, true)) return false;
         std::memcpy(f.sample, o.previous.data(), 12);
         std::memcpy(f.player, pa, 12);
         f.frontal = res.frontal;

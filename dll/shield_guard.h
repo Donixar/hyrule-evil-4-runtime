@@ -37,6 +37,7 @@
 #include "parry_general_block.h"
 #include "game_clock.h"
 #include "link_runtime_core.h"
+#include "secondary_slot.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -225,11 +226,16 @@ struct LayerWorld {
     uint32_t frame = 0;      // game frame counter (a repeated frame only reasserts the weight)
     float step = 1.f;        // this tick in 60 Hz frames
     uint32_t image_base = 0; // for the stance work
+    bool stance_live = false; // slot-guard-01: the stance work is still the player's live blend (secondary_slot::Check);
+                              // the exit gives 2A8 back to a stance only then, else 0
 };
 struct LayerStats {
     unsigned installs = 0, completed = 0, cancelled = 0, lost_owner = 0, dropped = 0, refused = 0, install_failed = 0;
     unsigned hits = 0, breaks = 0, lent = 0, repeated_frame = 0, neck_suppressed = 0, contested = 0, resumed = 0;
+    unsigned cleared = 0;    // slot-guard-01: exits that gave 2A8 back as 0 (the previous owner was stale)
 };
+// slot-guard-01: what the last exit that wrote 2A8 found at install and gave back (for the log).
+struct LayerHandBack { uint32_t previous = 0, restored = 0; bool wrote = false, cleared = false; };
 enum class Phase : uint8_t { Idle, In, Hold, Out, Zero, Breaking };
 inline const char* PhaseName(Phase p) {
     switch (p) {
@@ -249,6 +255,7 @@ public:
     uint32_t Work() const { return work_; }
     Clip clip() const { return clip_; }
     const LayerStats& stats() const { return stats_; }
+    const LayerHandBack& last_exit() const { return exit_; }
     // The guard pose is up: blocks count. The ramp-in counts from half weight; the break clip never does.
     bool Up() const { return (phase_ == Phase::Hold || (phase_ == Phase::In && last_ >= 0.5f)) && !lent_now_; }
     void OnBlocked() { if (Active()) hit_pending_ = true; }
@@ -306,7 +313,7 @@ public:
             }
             ++stats_.lost_owner; Lost(); return;                          // unexplained native detach or the neck
         }
-        if (w.blocked) { ++stats_.cancelled; Give(port); Idle(); cooldown_ = config_.cooldown; return; }
+        if (w.blocked) { ++stats_.cancelled; Give(port, w); Idle(); cooldown_ = config_.cooldown; return; }
         if (break_pending_) {
             break_pending_ = false;
             uint32_t work = 0;
@@ -351,7 +358,7 @@ public:
             break;
         }
         case Phase::Zero:   // the previous tick ran MotionMove at weight 0 (exact primary pose)
-            Give(port); ++stats_.completed; Idle(); return;
+            Give(port, w); ++stats_.completed; Idle(); return;
         default: break;
         }
     }
@@ -362,8 +369,13 @@ private:
         if (contest_window_ <= 0) contest_window_ = config_.contest_window;
         if (++contest_ >= config_.contest_limit) { given_up_ = true; ++stats_.contested; }
     }
-    template <class Port> void Give(Port& port) {
-        if (!port.ReplaceSecondary(player_, work_, previous_)) ++stats_.lost_owner;
+    // slot-guard-01: previous_ (0, the neck or the stance) only while it is still a live owner, else 0.
+    template <class Port> void Give(Port& port, const LayerWorld& w) {
+        bool cleared = false;
+        const uint32_t back = secondary_slot::HandBack(previous_, player_, w.image_base, w.stance_live, 0, cleared);
+        exit_ = LayerHandBack{previous_, back, false, cleared};
+        if (port.ReplaceSecondary(player_, work_, back)) { exit_.wrote = true; if (cleared) ++stats_.cleared; return; }
+        ++stats_.lost_owner;
     }
     template <class Port> void Write(Port& port, float v) { port.SetWeight(work_, v); last_ = v; }
     LayerConfig config_;
@@ -375,6 +387,7 @@ private:
     unsigned contest_ = 0, resumes_ = 0;
     bool hit_pending_ = false, break_pending_ = false, given_up_ = false, lent_now_ = false;
     LayerStats stats_;
+    LayerHandBack exit_;
 };
 
 // ------------------------------------------------------------------------------------------------ body variants
