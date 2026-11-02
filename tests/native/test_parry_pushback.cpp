@@ -25,12 +25,12 @@ static auto Getter(const Ini& ini) {
 static void Keys() {
     unsigned p = 0;
     auto c = pb::ReadConfig(Getter({}), p);
-    Check(p == 0 && c.heavy_power == 1000 && Near(c.distance, 700) && Near(c.frames, 14), "defaults");
+    Check(p == 0 && c.heavy_power == 1000 && Near(c.distance, 1300) && Near(c.frames, 20), "defaults");
     c = pb::ReadConfig(Getter({{L"ParryHeavyPower", L"1500"}, {L"ParryHeavyPushback", L"0"}, {L"ParryHeavyFrames", L"20"}}), p);
     Check(p == 0 && c.heavy_power == 1500 && c.distance == 0.f && Near(c.frames, 20), "explicit values");
     Check(!pb::Heavy(c, 5000), "distance 0 = off");
     p = 0; c = pb::ReadConfig(Getter({{L"ParryHeavyPower", L"0"}, {L"ParryHeavyPushback", L"x"}, {L"ParryHeavyFrames", L"99"}}), p);
-    Check(p == 3 && c.heavy_power == 1000 && Near(c.distance, 700) && Near(c.frames, 14), "bad values: defaults, counted");
+    Check(p == 3 && c.heavy_power == 1000 && Near(c.distance, 1300) && Near(c.frames, 20), "bad values: defaults, counted");
 }
 
 static void Threshold() {
@@ -55,13 +55,13 @@ static double Run(float step) {
     double total = 0, first = -1; float dx = 0, dz = 0; int ticks = 0;
     while (s.Active() && ticks < 1000) { s.Step(0x1000, step, dx, dz); if (first < 0) first = -dz; total += -dz; ++ticks; Check(dx == 0.f, "straight"); }
     Check(!s.Active() && s.stop() == pb::Stop::Finished, "finished");
-    Check(first > 0 && Near(total, 700, 0.01), "whole distance travelled");
+    Check(first > 0 && Near(total, 1300, 0.02), "whole distance travelled");
     return ticks * double(step);
 }
 
 static void Slides() {
-    Check(Near(Run(1.f), 14, 1e-6), "60 FPS: 14 frames");
-    Check(Near(Run(60.f / 165.f), 14, 0.5), "165 FPS: same game time");
+    Check(Near(Run(1.f), 20, 1e-6), "60 FPS: 20 frames");
+    Check(Near(Run(60.f / 165.f), 20, 0.5), "165 FPS: same game time");
     pb::Slide s; const pb::Config c; float dx = 0, dz = 0;
     s.Start(c, 0x1000, 1.f, 0.f); s.Step(0x1000, 1.f, dx, dz);
     const float early = dx; s.Step(0x1000, 1.f, dx, dz);

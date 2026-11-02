@@ -34,7 +34,8 @@ constexpr float kWorldZLimit=200.f;   // native world ESP limit; a point nearer 
 constexpr double kInnerAlpha=0.35;    // cross-ribbon factor at the inner edge (tip edge 1.0)
 
 struct Vertex {Vec3 p{};uint8_t rgba[4]{};float u=0,v=0;};
-struct FrameData {uint32_t generation=0;int quads=0;Vec3 centre{};Vertex v[kMaxQuads*4];};
+// dst: the blend's destination factor for this frame's strip (the trail's INVSRCALPHA; Zelda's ray passes ONE).
+struct FrameData {uint32_t generation=0;int quads=0;int dst=gx::kDstInvSrcAlpha;Vec3 centre{};Vertex v[kMaxQuads*4];};
 
 inline uint8_t Scale(uint8_t a,double f){const long v=std::lround(double(a)*f);return uint8_t(v<0?0:v>255?255:v);}
 // Core quads (v0 old inner, v1 old tip, v2 new tip, v3 new inner) to float vertices with colour, alpha and uv (u across:
@@ -173,9 +174,9 @@ inline void __cdecl Draw(void* data){
     const auto* d=static_cast<const FrameData*>(data);
     if(!d||!ready.load(std::memory_order_acquire))return;
     float view[12]{};gx::Prior prior;
-    if(!gx::DrawContext(base,global_slot,view,prior)){draw_fails.fetch_add(1);return;}
+    if(!gx::DrawContext(base,global_slot,view,prior)||(d->dst==gx::kDstOne&&!prior.blend)){draw_fails.fetch_add(1);return;}
     Progress progress;
-    const bool emitted=Emitted(natives.gx,*d,view,progress);
+    const bool emitted=Emitted(natives.gx,*d,view,progress,d->dst);
     if(!emitted){
         draw_fails.fetch_add(1);
         if(!progress.setup){restore_skipped.fetch_add(1);if(progress.Blended())gx::BlendRestored(base,natives.gx,prior);return;}
@@ -194,7 +195,7 @@ inline void __cdecl Draw(void* data){
 // (non-finite strip) and Refused (0xFFFF at the RegisterNode point: exhausted primitive buffer or a fault; without the
 // camera also a centroid below kWorldZLimit) count as reg_fails, and each in its own counter. Hidden (wholly behind
 // the eye plane or within zlimit) counts in reg_behind / reg_near only.
-inline Result Submit(const core::Quad* q,int n,const core::Style& st){
+inline Result Submit(const core::Quad* q,int n,const core::Style& st,int dst=gx::kDstInvSrcAlpha){
     if(!ready.load(std::memory_order_acquire))return Result::NotReady;
     if(!q||n<=0)return Result::Empty;
     if(!thread_binding::Serves(owner.Take())){reg_fails.fetch_add(1);reg_wrong_thread.fetch_add(1);return Result::WrongThread;}
@@ -204,7 +205,7 @@ inline Result Submit(const core::Quad* q,int n,const core::Style& st){
     have_generation=true;last_generation=generation;
     FrameData& d=ring[slot_index++%kRing];
     if(!Build(q,n,st,d)){d.quads=0;reg_fails.fetch_add(1);reg_failed.fetch_add(1);return Result::Failed;}
-    d.generation=generation;
+    d.generation=generation;d.dst=dst;
     switch(RegisterNode(natives,global,&d,&Draw,d.v,d.quads*4,d.centre)){
     case Placed::Behind:reg_behind.fetch_add(1);return Result::Hidden;
     case Placed::Near:reg_near.fetch_add(1);return Result::Hidden;

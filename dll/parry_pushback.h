@@ -1,7 +1,8 @@
 #pragma once
 // Heavy parry pushback (parry-heavy-01, Donald 31-oct): a tier-2 block of a hit with power >= ParryHeavyPower (default
 // 1000) still cancels the hit, and Link slides back TP-style, away from the hit point, ParryHeavyPushback units
-// (default 700) over ParryHeavyFrames 60 Hz frames of game time (default 14), easing out. 0 distance = off.
+// (default 1300; 700 until 2-nov, Donald found it too subtle) over ParryHeavyFrames 60 Hz frames of game time (default
+// 20), easing out. 0 distance = off.
 //
 // Wiring (link_runtime.cpp): Start on the game thread when the general block cancels a heavy hit; Step around the
 // player's MotionMove (CmbMoveDetour), after the original call, only when no sword action owns the move; Apply writes
@@ -15,8 +16,8 @@
 namespace link_runtime::parry::pushback {
 struct Config {
     unsigned heavy_power = 1000;   // ParryHeavyPower: hits at or above this push Link back (1..9998)
-    float distance = 700.f;        // ParryHeavyPushback: units of the slide (0 = off, max 3000)
-    float frames = 14.f;           // ParryHeavyFrames: 60 Hz frames of game time (4..60)
+    float distance = 1300.f;       // ParryHeavyPushback: units of the slide (0 = off, max 3000)
+    float frames = 20.f;           // ParryHeavyFrames: 60 Hz frames of game time (4..60)
 };
 template <class Get> Config ReadConfig(Get get, unsigned& problems) {
     Config c;
@@ -28,8 +29,8 @@ template <class Get> Config ReadConfig(Get get, unsigned& problems) {
         return v;
     };
     c.heavy_power = static_cast<unsigned>(num(L"ParryHeavyPower", 1, 9998, 1000));
-    c.distance = static_cast<float>(num(L"ParryHeavyPushback", 0, 3000, 700));
-    c.frames = static_cast<float>(num(L"ParryHeavyFrames", 4, 60, 14));
+    c.distance = static_cast<float>(num(L"ParryHeavyPushback", 0, 3000, 1300));
+    c.frames = static_cast<float>(num(L"ParryHeavyFrames", 4, 60, 20));
     return c;
 }
 inline bool Heavy(const Config& c, uint16_t power) { return c.distance > 0.f && power >= c.heavy_power; }

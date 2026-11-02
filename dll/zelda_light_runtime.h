@@ -16,7 +16,7 @@ static zl::Cast g_cast;                    // the cast: hand glow, the deferred 
 static ::sword_trail::Vec3 g_cast_hand{};    // where the hand was at the last frame of the cast
 static link_runtime::ztarget::voice::Voice g_voice;   // Bin32/link_zelda_light.wav, SHA-pinned
 static std::atomic<bool> g_sound{false};  // game thread raises, the poll thread plays
-inline constexpr const char* kSoundSha="32468ee94e73a4118838e77c3b7f9aa49f7cd96a6a62ff3c5292a061d324ae6b";
+inline constexpr const char* kSoundSha="8a37f69986bd71f8a3a1f8f9ddea9dd34799051cd98e427f691e720a6b836c5c";
 
 static ::sword_trail::Style Style(){::sword_trail::Style s{};s.length_ms=zl::kFadeMs;s.inner=0.5;s.rgb=zl::kGold;s.alpha=255;return s;}
 
@@ -223,12 +223,12 @@ static void Frame(){
         if(g_part.Alive())link_runtime::sword_particles::draw::runtime::Submit(g_part,now_ms,g_part_cfg.gain);
     }
     if(!g_beam.Live(now_ms))return;
-    static ::sword_trail::Quad quads[16];
+    static ::sword_trail::Quad quads[zl::kMaxBeamQuads];
     // The beam lives on through frames where the in-play gates blink (the knife press itself sets a native state bit):
     // only a room or player change ends it.
-    const int n=g_beam.Frame(now_ms,room,read?health.player:link_player,quads,0,16);
+    const int n=g_beam.Frame(now_ms,room,read?health.player:link_player,quads,0,zl::kMaxBeamQuads);
     if(n>0){
-        const auto r=link_runtime::sword_trail::ot::runtime::Submit(quads,n,Style());
+        const auto r=link_runtime::sword_trail::ot::runtime::Submit(quads,n,Style(),link_runtime::sword_trail::gx::kDstOne);   // additive: light
         CmbLogV("zelda_beam quads=%d submit=%d in_play=%u",n,int(r),zelda?1U:0U);   // LogLevel 2
     }
 }

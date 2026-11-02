@@ -42,9 +42,16 @@ constexpr float kVertical = 1500.f;            // feet-to-feet band
 constexpr float kKnightMin = 900.f;            // a knight nearer than this may be grabbing Zelda: left to its script
 constexpr double kSpeed = 120.0;               // mm per game ms: a 15 m ray lands in 125 ms
 constexpr double kHeadMm = 2500.0;             // the bright head
-constexpr double kFadeMs = 400.0;   // the beam lingers (Donald: a goddess, not a bullet)
-constexpr double kCoreWidth = 110.0, kGlowWidth = 280.0;
-constexpr uint8_t kCoreAlpha = 255, kGlowAlpha = 110;
+constexpr double kFadeMs = 900.0;   // the beam lingers (Donald: a goddess, not a bullet; 2-nov: more massive)
+// Drawn additively (light adds to the scene), each layer as soft halves: full at the ray's axis, kInnerAlpha at its edge
+// (sword_trail_draw_ot.h), so the stacked widths fall off smoothly instead of reading as flat cards (Donald 2-nov).
+struct Layer {double width; uint8_t alpha;};
+constexpr Layer kLayers[] = {{90.0, 255}, {230.0, 150}, {420.0, 70}, {700.0, 26}};   // core, glow, wide glow, haze
+constexpr double kPulseMs = 110.0, kPulse = 0.15;   // the widths throb while the beam lives
+constexpr double kSwell = 0.6;                      // after it lands the beam swells by this much as it fades
+constexpr double kBurstMm = 900.0, kBurstWidth = 420.0;    // the impact bloom: a short glow ending at the target
+constexpr uint8_t kBurstAlpha = 90;
+constexpr int kMaxBeamQuads = 32;
 constexpr uint32_t kGold = 0xF2C94C;
 namespace layout {
 constexpr uint32_t be_flag = 0x004, pos = 0x094, routine = 0x0FC, id = 0x100, hp = 0x324;   // routine: r_no_0
@@ -188,8 +195,22 @@ inline unsigned SparkPoints(const core::Vec3& from, const core::Vec3& to, core::
     return n;
 }
 
-// The ray: a wide soft glow around a bright core, its head running from the hand to where it stops at kSpeed, the
-// whole beam fading over kFadeMs after it lands. Two crossed planes each (spin_bullets::Streak).
+// The ray: a wide haze and a soft glow around a bright core, all throbbing, its head running from the hand to where it stops at kSpeed, the
+// whole beam swelling and fading over kFadeMs after it lands, with a flare at the target. Two crossed planes each
+// (SoftStreak); kMaxBeamQuads at most.
+// A streak as soft halves: two crossed planes (as spin_bullets::Streak), each split along the axis into two quads whose
+// full-alpha edge is the axis and whose kInnerAlpha edge is the rim. 4 quads.
+inline int SoftStreak(const core::Vec3& p, const core::Vec3& q, double w, uint8_t a0, uint8_t a1, core::Quad* out, int at, int max) {
+    const double dx = q.x - p.x, dz = q.z - p.z, len = std::sqrt(dx * dx + dz * dz);
+    if (at + 4 > max || !(len > 1.0)) return at;
+    const double sx = -dz / len * w, sz = dx / len * w;
+    for (int side = -1; side <= 1; side += 2) {
+        out[at++] = core::Quad{{{p.x + side * sx, p.y, p.z + side * sz}, p, q, {q.x + side * sx, q.y, q.z + side * sz}}, a0, a1};
+        out[at++] = core::Quad{{{p.x, p.y + side * w, p.z}, p, q, {q.x, q.y + side * w, q.z}}, a0, a1};
+    }
+    return at;
+}
+
 class Beam {
     spin_bullets::Ray ray_{}; double t0_ = 0; bool on_ = false; uint32_t room_ = 0, player_ = 0;
 public:
@@ -208,10 +229,17 @@ public:
         if (!(fade > 0)) return at;
         const double head = age * kSpeed < len ? age * kSpeed : len, tail = head - kHeadMm > 0 ? head - kHeadMm : 0;
         const core::Vec3 h = spin_bullets::Along(ray_, head), t = spin_bullets::Along(ray_, tail);
-        const uint8_t glow = uint8_t(kGlowAlpha * fade), core_a = uint8_t(kCoreAlpha * fade);
-        at = spin_bullets::Streak(ray_.from, h, kGlowWidth, glow, glow, out, at, max);              // the glow, hand to head
-        at = spin_bullets::Streak(ray_.from, t, kCoreWidth, uint8_t(core_a / 2), core_a, out, at, max);   // the core behind
-        at = spin_bullets::Streak(t, h, kCoreWidth, core_a, core_a, out, at, max);                  // the bright head
+        const double w = (1.0 + kPulse * std::sin(age * 6.283185307179586 / kPulseMs)) * (1.0 + kSwell * (1.0 - fade));
+        for (const Layer& l : kLayers) {   // each layer from the hand to the head, brighter toward the head
+            const uint8_t a = uint8_t(l.alpha * fade);
+            at = SoftStreak(ray_.from, h, l.width * w, uint8_t(a / 2), a, out, at, max);
+        }
+        at = SoftStreak(t, h, kLayers[0].width * 1.6 * w, uint8_t(kLayers[0].alpha * fade), uint8_t(kLayers[0].alpha * fade), out, at, max);
+        if (age > arrive) {   // the bloom where it lands, widest at the moment of impact
+            const double k = 0.5 + fade;
+            const core::Vec3 from = spin_bullets::Along(ray_, len - kBurstMm * k);
+            at = SoftStreak(from, ray_.to, kBurstWidth * k, 0, uint8_t(kBurstAlpha * fade), out, at, max);
+        }
         return at;
     }
 };
