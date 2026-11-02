@@ -20,13 +20,17 @@
 //   hp     +0x324 cSubChar::move copies pG+0x4FB8 (ashley_life) there each frame
 //   caught pG+0x5024 bit 0x20000000, cleared at the top of cSubChar::move (0x361AB9)
 //   vtable 0x727FE4 (RTTI .?AVcSubChar@@); slot 4 -> thunk 0xAA60 -> cSubChar::move 0x361A70
+//   The live partner Ashley is a cSubAshley (vtable 0x7300FC, RTTI .?AVcSubAshley@@ : cSubChar, same slot 4), probed
+//   2-nov in r212 with id 3 and r_no 0/1: checking only the cSubChar vtable left the companion silent in 3.4.0.
 // The id byte +0x100 == 3 (Ashley) is from the brief; the routine allow-list is the GC decomp's (pl_npc.cpp:203-231).
 #include <cmath>
 #include <cstdint>
 #include <cwchar>
 
 namespace link_runtime::zelda_companion {
-constexpr uint32_t kPartnerSlot = 0x857060, kSubCharVtable = 0x727FE4;
+constexpr uint32_t kPartnerSlot = 0x857060, kSubCharVtable = 0x727FE4, kSubAshleyVtable = 0x7300FC;
+// vtable_rva = the partner's vtable minus the module base.
+inline bool PartnerVtable(uint32_t vtable_rva) { return vtable_rva == kSubCharVtable || vtable_rva == kSubAshleyVtable; }
 constexpr uint8_t kAshleyId = 3;
 namespace layout {
 constexpr uint32_t pos = 0x94, rot_y = 0xA4, r0 = 0xFC, r1 = 0xFD, id = 0x100, hp = 0x324;

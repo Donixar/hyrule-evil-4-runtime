@@ -6,7 +6,7 @@ VS_VERSION_INFO VERSIONINFO
  FILEVERSION LINK_RUNTIME_VERSION_NUMBERS
  PRODUCTVERSION LINK_RUNTIME_VERSION_NUMBERS
  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
- FILEFLAGS VS_FF_PRERELEASE
+ FILEFLAGS 0x0L
  FILEOS VOS_NT_WINDOWS32
  FILETYPE VFT_DLL
  FILESUBTYPE VFT2_UNKNOWN
@@ -15,10 +15,12 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
+            VALUE "Comments", "Fan mod runtime for Resident Evil 4 UHD (Steam). Source: github.com/Donixar/hyrule-evil-4-runtime"
             VALUE "CompanyName", "Donixar"
             VALUE "FileDescription", "Hyrule Evil 4 runtime (DirectInput8 proxy)"
             VALUE "FileVersion", LINK_RUNTIME_FILE_VERSION
             VALUE "InternalName", "link_runtime"
+            VALUE "LegalCopyright", "Hyrule Evil 4 fan mod, free and non-commercial"
             VALUE "OriginalFilename", "dinput8.dll"
             VALUE "ProductName", LINK_RUNTIME_PRODUCT_NAME
             VALUE "ProductVersion", LINK_RUNTIME_PRODUCT_VERSION

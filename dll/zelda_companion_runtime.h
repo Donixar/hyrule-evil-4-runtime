@@ -26,6 +26,7 @@ inline constexpr link_runtime::native_pins::Pin kCompanionPins[]={
     {0x3619D0,"568bf1e86a18caff0fb686fd0000008b1485d8bac1008bceffd2"},       // moveCore: r_no_1 +0xFD, funcTbl
     {0x361B4D,"e8d8c4caff8bcee84a42caff56e8b157caff"},                        // shadowCtrl, partsWorldCalc (ret 0x361B59)
     {0x727FF4,"60aa4000"},                                                    // cSubChar vtable slot 4 -> 0xAA60
+    {0x73010C,"60aa4000"},                                                    // cSubAshley vtable slot 4 -> 0xAA60
     {0xAA60,"e90b703500"}};                                                   // thunk -> cSubChar::move 0x361A70
 static zc::Config g_comp_cfg;
 static bool g_comp_on=false,g_comp_dead_logged=false;
@@ -112,7 +113,7 @@ static void CompanionFrame(double now_ms,uint32_t room,uint32_t link_player){
     uint32_t vt=0;uint8_t id=0,r[2]{};float feet[3]{},yaw=0;
     const bool read=m.Read(partner,&vt,4)&&m.Read(partner+zc::layout::id,&id,1)&&m.Read(partner+zc::layout::r0,r,2)&&
         m.Read(partner+zc::layout::pos,feet,12)&&m.Read(partner+zc::layout::rot_y,&yaw,4);
-    const bool ok=read&&g_comp_sanity.Check(vt==g_cmb_base+zc::kSubCharVtable,id,r[0],r[1]);
+    const bool ok=read&&g_comp_sanity.Check(zc::PartnerVtable(vt-g_cmb_base),id,r[0],r[1]);
     if(g_comp_sanity.Dead()){
         if(!g_comp_dead_logged){g_comp_dead_logged=true;Log("ZeldaCompanion disabled: implausible r0=%u r1=%u for %u frames (cSubChar offsets need a live probe)",
             r[0],r[1],zc::kImplausibleLimit);}

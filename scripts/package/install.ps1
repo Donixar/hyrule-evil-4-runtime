@@ -311,13 +311,20 @@ function Merge-IniText([string]$Original, [string]$Defaults) {
 # Keys whose public default changed (3.4.0: the bolt and direct parry routes went from 0 to 1). A merged INI that still
 # holds the old default exactly gets the new one; any other value is the player's choice and stays. Section and key
 # are matched case insensitively, the value must equal From after trimming spaces (an inline comment keeps it).
+# Before: only a patch from an older version gets the upgrade (3.4.1: a 0 kept in 3.4.0 is the player's choice).
 $IniDefaultUpgrades = @(
-    @{ Section = 'LinkRuntime'; Key = 'ParryLineBlock'; From = '0'; To = '1' },
-    @{ Section = 'LinkRuntime'; Key = 'ParryDirectKrauserKick'; From = '0'; To = '1' },
-    @{ Section = 'LinkRuntime'; Key = 'ParryDirectBats'; From = '0'; To = '1' },
-    @{ Section = 'LinkRuntime'; Key = 'ParryDirectCart'; From = '0'; To = '1' },
-    @{ Section = 'LinkRuntime'; Key = 'ParryDirectGiantTree'; From = '0'; To = '1' }
+    @{ Section = 'LinkRuntime'; Key = 'ParryLineBlock'; From = '0'; To = '1'; Before = '3.4.0' },
+    @{ Section = 'LinkRuntime'; Key = 'ParryDirectKrauserKick'; From = '0'; To = '1'; Before = '3.4.0' },
+    @{ Section = 'LinkRuntime'; Key = 'ParryDirectBats'; From = '0'; To = '1'; Before = '3.4.0' },
+    @{ Section = 'LinkRuntime'; Key = 'ParryDirectCart'; From = '0'; To = '1'; Before = '3.4.0' },
+    @{ Section = 'LinkRuntime'; Key = 'ParryDirectGiantTree'; From = '0'; To = '1'; Before = '3.4.0' }
 )
+# The version a patch updates from (set in patch mode); $null for a full install, which applies every upgrade.
+$Script:IniUpgradeFrom = $null
+function Test-IniUpgradeApplies($Upgrade) {
+    if ($null -eq $Script:IniUpgradeFrom) { return $true }
+    try { return ([version]$Script:IniUpgradeFrom) -lt ([version]$Upgrade.Before) } catch { return $true }
+}
 function Update-IniDefaults([string]$Text) {
     $section = ''
     $out = New-Object System.Text.StringBuilder
@@ -331,7 +338,7 @@ function Update-IniDefaults([string]$Text) {
         } elseif ($body -match '^(\s*)([^;#=\[\]\s][^=]*?)(\s*=\s*)(.*)$') {
             $lead = $Matches[1]; $name = $Matches[2]; $eq = $Matches[3]; $current = $Matches[4].Trim()
             foreach ($u in $IniDefaultUpgrades) {
-                if ($section -ieq $u.Section -and $name.Trim() -ieq $u.Key -and $current -ceq $u.From) {
+                if ($section -ieq $u.Section -and $name.Trim() -ieq $u.Key -and $current -ceq $u.From -and (Test-IniUpgradeApplies $u)) {
                     $body = $lead + $name + $eq + $u.To
                 }
             }
@@ -697,6 +704,7 @@ function Invoke-Install {
     $retainedIni = $null
     if ($patchMode) {
         $from = $Script:Patch.Manifest.from_version
+        $Script:IniUpgradeFrom = $from
         if ($null -eq $state) {
             Fail $EXIT_PATCH ('No encontré Link in RE4 ' + $from + ' instalado en esta carpeta (falta LinkInRE4_Backup\installed.json). El parche solo actualiza una instalación hecha con el instalador de la ' + $from + '; si no la tienes, usa el paquete completo. No se cambió nada.') `
                 ('Link in RE4 ' + $from + ' is not installed in this folder (LinkInRE4_Backup\installed.json is missing). The patch only updates an install made with the ' + $from + ' installer; otherwise use the full package. Nothing was changed.')

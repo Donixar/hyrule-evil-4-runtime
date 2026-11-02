@@ -228,11 +228,17 @@ static void FollowUp() {
     w.now += 16; w.At(0, -500); w.frontal = false; Check(Go(w, kEm10, follow).follow, "same swing behind Link: silent follow");
     w.now += 16; w.pose = false; Check(Go(w, kEm10, follow).follow, "same swing during the parry reaction (no sword pose): silent follow");
     w.owner = 0x8BCFB28; w.now += 16; Check(!Go(w, kEm10, follow).cancel, "another attacker on the side is not followed");
-    // Unknown owner (every producer but em10AtkCk and thrown weapons): the follow-up is by distance only, so it never
-    // skips the gates; another attacker of the same kind at Link's back must still land (review 22-oct).
+    // Unknown owner (every producer but em10AtkCk and thrown weapons): the follow-up is by distance only. Within
+    // kPoseFreeFollowMs of the block it is the blocked swing wherever it lands (Krauser r31c, Donald 31-oct: the arm sweep
+    // sampled at Link's back 15-32 ms after the block and landed); later, another attacker of the same kind at Link's back
+    // must still land (review 22-oct).
     follow = {}; Fake u; Check(Go(u, kRegen, follow).cancel, "block a producer without an owner");
-    u.now += 16; u.At(0, -500); Check(!Go(u, kRegen, follow).cancel, "unknown owner at Link's back: not followed past the gates");
-    u.now += 16; u.At(0, 500); u.pose = false; Check(!Go(u, kRegen, follow).cancel, "unknown owner without the sword pose: not followed");
+    u.now += 16; u.At(0, -500); Check(Go(u, kRegen, follow).follow && u.consumes == 1, "unknown owner at Link's back 16 ms after the block: same swing");
+    u.now += 16; u.At(0, -500); u.frontal = false; u.pose = false; Check(Go(u, kRegen, follow).follow && u.consumes == 1, "unknown owner at Link's back without the sword pose, 32 ms: same swing");
+    { g::Follow late; Fake v; Check(Go(v, kRegen, late).cancel, "block (late rear check)");
+      v.now += 60; v.At(0, -500); v.frontal = false; Check(Go(v, kRegen, late).follow, "60 ms, at the back: same swing");
+      v.now += 60; Check(!Go(v, kRegen, late).cancel, "120 ms after the block, at the back: the gates apply (another attacker)"); }
+    u.now += 16; u.At(0, 500); u.frontal = true; Check(Go(u, kRegen, follow).follow && u.consumes == 1, "unknown owner in front without the sword pose: same swing, silent follow (U3 30-oct)");
     u.now += 16; u.pose = true; Check(Go(u, kRegen, follow).follow, "unknown owner in front: still followed after the gates");
 }
 // Chainsaw (Donald 28-oct, play-20261028/tests/04-chainsaw.log): block at 0x2C249 (power 9999, owner_id 0), then
@@ -262,7 +268,7 @@ static void ChainsawSwing() {
         const auto a = GoSaw(f, 0x2C249, f.owner, follow);
         Check(a.cancel && a.owner == 0, "ESI without the chainsaw (+0x7F0 != 4) is no owner");
         f.now += 31; f.At(30, -13); f.frontal = false; f.press = false;
-        Check(!GoSaw(f, 0x2C2CA, f.owner, follow).cancel, "no owner: a rear check is not followed past the gates (old behaviour)");
+        Check(GoSaw(f, 0x2C2CA, f.owner, follow).follow, "no owner: a rear check 31 ms after the block is the same swing (31-oct)");
     }
     {   g::Follow follow; Fake f; f.d = f.second = saw;
         Check(GoSaw(f, 0x2C249, 0, follow).cancel && !follow.owner, "ESI 0: no owner");
@@ -614,7 +620,18 @@ static void DrawGuard() {
     {g::Follow follow; Fake f;
         Check(Go(f, kRegen, follow).cancel, "arm distance-only follow before hidden pose");
         f.pose = false; f.guard = true; f.press = f.peek = false; f.now += 16;
-        Check(!Go(f, kRegen, follow).cancel, "draw fallback does not extend distance-only follow without a press");}
+        Check(Go(f, kRegen, follow).follow, "hidden pose 16 ms after the block, in front: the same swing (U3 30-oct)");
+        f.now += 120;
+        Check(!Go(f, kRegen, follow).cancel, "draw fallback does not extend distance-only follow without a press past 100 ms");}
+    {g::Follow follow; g::Grace grace; grace.Configure(200);
+        Fake a; Check(GoGrace(a, kEm10, follow, grace, 0.0).grace_opened && follow.armed, "press block arms the follow and opens grace");
+        Fake b; b.press = b.peek = false; b.now = a.now + 20;
+        Check(GoGrace(b, kRegen, follow, grace, 1.2).grace && grace.blocked == 1, "another swing inside grace: grace-blocked and followed in its slot");
+        Fake c; c.pose = false; c.guard = true; c.press = c.peek = false; c.now = a.now + 40;
+        const auto o = GoGrace(c, kRegen, follow, grace, 2.4);
+        Check(!o.cancel && !o.grace && !o.follow && o.reason == g::Reason::Pose, "hidden pose within 100 ms never borrows a grace-followed swing");
+        Fake d; d.owner = 0; d.pose = false; d.press = d.peek = false; d.now = a.now + 50;
+        Check(GoGrace(d, kEm10, follow, grace, 3.0).follow, "hidden pose within 100 ms still follows the press-blocked swing");}
 }
 
 int main(int argc, char** argv) {
