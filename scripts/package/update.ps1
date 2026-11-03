@@ -364,6 +364,33 @@ function Restore-UpdateSnapshot([string]$Game, [string]$Transaction) {
     Write-JsonFile $journalPath $journal
 }
 
+function Remove-UpdateHistory([string]$Game, [string]$Keep) {
+    # After a successful update keep only the newest previous snapshot: the one this run archived, or, when it
+    # archived none, the most recently written one. Each history can weigh a gigabyte or more.
+    $backup=[IO.Path]::GetDirectoryName((Get-UpdatePath $Game 'LinkInRE4_Backup/updater-transaction'))
+    $histories=@([IO.Directory]::GetDirectories($backup) | Where-Object { [IO.Path]::GetFileName($_) -match '^updater-history-[0-9a-f]{32}$' })
+    if (-not $Keep -and $histories.Count) {
+        $Keep=@($histories | Sort-Object { [IO.Directory]::GetLastWriteTimeUtc($_) } -Descending)[0]
+    }
+    $removed=0
+    foreach ($dir in $histories) {
+        if ($Keep -and [string]::Equals($dir, $Keep, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        $rel='LinkInRE4_Backup/' + [IO.Path]::GetFileName($dir)
+        [void](Get-UpdatePath $Game $rel)
+        # Refuse to descend into a link: delete only a plain tree.
+        $pending=New-Object Collections.Stack; $pending.Push($dir)
+        while ($pending.Count) {
+            foreach ($entry in [IO.Directory]::GetFileSystemEntries($pending.Pop())) {
+                if (Test-Reparse $entry) { throw "El historial del actualizador contiene un enlace: $entry" }
+                if ([IO.Directory]::Exists($entry)) { $pending.Push($entry) }
+            }
+        }
+        [IO.Directory]::Delete($dir,$true)
+        $removed++
+    }
+    return $removed
+}
+
 function Format-UpdateSteps([string[]]$Versions) {
     # 'se aplicó el parche 3.0.3' / 'se aplicaron los parches 3.0.2 y 3.0.3' / '3.0.2, 3.0.3 y 3.0.4'
     $list=@($Versions)
@@ -394,7 +421,7 @@ function Invoke-LinkUpdate($Options, [string]$RunDir) {
     finally { $hashTool.Dispose() }
     $mutex=New-Object Threading.Mutex($false,('Local\LinkInRE4-Update-'+$key))
     $owned=$false; $transaction=Join-Path $game 'LinkInRE4_Backup/updater-transaction'
-    $active=$false; $detected=''
+    $active=$false; $detected=''; $archive=''
     try {
         try { $owned=$mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $owned=$true }
         if (-not $owned) { throw 'Ya hay otro actualizador trabajando en esta carpeta. Espera a que termine.' }
@@ -476,6 +503,9 @@ function Invoke-LinkUpdate($Options, [string]$RunDir) {
         $done.status='complete'
         Write-JsonFile $journal $done
         $active=$false
+        # The update is complete; a cleanup failure must not undo it. Logged, retried by the next update.
+        try { [void](Remove-UpdateHistory $game $archive) }
+        catch { [IO.File]::WriteAllText((Join-Path $RunDir 'history-cleanup.log'), $_.Exception.Message, $Utf8) }
         return @{ status='updated'; version=$target; detected_version=$detected; applied=$applied;
             message=("Listo: tenías la $detected y " + (Format-UpdateSteps $applied) + ". Ahora tienes Link in RE4 $target. Se conservaron tus valores del INI.");
             backup_path=$transaction }

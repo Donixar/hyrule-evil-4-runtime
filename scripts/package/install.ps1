@@ -308,7 +308,7 @@ function Merge-IniText([string]$Original, [string]$Defaults) {
     return $result
 }
 
-# Keys whose public default changed (3.4.0: the bolt and direct parry routes went from 0 to 1). A merged INI that still
+# Keys whose public default changed (3.4.0: the bolt and direct parry routes went from 0 to 1; 3.3.0: KeyStow D to 0x08). A merged INI that still
 # holds the old default exactly gets the new one; any other value is the player's choice and stays. Section and key
 # are matched case insensitively, the value must equal From after trimming spaces (an inline comment keeps it).
 # Before: only a patch from an older version gets the upgrade (3.4.1: a 0 kept in 3.4.0 is the player's choice).
@@ -317,7 +317,12 @@ $IniDefaultUpgrades = @(
     @{ Section = 'LinkRuntime'; Key = 'ParryDirectKrauserKick'; From = '0'; To = '1'; Before = '3.4.0' },
     @{ Section = 'LinkRuntime'; Key = 'ParryDirectBats'; From = '0'; To = '1'; Before = '3.4.0' },
     @{ Section = 'LinkRuntime'; Key = 'ParryDirectCart'; From = '0'; To = '1'; Before = '3.4.0' },
-    @{ Section = 'LinkRuntime'; Key = 'ParryDirectGiantTree'; From = '0'; To = '1'; Before = '3.4.0' }
+    @{ Section = 'LinkRuntime'; Key = 'ParryDirectGiantTree'; From = '0'; To = '1'; Before = '3.4.0' },
+    # 3.3.0: the chromatic piano took D (D#4), so the public stow key moved from D to Backspace (0x08). A 3.2.x
+    # KeyStow=D now collides with the piano and the runtime warns 'Ocarina: 1 invalid binding' at every start; the
+    # runtime already moves stow to Backspace then, so any D kept up to 3.4.3 is migrated (every 3.5.0 patch starts
+    # at 3.4.0 or later, and the 3.4.3 EXE a 3.2.x player runs first has no migration).
+    @{ Section = 'Ocarina'; Key = 'KeyStow'; From = 'D'; To = '0x08'; Before = '3.5.0' }
 )
 # The version a patch updates from (set in patch mode); $null for a full install, which applies every upgrade.
 $Script:IniUpgradeFrom = $null

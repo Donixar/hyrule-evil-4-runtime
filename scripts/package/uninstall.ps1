@@ -12,7 +12,8 @@
     its sha256. Then it deletes each mod file whose hash is still the mod's (a file changed since the install is
     left in place with a warning; an edited Bin32\link_runtime.ini moves to LinkInRE4_Backup as
     link_runtime.ini.<hash>-user), moves every original back (.lfs files and loose originals), checks each one
-    against backup.json, removes the folders the installer created and, when everything is back, the backup.
+    against backup.json, removes the folders the installer created and, when everything is back, the backup and
+    the updater's snapshots (updater-transaction, updater-history-*). With warnings or a failed restore they stay.
 
     Exit codes: 0 ok (or nothing installed), 1 unexpected error, 3 game folder not found, 7 game running,
     8 inconsistent state, 9 a backup is missing or damaged (nothing changed) or a restored file does not match,
@@ -208,6 +209,23 @@ function Read-Journal([string]$Path) {
         }
     }
     return $result
+}
+
+# The updater's rollback snapshot (updater-transaction, about 1.3 GB on a full chain) and the snapshots it archived
+# (updater-history-<guid>) only fit the install that was just removed. Called only after every original is back.
+function Remove-UpdaterLeftovers([string]$BackupRoot) {
+    if (-not [System.IO.Directory]::Exists($BackupRoot)) { return }
+    foreach ($dir in @([System.IO.Directory]::GetDirectories($BackupRoot))) {
+        $name = [System.IO.Path]::GetFileName($dir)
+        if ($name -ne 'updater-transaction' -and $name -notmatch '^updater-history-[0-9a-f]{32}$') { continue }
+        try {
+            [void](Get-SafePath $BackupRoot $name)
+            Assert-SafeBackupTree $dir
+            [System.IO.Directory]::Delete($dir, $true)
+        } catch {
+            Warn ('No pude borrar ' + $dir + '; puedes borrarla a mano.') ('Could not delete ' + $dir + '; you can delete it by hand.')
+        }
+    }
 }
 
 # ------------------------------------------------------------------ game
@@ -495,6 +513,8 @@ function Invoke-Uninstall {
     if (@([System.IO.Directory]::GetFileSystemEntries($backupDir)).Count -eq 0) { [System.IO.Directory]::Delete($backupDir) }
     Remove-FileIfPresent $statePath
     foreach ($name in @('installed.json.writing', 'uninstall.ps1', 'Uninstall-LinkInRE4.bat')) { Remove-FileIfPresent (Join-Path $backupRoot $name) }
+    # Every original is back and verified: the updater's snapshots can no longer be restored over anything.
+    Remove-UpdaterLeftovers $backupRoot
     if ([System.IO.Directory]::Exists($backupRoot) -and @([System.IO.Directory]::GetFileSystemEntries($backupRoot)).Count -eq 0) {
         try { [System.IO.Directory]::Delete($backupRoot) } catch { Warn ('Puedes borrar la carpeta vacía ' + $backupRoot + '.') ('You can delete the empty folder ' + $backupRoot + '.') }
     }

@@ -75,6 +75,50 @@ static void Slides() {
     Check(!s.Active() && s.stop() == pb::Stop::Damaged && !s.Step(0x1000, 1.f, dx, dz), "abort");
 }
 
+// Pending 14 (3-nov): a pause in the middle of the slide. Frozen counter (pause that stops the game): the slide resumes
+// and still ends after 20 game frames with the whole distance. Counter that ran on without the slide's MotionMove
+// (event, menu, sword action) or went back (load): cancelled at once, no displacement after the gap.
+static void Pauses() {
+    const pb::Config c; float dx = 0, dz = 0;
+    {   // 165 FPS, a 3 s pause after 10 ticks with the counter frozen: same game-time slide as without the pause.
+        pb::Slide s; uint32_t frame = 5000; const float step = 60.f / 165.f; double total = 0; int ticks = 0;
+        Check(s.Start(c, 0x1000, 0.f, -1.f, frame), "start with the counter");
+        for (int i = 0; i < 10; ++i) { s.Step(0x1000, step, dx, dz, ++frame); total += -dz; ++ticks; }
+        Check(s.Active() && total > 0 && total < 1300, "mid-slide before the pause");
+        // pause: no MotionMove, no tick (the counter stays at `frame`) for 3 s of wall time; nothing to call.
+        while (s.Active() && ticks < 1000) { s.Step(0x1000, step, dx, dz, ++frame); total += -dz; ++ticks; }
+        Check(s.stop() == pb::Stop::Finished && Near(total, 1300, 0.02), "frozen pause: the slide finishes, whole distance");
+        Check(Near(ticks * double(step), 20, 0.5), "frozen pause: 20 game frames in all, wall time not counted");
+    }
+    {   // 60 FPS, an event/menu runs 600 ticks without the slide's MotionMove: cancelled, no late slide.
+        pb::Slide s; uint32_t frame = 100; double total = 0;
+        s.Start(c, 0x1000, 1.f, 0.f, frame);
+        for (int i = 0; i < 5; ++i) { s.Step(0x1000, 1.f, dx, dz, ++frame); total += dx; }
+        const float before = s.moved();
+        frame += 600;
+        Check(!s.Step(0x1000, 1.f, dx, dz, frame) && dx == 0.f && dz == 0.f, "after the event: no displacement");
+        Check(!s.Active() && s.stop() == pb::Stop::Gap && s.moved() == before && Near(total, before), "event: cancelled (gap)");
+        Check(!s.Step(0x1000, 1.f, dx, dz, frame + 1) && dx == 0.f, "stays cancelled");
+        Check(std::strcmp(pb::StopName(pb::Stop::Gap), "gap") == 0, "stop name for the log");
+    }
+    {   // slack: a native hit-stop of kMaxGapTicks ticks keeps the slide; one more tick cancels it.
+        pb::Slide s; uint32_t frame = 7; s.Start(c, 0x1000, 1.f, 0.f, frame);
+        frame += pb::kMaxGapTicks; Check(s.Step(0x1000, 1.f, dx, dz, frame) && s.Active() && dx > 0, "gap at the limit: continues");
+        frame += pb::kMaxGapTicks + 1; Check(!s.Step(0x1000, 1.f, dx, dz, frame) && s.stop() == pb::Stop::Gap, "gap past the limit: cancelled");
+    }
+    {   // a load rewinds the counter: cancelled; the counter wrapping forward by one tick is not a gap.
+        pb::Slide s; s.Start(c, 0x1000, 1.f, 0.f, 4000); s.Step(0x1000, 1.f, dx, dz, 4001);
+        Check(!s.Step(0x1000, 1.f, dx, dz, 120) && s.stop() == pb::Stop::Gap, "counter went back: cancelled");
+        pb::Slide w; w.Start(c, 0x1000, 1.f, 0.f, 0xFFFFFFFFu);
+        Check(w.Step(0x1000, 1.f, dx, dz, 1) && w.Active(), "counter wraps 0xFFFFFFFF -> 1 (gap 2): continues");
+    }
+    {   // counter unknown (0) at the start or at a step: no gap check, legacy behaviour.
+        pb::Slide s; s.Start(c, 0x1000, 1.f, 0.f, 0);
+        Check(s.Step(0x1000, 1.f, dx, dz, 900) && s.Active(), "unknown start frame: first known step anchors");
+        Check(s.Step(0x1000, 1.f, dx, dz, 0) && s.Active(), "unknown step frame: no check");
+        Check(s.Step(0x1000, 1.f, dx, dz, 901) && s.Active(), "anchor kept across an unknown frame");
+    }
+}
 struct Mem {
     unsigned char bytes[0x200]{}; bool writable = true, flip = false; unsigned reads = 0;
     bool Read(uint32_t a, void* out, size_t n) { if (flip && ++reads == 2) bytes[a - 0x1000] ^= 1; std::memcpy(out, bytes + (a - 0x1000), n); return true; }
@@ -94,7 +138,7 @@ static void Writes() {
 }
 
 int main() {
-    Keys(); Threshold(); Directions(); Slides(); Writes();
+    Keys(); Threshold(); Directions(); Slides(); Pauses(); Writes();
     std::printf("parry_pushback: %u checks passed\n", checks);
     return 0;
 }

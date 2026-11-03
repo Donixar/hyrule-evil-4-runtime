@@ -30,6 +30,7 @@
 #include "parry_spark_runtime.h"
 #include "parry_general_runtime.h"
 #include "parry_pushback.h"
+#include "parry_observe_log.h"
 #include "parry_line.h"
 #include "parry_direct_runtime.h"
 #include "ocarina_session.h"
@@ -501,10 +502,12 @@ static bool StartParryObservation(const link_runtime::shield::NativeAccess& nati
     }
     p::direct::on_block=ParryDirectAudio;
     for(unsigned i=0;i<p::direct::kCount;++i){
+        // A route the INI leaves off is never tried: status=off instead of the hook's NOT_EXECUTABLE (pending 12).
+        if(!p::direct::requested[i]){Log("ParryDirect ready route=%s ok=0 enabled=0 status=off",p::direct::kSpecs[i].name);continue;}
         const auto route=static_cast<p::direct::Route>(i);
         const auto direct_status=p::direct::Start(g_gen,route);
-        Log("ParryDirect ready route=%s ok=%u enabled=%u status=%s",p::direct::kSpecs[i].name,
-            direct_status==MH_OK?1U:0U,p::direct::requested[i]?1U:0U,MH_StatusToString(direct_status));
+        Log("ParryDirect ready route=%s ok=%u enabled=1 status=%s",p::direct::kSpecs[i].name,
+            direct_status==MH_OK?1U:0U,MH_StatusToString(direct_status));
     }
     if(g_parry_line_requested){
         const auto line_status=p::line::Start(g_gen,ResolveParryLine);
@@ -518,7 +521,14 @@ static void PollParryObservation(DWORD& previous) {
     o::Record r;
     link_runtime::parry::general::Drain([](const char* line){Log("%s",line);});
     if(const unsigned lost=link_runtime::parry::general::dropped.exchange(0))Log("parry general records dropped=%u",lost);
+    static link_runtime::parry::observe_log::Gate quiet;   // worker thread only (pending 13)
     for(unsigned i=0;i<32&&o::Pop(r);++i){
+        link_runtime::parry::observe_log::Facts facts;
+        facts.kind=static_cast<uint32_t>(r.kind);facts.on=r.on;facts.trg=r.trg;facts.armed=(r.flags&(o::WindowArmed|o::InputSampleArmed))!=0;
+        facts.contact=r.contact_valid&&(r.contact.endpoint_intersects||r.contact.spatial_segment_intersects||r.contact.body_hit_reported);
+        facts.reasons=r.reasons;facts.flags=r.flags;facts.ready=r.epoch_ready;facts.poisoned=r.epoch_poisoned;facts.failure=r.epoch_failure;
+        facts.reader_failure=r.epoch_reader_failure;facts.room=r.room;facts.weapon=r.weapon;facts.character=r.character;
+        if(!quiet.Admit(facts,GetTickCount64()))continue;
         LogV("parry observe kind=%u reasons=0x%X flags=0x%X thread=%u frame=%u input_frame=%u owner_frame=%u completed_frame=%u "
             "pose_ready=%u pose_poisoned=%u depth=%u serial=%llu profile=%u room=0x%X weapon=%u character=%u pose_failure=%u pose_reader_failure=%u "
             "input_on=0x%llX input_trg=0x%llX window_age_ms=%llu remaining_ms=%u "
@@ -542,8 +552,10 @@ static void PollParryObservation(DWORD& previous) {
     const DWORD now=GetTickCount();
     if(now-previous>=5000) {
         previous=now;const auto c=o::SnapshotCounters();
-        LogV("parry observation totals tails=%u ready=%u candidates=%u published=%u dropped_full=%u dropped_busy=%u reentered=%u observer_only=1",
-            c.tails,c.epoch_ready_tails,c.candidates,c.published,c.dropped_full,c.dropped_busy,c.reentered);
+        LogV("parry observation totals tails=%u ready=%u candidates=%u published=%u dropped_full=%u dropped_busy=%u reentered=%u quiet_skipped=%u observer_only=1",
+            c.tails,c.epoch_ready_tails,c.candidates,c.published,c.dropped_full,c.dropped_busy,c.reentered,quiet.TakeSkipped());
+        for(uint32_t kind=0;kind<link_runtime::parry::observe_log::Gate::kKinds;++kind)   // identical records not written (pending 13)
+            if(const uint32_t n=quiet.TakeRepeated(kind))LogV("parry observe repeated kind=%u n=%u window_ms=5000 observer_only=1",kind,n);
         LogV("parry defense active=%ld attempts=%ld committed=%ld partial_failure=%ld",
             InterlockedCompareExchange(&g_parry_defense_active,0,0),InterlockedCompareExchange(&g_parry_attempts,0,0),
             InterlockedCompareExchange(&g_parry_committed,0,0),InterlockedCompareExchange(&g_parry_partial,0,0));
@@ -3321,7 +3333,7 @@ static void ParryHeavyBlock(const link_runtime::parry::general::Applied& applied
     const uint32_t player=CmbGet<uint32_t>(g_cmb_player_slot);
     if(!link_runtime::IsPointer(player))return;
     float ux=0,uz=0;
-    if(!ppb::Direction(applied.hit,applied.player,CmbGet<float>(player+0xA4),ux,uz)||!g_push.Start(g_push_cfg,player,ux,uz))return;
+    if(!ppb::Direction(applied.hit,applied.player,CmbGet<float>(player+0xA4),ux,uz)||!g_push.Start(g_push_cfg,player,ux,uz,CmbFrame()))return;
     CmbLog("parry heavy pushback serial=0x%08X power=%u distance=%.0f frames=%.0f dir=%.2f,%.2f",applied.serial,applied.power,
         static_cast<double>(g_push_cfg.distance),static_cast<double>(g_push_cfg.frames),static_cast<double>(ux),static_cast<double>(uz));
 }
@@ -3332,7 +3344,8 @@ static int CmbPushMove(void* model){
     const uint32_t routine=CmbGet<uint32_t>(player+0xFC);
     if((routine&0xFF)!=0)g_push.Abort(ppb::Stop::Damaged);   // damage / death routine: the native reaction moves Link
     float dx=0,dz=0;
-    if(g_push.Step(player,static_cast<float>(GameStep(g_cmb_global_slot)),dx,dz)){
+    // Game time only: the counter jumping (event, menu, load) since the last step cancels it (pending 14).
+    if(g_push.Step(player,static_cast<float>(GameStep(g_cmb_global_slot)),dx,dz,CmbFrame())){
         link_runtime::ztarget::runtime::Memory w;
         if(!ppb::Apply(w,player,dx,dz))g_push.Abort(ppb::Stop::Write);
     }
@@ -3620,6 +3633,81 @@ static htp::Painter<HudNative> g_hud_painter;
 static htp::RingHide<HudNative> g_hud_ring;
 static htp::PaintWhy g_hud_why=htp::PaintWhy::Idle;
 static void HudLog(const char* format,...){va_list args;va_start(args,format);CmbRing(link_runtime::log::kNormal,format,args);va_end(args);}
+// --- heart-refill-01 (3.5.0 F-01, hud_tp.h Refill): the drawn hearts chase the life a quarter per 2 frames; one
+// Z2SE_HP_GAUGE_INC tick per whole heart. Game thread: HudRefillFrame logs and hands the ticks to the poll thread
+// (atomic); PollHudRefill paces them (60 ms) on two alternating voices and latches SYS_LOAD_GAME (global+0x54 0x100,
+// GameLoad 0x23D816) for the load snap even while no player frame runs. Inert unless [Hud] HeartRefill=1.
+static std::atomic<unsigned> g_hud_refill_ticks{0},g_hud_refill_played{0};
+static std::atomic<bool> g_hud_load_seen{false};
+static link_runtime::ztarget::voice::Voice g_hud_tick_voice[2];
+static htp::TickPacer g_hud_tick_pacer;
+static bool g_hud_tick_sound=false;
+static bool HudLoadFlag(uint32_t g){LocalMemory m;uint32_t sys=0;return link_runtime::IsPointer(g)&&m.Read32(g+0x54,sys)&&(sys&0x100U)!=0;}
+static void HudRefillFrame(){
+    if(!g_hud_cfg.refill)return;
+    const htp::Snap snap=g_hud.snap();
+    if(snap!=htp::Snap::None)HudLog("hud refill snap why=%s q=%d hp=%d/%d ticks=0",htp::SnapName(snap),g_hud.quarters(),g_hud_in.hp,g_hud_in.max_hp);
+    const unsigned ticks=g_hud.refill().TakeTicks();
+    if(ticks&&g_hud_tick_sound)g_hud_refill_ticks.fetch_add(ticks,std::memory_order_acq_rel);
+    htp::RefillDone done;
+    if(g_hud.refill().TakeDone(done))HudLog("hud refill from=%d to=%d ticks=%u t_ms=%.0f hearts=%d hp=%d/%d sound=%u",done.from,done.to,done.ticks,done.ms,
+        g_hud.hearts(),g_hud_in.hp,g_hud_in.max_hp,g_hud_tick_sound?1U:0U);
+}
+static void PollHudRefill(){   // poll thread
+    if(!g_hud_cfg.refill)return;
+    LocalMemory m;uint32_t g=0;
+    if(m.Read32(g_hud_global_slot,g)&&HudLoadFlag(g))g_hud_load_seen.store(true,std::memory_order_release);
+    if(!g_hud_tick_sound)return;
+    const int v=g_hud_tick_pacer.Poll(g_hud_refill_ticks.exchange(0,std::memory_order_acq_rel),GetTickCount64());
+    if(v>=0&&g_hud_tick_voice[v].Play())g_hud_refill_played.fetch_add(1,std::memory_order_relaxed);
+}
+// --- end heart-refill-01
+// --- ztarget-letterbox-01 (3.5.0 F-09, hud_tp.h BarView): TP's cinema bars while Z-locked or in neutral Z, two
+// fixed units of the hearts' painter (UnitCount never changes with a lock). Lock read on the game thread from the
+// ztarget runtime (PlayerDecide runs before HudFrame in CombinedDecide; the core's player_frame may see it one frame
+// late). LetterboxOrder=end|start is re-read by the poll thread every 2 s (the bot's A/B) and applied with no bar up.
+// Inert unless [Hud] ZTargetLetterbox=1.
+static wchar_t g_hud_ini[MAX_PATH]{};
+static std::atomic<int> g_hud_lb_order{-1};   // poll -> game: -1 none, 0 end, 1 start
+static uint64_t g_hud_lb_next=0;static bool g_hud_lb_said=false;
+static bool HudLock(){
+    namespace zt=link_runtime::ztarget::runtime;
+    return g_hud_cfg.letterbox&&zt::live.load(std::memory_order_acquire)&&
+        (zt::controller.phase==link_runtime::ztarget::Phase::Locked||zt::NeutralNow());
+}
+static void HudLetterboxOrder(){   // game thread, before Update
+    if(!g_hud_cfg.letterbox)return;
+    const int want=g_hud_lb_order.load(std::memory_order_acquire);
+    if(want<0||(want==1)==g_hud.config().letterbox_start||g_hud.bar_on()||g_hud.bar()>0)return;
+    g_hud.SetOrder(want==1);
+    HudLog("hud letterbox order=%s (live; the painter re-arms)",want==1?"start":"end");
+}
+static void HudLetterboxFrame(){   // game thread, after Update
+    if(!g_hud_cfg.letterbox)return;
+    double full=0,clear=0;const unsigned e=g_hud.TakeBarEvents(full,clear);
+    if(!e)return;
+    const auto& geo=g_hud_painter.geometry();
+    if(e&htp::BarIn)HudLog("hud letterbox in h=%u rows=%.1f order=%s clip=%u bottom=%u instant=%u units=%d",g_hud_cfg.letterbox_height,
+        static_cast<double>(g_hud.BarRows(geo,false)),g_hud.config().letterbox_start?"start":"end",g_hud_cfg.letterbox_clip?1U:0U,
+        g_hud_cfg.letterbox_no_bottom?0U:1U,g_hud_cfg.letterbox_instant?1U:0U,g_hud.UnitCount());
+    if(e&htp::BarFull)HudLog("hud letterbox full t_ms=%.0f",full);
+    if(e&htp::BarOut)HudLog("hud letterbox out play=%u",g_hud_in.play?1U:0U);
+    if(e&htp::BarClear)HudLog("hud letterbox clear t_ms=%.0f",clear);
+}
+static void PollHudLetterbox(){   // poll thread
+    if(!g_hud_cfg.letterbox)return;
+    if(!g_hud_lb_said){
+        g_hud_lb_said=true;
+        Log("hud letterbox ztarget_live=%u (no lock without [LinkRuntime] ZTarget=1)",link_runtime::ztarget::runtime::live.load()?1U:0U);
+    }
+    const uint64_t now=GetTickCount64();
+    if(now<g_hud_lb_next||!g_hud_ini[0])return;
+    g_hud_lb_next=now+2000;
+    wchar_t word[16]{};bool start=false;
+    GetPrivateProfileStringW(L"Hud",L"LetterboxOrder",L"",word,16,g_hud_ini);
+    if(htp::ParseOrder(word,start))g_hud_lb_order.store(start?1:0,std::memory_order_release);
+}
+// --- end ztarget-letterbox-01
 // hud-pause-01 (31-oct, Donald's r31c crash, bio4+0x55B729 on taking the second crest, gone with the HUD off): outside
 // play (item get, case, menus, events, death; the in_play gates of link_runtime_health.h) the painter drops its units and
 // releases its HD texture, so the native screens get that memory back, and re-arms when play resumes. Leon's ring stays
@@ -3633,16 +3721,21 @@ static void HudFrame(){
     link_runtime::HealthState health;
     if(link_runtime::low_health::ReadHealth(m,g_hud_player_slot,g_hud_global_slot,g_cmb_shop_flag_fix,health)){   // past a latched STA_INTO_SHOP
         g_hud_miss=0;g_hud_in.leon=health.character==0;g_hud_in.hp=health.hp;g_hud_in.max_hp=health.max_hp;
-        g_hud_play=health.in_play;
+        g_hud_play=health.in_play;g_hud_in.character=health.character;
     }else if(++g_hud_miss>=30)g_hud_in.leon=false;   // a transient unreadable frame keeps the last view (no re-arm flicker)
     // The meter follows shield_guard's own state (GuardTick, MotionMove): drawn only with a shield costume and ShieldGuard ready.
     htp::MeterState& mt=g_hud_in.meter;
     mt.on=g_sg_on&&g_sg_supported;mt.left=g_sg_dur.Left();mt.max=g_sg_dur.Max();mt.broken=g_sg_dur.Broken();
     mt.remaining=g_sg_dur.Remaining(g_sg_clock.Now());mt.regen=g_sg_dur.RegenFrames();
-    g_hud.Update(g_hud_in,GameStep(g_hud_global_slot));
-    HudNative n;
-    uint32_t room=0xFFFFFFFFu;   // the room (TrailRoom's u16 at +0x4FAC): a new one retries a failed paint
+    uint32_t room=0xFFFFFFFFu;   // the room (TrailRoom's u16 at +0x4FAC): a new one retries a failed paint (and snaps the refill)
     if(m.Read32(g+0x4FAC,room))room&=0xFFFFu;
+    g_hud_in.play=g_hud_play;g_hud_in.room=room;   // heart-refill-01: read only with HeartRefill=1
+    g_hud_in.load=g_hud_cfg.refill&&(g_hud_load_seen.exchange(false,std::memory_order_acq_rel)||HudLoadFlag(g));
+    g_hud_in.lock=HudLock();HudLetterboxOrder();   // ztarget-letterbox-01: no-op unless ZTargetLetterbox=1
+    g_hud.Update(g_hud_in,GameStep(g_hud_global_slot));
+    HudRefillFrame();   // heart-refill-01: no-op unless HeartRefill=1
+    HudLetterboxFrame();   // ztarget-letterbox-01
+    HudNative n;
     g_hud_painter.Scene(room);
     const htp::PaintWhy why=g_hud_painter.Tick(n,g_hud,g_hud_play);
     // Leon's ring hides only while our hearts are (being) drawn; any failure or the Zelda segment puts it back.
@@ -3698,6 +3791,26 @@ static void StartHud(unsigned char* base,uint32_t player_slot,uint32_t global_sl
         htp::layout::id_class,htp::layout::tex_id,htp::layout::tex_owner,mortal::dispatch_hooks::player_frame?1U:0U,g_sg_on?1U:0U);
     if(g_hud_cfg.meter&&!g_sg_on)Log("Hud shield meter idle: ShieldGuard is not ready (the meter draws only with it)");
     if(g_hud_cfg.hide_native&&!g_hud_cfg.hearts)Log("Hud HideNativeLife ignored: TpHearts=0 (Leon's ring stays)");
+    // --- heart-refill-01
+    if(g_hud_cfg.refill){
+        unsigned voices=0;
+        if(g_hud_cfg.refill_sound){
+            wchar_t wav[MAX_PATH]{};
+            if(link_runtime::paths::Format(wav,L"%ls%ls",directory,htp::kRefillSoundFile)>0)
+                for(auto& v:g_hud_tick_voice)if(v.Load(wav,g_hud_cfg.refill_volume,htp::kRefillSoundSha))++voices;
+            g_hud_tick_sound=voices==2;
+            if(!g_hud_tick_sound)Log("hud refill sound: Bin32/link_heart_refill.wav missing or changed (the refill still draws)");
+        }
+        Log("hud refill ready=1 sound=%u end_tick=%u voices=%u volume=%u quarter_frames=%.0f gap_ms=%u",g_hud_tick_sound?1U:0U,
+            g_hud_cfg.refill_sound_end?1U:0U,voices,g_hud_cfg.refill_volume,htp::kRefillFrames,htp::kTickGapMs);
+    }else Log("hud refill off (HeartRefill=0 or TpHearts=0): hearts jump as in 3.4.3");
+    // --- end heart-refill-01
+    // --- ztarget-letterbox-01
+    if(g_hud_cfg.letterbox)Log("hud letterbox ready=1 h=%u order=%s instant=%u bottom=%u clip=%u clip_x=%u top_rows=%u units_max=%d",
+        g_hud_cfg.letterbox_height,g_hud_cfg.letterbox_start?"start":"end",g_hud_cfg.letterbox_instant?1U:0U,g_hud_cfg.letterbox_no_bottom?0U:1U,
+        g_hud_cfg.letterbox_clip?1U:0U,g_hud_cfg.letterbox_clip_x,g_hud_cfg.letterbox_top_rows,htp::kMaxUnits);
+    else Log("hud letterbox off (ZTargetLetterbox=0 or TpHearts=0)");
+    // --- end ztarget-letterbox-01
 }
 static void __cdecl CombinedDecide(mortal::dispatch::Runtime& run,void* player){
     UserIniApply();   // user-ini-01: a new cosmetic snapshot from the worker, before this dispatch's readers (the arbiter and the lifecycle may read the previous one for one frame: same thread, cosmetic)
@@ -4547,7 +4660,14 @@ static DWORD WINAPI Worker(LPVOID) {
     g_oca_staff_on=GetPrivateProfileIntW(L"Ocarina",L"Staff",0,path)==1;
     g_oca_manual_on=GetPrivateProfileIntW(L"Ocarina",L"Manual",1,path)==1;   // default on; needs Item=1
     g_hud_cfg=htp::ReadConfig([&](const wchar_t* key,unsigned fallback){return static_cast<unsigned>(GetPrivateProfileIntW(L"Hud",key,static_cast<INT>(fallback),path));});
-    if(g_hud_cfg.problems)Log("Hud: %u invalid values (switches take only exact 1; HeartLife 40..600, multiple of 4); those keep 0 / 120",g_hud_cfg.problems);
+    {   // ztarget-letterbox-01: LetterboxOrder is a word; the INI path for the poll thread's live re-read
+        wchar_t word[16]{};bool start=false;
+        GetPrivateProfileStringW(L"Hud",L"LetterboxOrder",L"",word,16,path);
+        if(!htp::ParseOrder(word,start))++g_hud_cfg.problems;
+        g_hud_cfg.letterbox_start=start;
+        if(link_runtime::paths::Copy(g_hud_ini,path)!=0)g_hud_ini[0]=0;
+    }
+    if(g_hud_cfg.problems)Log("Hud: %u invalid values (switches take only exact 1; HeartLife 40..600, multiple of 4; HeartRefillVolumePercent 0..100; ZTargetLetterboxHeight 4..10; LetterboxOrder end|start; LetterboxClipX 0..320; LetterboxTopRows 4..40); those keep their defaults",g_hud_cfg.problems);
     g_cmb=cmb::ReadConfig([&](const wchar_t* key,wchar_t* out,size_t count){
         GetPrivateProfileStringW(L"LinkRuntime",key,L"",out,static_cast<DWORD>(count),path);},defense_requested);
     if(g_cmb.problems)Log("Combat: %u invalid values or unmet dependencies (Damage needs Contextual, parry keys need ParryActive); switches, unmet dependencies and a bad ParryRiposteMilli stay off, other numbers keep their defaults",g_cmb.problems);
@@ -4578,6 +4698,10 @@ static DWORD WINAPI Worker(LPVOID) {
     g_charge_cfg=link_runtime::sword_charge::ReadConfig(cosmetic);
     // sword-particles-01 (sword_particles.h): SwordParticles* keys, read always; started after the trail.
     g_part_cfg=link_runtime::sword_particles::ReadConfig(cosmetic);
+    // ---- F-11 Cucco feathers (cucco_feathers.h): CuccoFeathers* keys, main INI only; exact 1, started after the particles.
+    g_cucco_cfg=link_runtime::cucco_feathers::ReadConfig([&](const wchar_t* key,wchar_t* out,size_t count){
+        GetPrivateProfileStringW(L"LinkRuntime",key,L"",out,static_cast<DWORD>(count),path);});
+    // ---- end F-11
     // Task 3b probe (sword_trail_probe.h): exact 1, default 0; started after the player dispatch, never otherwise.
     const bool sword_trail_probe_requested=ChapterIniSwitch(path,L"SwordTrailProbe");
     const bool sword_trail_probe_ot22=ChapterIniSwitch(path,L"SwordTrailProbeOt22");   // exact 1, default 0
@@ -4713,6 +4837,7 @@ static DWORD WINAPI Worker(LPVOID) {
     StartSwordTrail(base,slot,global_slot,dispatch_up);
     StartSwordCharge(base,slot,global_slot,dispatch_up,mortal_name?mortal_directory:nullptr);
     StartSwordParticles(base,slot,global_slot,dispatch_up);   // sword-particles-01: after the trail (it reads its samples)
+    StartCuccoFeathers(dispatch_up,mortal_name?mortal_directory:nullptr);   // F-11: after the particles (it emits through them)
     if(zlr::g_on&&!g_trail_on.load(std::memory_order_acquire))Log("ZeldaLight inert: sword_trail is off (its reason above); the ray is drawn with the trail's node");
     UserIniStart(user_ini,user_file_problems);   // user-ini-01: after the three: what started, then live reloads
     StartZTargetArrow(base,slot,global_slot,dispatch_up,path);   // before ztarget Start: it mutes the 2D cursor
@@ -4776,6 +4901,7 @@ static DWORD WINAPI Worker(LPVOID) {
         PollSwordTrail();
         PollSwordCharge();
         PollSwordParticles();   // sword-particles-01
+        PollCuccoFeathers();    // F-11: the cry and wing request, its stats
         UserIniPoll();          // user-ini-01: the override file, at most once per second
         PollThreadBindings();   // skills-fix-01: a game thread handed over (one line each)
         PollZTargetArrow();
@@ -4786,6 +4912,7 @@ static DWORD WINAPI Worker(LPVOID) {
         }
         if(mortal_voice)PollMortalTrial(mortal_consumer,mortal_audio);
         if(g_cmb.AnyOn()||g_hud_on)PollCombat();
+        if(g_hud_on){PollHudRefill();PollHudLetterbox();}   // heart-refill-01 / ztarget-letterbox-01: no-op unless on
         if(g_cmb.SwordActions())SwordPollAudio();
         zlr::PollAudio();
         if(g_sg_on)GuardPollAudio();

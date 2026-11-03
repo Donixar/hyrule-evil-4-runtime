@@ -4,7 +4,7 @@
 #include "sword_particles_def.h"
 
 namespace link_runtime::sword_particles {
-enum class Effect:uint8_t {HitOkA,HitOkB,HitOkC,HitOkD,HitCrA,HitCrB,HitCrC,HitCrD,Hibana,Kikuzu,SpinSparkle,Leaves,Dust,Count};
+enum class Effect:uint8_t {HitOkA,HitOkB,HitOkC,HitOkD,HitCrA,HitCrB,HitCrC,HitCrD,Hibana,Kikuzu,SpinSparkle,Leaves,Dust,FeatherWhite,Count};
 inline constexpr Def kDefs[]={
     // ZI_J_HITOK_A (id 0x119, fingerprint 1b35da8fd17a, from common.jpc)
     {"ZI_J_HITOK_A",0x119,"1b35da8fd17a","zl2_glowLine01",
@@ -252,6 +252,25 @@ inline constexpr Def kDefs[]={
      {true,0.0f,365.4932f,0.9f,0.25f,0.0f},
      // fields: type, add type, world, enable, disable, fade in, fade out, direction, magnitude (cm per frame^2 or rad per frame), enable/disable/fade in/fade out times
      1,{{FieldType::Gravity,0,true,false,true,false,false,{0.0f,1.0f,0.0f},0.025f,0.0f,0.75f,0.0f,1.0f},
+        {FieldType::Gravity,0,false,false,false,false,false,{0.0f,0.0f,0.0f},0.0f,0.0f,0.0f,0.0f,0.0f}}},
+    // ZI_S_NI_HANE_WHITE (id 0x2C2, fingerprint 1c09e50d159b, from Pscene010.jpc)
+    {"ZI_S_NI_HANE_WHITE",0x2C2,"1c09e50d159b","zl2_hane_white",
+     // dynamics: volume, size cm, sweep, min radius, div, fixed density/interval, inherit scale, follow; scale, translation cm, direction, rotation deg;
+     // omni/axis/random/direction cm per frame, spread, ratio random; rate, rate random, every, max frame, start frame; life frames, life random, air, moment random
+     {Volume::Sphere,25.0f,1.0f,1.0f,5,false,false,false,false,
+      {1.0f,1.0f,1.0f},{0.0f,30.0f,0.0f},{0.0f,1.0f,0.0f},{0.0f,0.0f,0.0f},
+      10.0f,5.0f,0.0f,20.0f,0.5f,0.25f,
+      0.1f,0.0f,1,0,0,60.0f,0.3f,0.8f,0.375f},
+     // look: shape, dir type, bottom anchored, quad cm, additive, formula; prm, env, prm a, env a, anim, max frame, loop offset/mask; keys
+     {Shape::Billboard,DirType::Position,false,{20.0f,7.5f},false,Formula::PrmTex,
+      0xFFFFFF,0x000000,255,255,ColourAnim::Random,10,10,255,
+      0,0,{{0,0x000000,0},{0,0x000000,0},{0,0x000000,0},{0,0x000000,0}},{{0,0x000000,0},{0,0x000000,0},{0,0x000000,0},{0,0x000000,0}}},
+     // scale: on, xy differ, in/out timing, in/out x, in/out y, random; alpha: on, in/out timing, in, base, out; rotate: on, init deg, random deg, speed deg per frame, speed random, direction
+     {true,false,0.0f,0.75f,0.0f,0.25f,0.0f,0.25f,0.375f},
+     {true,0.0f,0.75f,0.0f,1.0f,0.0f},
+     {true,0.0f,365.4932f,2.52f,0.25f,0.0f},
+     // fields: type, add type, world, enable, disable, fade in, fade out, direction, magnitude (cm per frame^2 or rad per frame), enable/disable/fade in/fade out times
+     1,{{FieldType::Gravity,0,false,true,false,false,false,{0.0f,-1.0f,0.0f},0.1f,0.25f,1.0f,0.0f,1.0f},
         {FieldType::Gravity,0,false,false,false,false,false,{0.0f,0.0f,0.0f},0.0f,0.0f,0.0f,0.0f,0.0f}}}
 };
 static_assert(sizeof(kDefs)/sizeof(kDefs[0])==unsigned(Effect::Count),"one table per effect");

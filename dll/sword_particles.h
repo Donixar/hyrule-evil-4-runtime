@@ -277,7 +277,12 @@ struct Particle {
 };
 // Where an effect goes: the origin (world mm), its frame (world = frame * local; the resource's own rotation and
 // translation are applied inside it) and the colour change.
-struct Placement {V3 origin;M3 frame=M3::Identity();Paint paint;double size=1.0;};   // size: x the drawn size
+struct Placement {V3 origin;M3 frame=M3::Identity();Paint paint;double size=1.0;   // size: x the drawn size
+    // Cucco feathers (F-11): TP's emitter->setRate / setDirectionalSpeed after creating the emitter (d_a_ni.cpp
+    // hane_set), and `full` = this emitter throws its whole count (SwordParticlesAmount is for the sword's bits only).
+    // A negative or non-finite override keeps the resource's value; the sword effects never set them.
+    double rate=-1.0,dir_speed=-1.0;bool full=false;
+};
 // JPABaseParticle::calc_p: one TP frame of one particle (age, fields with their fades, air, moment, position, spin).
 // false: it died at this tick (age reached its life).
 inline bool StepParticle(Particle& p){
@@ -306,7 +311,8 @@ inline const char* StepName(Step s){
 }
 // Game thread only. Counters are atomics so the worker can log them.
 class System {
-    struct Emitter {bool alive=false;uint8_t effect=0;uint16_t tick=0;bool emitted=false;double acc=0;V3 origin;M3 frame{};Paint paint;double size=1.0;};
+    struct Emitter {bool alive=false;uint8_t effect=0;uint16_t tick=0;bool emitted=false;double acc=0;V3 origin;M3 frame{};Paint paint;double size=1.0;
+        double rate=-1.0,dir_speed=-1.0;bool full=false;};   // Placement's overrides (F-11)
     Particle p_[kPool];Emitter e_[kEmitters];Rng rng_;
     bool clock_=false;double anchor_=0;uint64_t ticks_=0;   // tick n at anchor_ + n * kTickMs
     bool scene_=false;uint32_t room_=0,player_=0;unsigned alive_=0,emitters_=0;
@@ -350,11 +356,12 @@ class System {
         V3 v;
         if(y.omni)v=Add(v,Mul(Unit(omni),y.omni));
         if(y.axis)v=Add(v,Mul(Unit(axis),y.axis));
-        if(y.dir_speed){
+        const double dir_speed=e.dir_speed>=0.0?e.dir_speed:double(y.dir_speed);   // setDirectionalSpeed (F-11)
+        if(dir_speed){
             const V3 d0=Unit({y.direction[0],y.direction[1],y.direction[2]},{0,1,0});
             const double tilt=rng_.ZP()*y.spread*kPi,roll=Binary(double(rng_.SS()));
             const V3 u=Perpendicular(d0),w=Cross(d0,u);
-            v=Add(v,Mul(Add(Mul(d0,std::cos(tilt)),Mul(Add(Mul(u,std::cos(roll)),Mul(w,std::sin(roll))),std::sin(tilt))),y.dir_speed));
+            v=Add(v,Mul(Add(Mul(d0,std::cos(tilt)),Mul(Add(Mul(u,std::cos(roll)),Mul(w,std::sin(roll))),std::sin(tilt))),dir_speed));
         }
         if(y.random)v=Add(v,Mul(V3{rng_.ZH(),rng_.ZH(),rng_.ZH()},y.random));
         v=Mul(v,1.0+y.ratio_random*rng_.ZP());
@@ -393,12 +400,13 @@ class System {
             unsigned n;
             if(y.fixed_interval)n=y.div_number;
             else{
-                const double add=double(y.rate)*(1.0+double(y.rate_random)*rng_.ZP());
+                const double rate=e.rate>=0.0?e.rate:double(y.rate);   // setRate (F-11)
+                const double add=rate*(1.0+double(y.rate_random)*rng_.ZP());
                 e.acc+=add>0?add:0;n=unsigned(e.acc);e.acc-=n;
                 if(!e.emitted&&!n&&add>0)n=1;   // the first emission rounds 0 < n < 1 up to 1
             }
             e.emitted=true;
-            if(n&&amount_<1.0){const long m=std::lround(double(n)*amount_);n=m<1?1u:unsigned(m);}   // SwordParticlesAmount
+            if(n&&amount_<1.0&&!e.full){const long m=std::lround(double(n)*amount_);n=m<1?1u:unsigned(m);}   // SwordParticlesAmount
             for(unsigned i=0;i<n;++i)Spawn(e,d,i,n);
         }
         if(k+1>=frames){e.alive=false;--emitters_;}
@@ -455,6 +463,7 @@ public:
         if(!e){refused_.fetch_add(1);return false;}
         const Def& d=DefOf(effect);
         *e=Emitter{};e->alive=true;e->effect=uint8_t(effect);e->frame=at.frame;e->paint=at.paint;e->size=at.size;
+        e->rate=std::isfinite(at.rate)?at.rate:-1.0;e->dir_speed=std::isfinite(at.dir_speed)?at.dir_speed:-1.0;e->full=at.full;
         e->origin=Add(at.origin,Apply(at.frame,Mul(V3{d.dyn.translation_cm[0],d.dyn.translation_cm[1],d.dyn.translation_cm[2]},kCm)));
         ++emitters_;
         Run(*e);

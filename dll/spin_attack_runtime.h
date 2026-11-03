@@ -1063,8 +1063,10 @@ static void ParticlesOff(){
     if(g_part.Busy()||g_part_blade.lease){g_part.Reset();g_part_blade=PartBlade{};g_part_watch.Reset();}
     g_part_scanned=false;g_part_alive.store(0);
 }
+#include "cucco_feathers_runtime.h"   // F-11 Cucco feathers (3.5.0): CuccoFrame, StartCuccoFeathers, PollCuccoFeathers
 static void ParticlesFrame(){
     namespace spd=link_runtime::sword_particles::draw;
+    CuccoFrame();   // F-11: first, before the returns below (no sword move needed); no-op unless CuccoFeathers=1 started
     if(!g_part_on.load(std::memory_order_acquire))return;
     if(!g_part_cfg.on){ParticlesOff();return;}
     g_part.Amount(g_part_cfg.amount);

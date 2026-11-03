@@ -50,6 +50,8 @@ cl /nologo /std:c++17 /W4 /WX /O2 /MT /EHsc tests\native\test_parry_line.cpp /I"
 if defined PIN_IMAGE ("%BUILD%\test_parry_line.exe" "%PIN_IMAGE%" || exit /b 1) else ("%BUILD%\test_parry_line.exe" || exit /b 1)
 cl /nologo /std:c++17 /W4 /WX /O2 /MT /EHsc tests\native\test_parry_pushback.cpp /Fo"%BUILD%\test_parry_pushback.obj" /Fe"%BUILD%\test_parry_pushback.exe" || exit /b 1
 "%BUILD%\test_parry_pushback.exe" || exit /b 1
+cl /nologo /std:c++17 /W4 /WX /O2 /MT /EHsc tests\native\test_parry_observe_log.cpp /Fo"%BUILD%\test_parry_observe_log.obj" /Fe"%BUILD%\test_parry_observe_log.exe" || exit /b 1
+"%BUILD%\test_parry_observe_log.exe" || exit /b 1
 rem Direct parry: native contact shims and fixed-damage admission.
 cl /nologo /std:c++17 /W4 /WX /O2 /MT /EHsc tests\native\test_parry_direct_routes.cpp /I"%MH%\include" /Fo"%BUILD%\test_parry_direct_routes.obj" /Fe"%BUILD%\test_parry_direct_routes.exe" /link "%BUILD%\minhook.lib" || exit /b 1
 if defined PIN_IMAGE ("%BUILD%\test_parry_direct_routes.exe" "%PIN_IMAGE%" || exit /b 1) else ("%BUILD%\test_parry_direct_routes.exe" || exit /b 1)

@@ -59,12 +59,31 @@ inline constexpr const auto& kPins = native_pins::kOcarinaStaff;   // the same I
 // ---------------------------------------------------------------- configuration ([Hud] in link_runtime.ini)
 constexpr unsigned kDefaultHeartLife = 120, kMinHeartLife = 40, kMaxHeartLife = 600;
 constexpr int kMaxHearts = 20, kRow = 10;   // TP: 20 hearts, rows of 10
+constexpr unsigned kDefaultRefillVolume = 60;
+// TP d_camera.cpp defaultTriming: 35 of 448 lines (7.8 %) per bar; 8 % of the visible HUD height (28.8 of 360 rows at
+// 16:9, 72 px at 1600x900). The bottom-bar clip: the left edge of the native ring at 16:9 (ocarina_staff.h: x ~172).
+constexpr unsigned kDefaultLetterboxHeight = 8, kMinLetterboxHeight = 4, kMaxLetterboxHeight = 10;
+constexpr unsigned kDefaultLetterboxClipX = 168, kMinTopRows = 4, kMaxTopRows = 40;
 struct Config {
     bool hearts = false;        // TpHearts=1
     bool meter = false;         // TpShieldMeter=1 (drawn only while the shield feature is active)
     bool hide_native = false;   // HideNativeLife=1 (only while our hearts are shown)
     bool hide_disc = false;     // HideNativeLifeDisc=1 (unitNo 0x02 too; unverified)
     unsigned heart_life = kDefaultHeartLife;   // HeartLife: life per heart (Leon starts at 1200 = 10 hearts)
+    // heart-refill-01 (3.5.0 F-01): TP's quarter-by-quarter refill of the DRAWN hearts (the life itself is native).
+    bool refill = false;            // HeartRefill=1 (only with TpHearts=1)
+    bool refill_sound = false;      // HeartRefillSound=1: Z2SE_HP_GAUGE_INC per whole heart (Bin32/link_heart_refill.wav)
+    bool refill_sound_end = false;  // HeartRefillSoundEnd=1: plan B2, one tick at the end of each refill instead
+    unsigned refill_volume = kDefaultRefillVolume;   // HeartRefillVolumePercent 0..100
+    // ztarget-letterbox-01 (3.5.0 F-09): TP's cinema bars while Z-locked (or neutral Z), two fixed units of the painter.
+    bool letterbox = false;               // ZTargetLetterbox=1 (only with TpHearts=1: the painter of the hearts draws them)
+    unsigned letterbox_height = kDefaultLetterboxHeight;   // ZTargetLetterboxHeight: percent of the visible height, 4..10
+    bool letterbox_start = false;         // LetterboxOrder=start: bars first in the table (A/B of the draw order)
+    bool letterbox_instant = false;       // LetterboxInstant=1: plan B1, no easing
+    bool letterbox_no_bottom = false;     // LetterboxNoBottom=1: plan B2, the top bar only
+    bool letterbox_clip = false;          // LetterboxClipBottom=1: the bottom bar ends at LetterboxClipX (ammo ring)
+    unsigned letterbox_clip_x = kDefaultLetterboxClipX;   // LetterboxClipX 0..320, HUD units right of the centre
+    unsigned letterbox_top_rows = 0;      // LetterboxTopRows 4..40 HUD rows for the top bar (0: same as the bottom)
     unsigned problems = 0;
     bool Any() const { return hearts || meter; }
 };
@@ -81,7 +100,41 @@ template <class ReadInt> Config ReadConfig(ReadInt read) {
     const unsigned life = read(L"HeartLife", kDefaultHeartLife);
     if (life < kMinHeartLife || life > kMaxHeartLife || life % 4) ++c.problems;
     else c.heart_life = life;
+    // The refill draws the hearts: without TpHearts=1 its keys are read (for their problems) but stay off.
+    c.refill = on(L"HeartRefill") && c.hearts;
+    c.refill_sound = on(L"HeartRefillSound") && c.refill;
+    c.refill_sound_end = on(L"HeartRefillSoundEnd") && c.refill_sound;
+    const unsigned volume = read(L"HeartRefillVolumePercent", kDefaultRefillVolume);
+    if (volume > 100) ++c.problems;
+    else c.refill_volume = volume;
+    // Letterbox: same rule (the bars are units of the hearts' painter). LetterboxOrder is a word (ParseOrder).
+    c.letterbox = on(L"ZTargetLetterbox") && c.hearts;
+    const unsigned height = read(L"ZTargetLetterboxHeight", kDefaultLetterboxHeight);
+    if (height < kMinLetterboxHeight || height > kMaxLetterboxHeight) ++c.problems;
+    else c.letterbox_height = height;
+    c.letterbox_instant = on(L"LetterboxInstant"); c.letterbox_no_bottom = on(L"LetterboxNoBottom");
+    c.letterbox_clip = on(L"LetterboxClipBottom");
+    const unsigned clip_x = read(L"LetterboxClipX", kDefaultLetterboxClipX);
+    if (clip_x > 320) ++c.problems;
+    else c.letterbox_clip_x = clip_x;
+    const unsigned top = read(L"LetterboxTopRows", 0u);
+    if (top && (top < kMinTopRows || top > kMaxTopRows)) ++c.problems;
+    else c.letterbox_top_rows = top;
     return c;
+}
+// LetterboxOrder=end|start (missing or empty: end). Returns false for any other word (a problem; end kept).
+inline bool ParseOrder(const wchar_t* s, bool& start) {
+    start = false;
+    if (!s || !*s) return true;
+    auto same = [](const wchar_t* a, const char* b) {
+        for (; *a && *b; ++a, ++b) {
+            const wchar_t c = (*a >= L'A' && *a <= L'Z') ? wchar_t(*a + 32) : *a;
+            if (c != wchar_t(*b)) return false;
+        }
+        return !*a && !*b;
+    };
+    if (same(s, "start")) { start = true; return true; }
+    return same(s, "end");
 }
 
 // ---------------------------------------------------------------- hearts from life
@@ -145,10 +198,12 @@ struct Geometry {
     float heart = 20.0f, dx = 19.0f, dy = 18.0f;
     float meter_x = -282.0f, meter_y = 0, meter_w = 120.0f, meter_h = 12.0f, inset = 3.0f;   // rim left edge, centre y
     float cap_w = 36.0f, cap_h = 12.0f;   // hud-tp-02: the ornament spans the frame's height (was 8)
+    float half_h = 180.0f;                // the visible half height (ztarget-letterbox-01: the bars hang from it)
 };
 constexpr float kLeftMargin = 16.0f, kTopMargin = 14.0f, kMeterGap = 5.0f, kCapOverlap = 4.0f;
 inline Geometry Fit(float half_h, int rows) {
     Geometry g;
+    g.half_h = half_h;
     g.x0 = -320.0f + kLeftMargin + g.heart * 0.5f;
     g.y0 = half_h - kTopMargin - g.heart * 0.5f;
     g.meter_x = -320.0f + kLeftMargin + 22.0f;   // the spiral cap hangs left of the rim, its tail at the rim's end
@@ -160,36 +215,218 @@ inline float HeartX(const Geometry& g, int i) { return g.x0 + (i % kRow) * g.dx;
 inline float HeartY(const Geometry& g, int i) { return g.y0 - (i / kRow) * g.dy; }
 inline int Rows(int hearts) { return hearts <= 0 ? 0 : (hearts + kRow - 1) / kRow; }
 
+// ---------------------------------------------------------------- heart refill (heart-refill-01, 3.5.0 F-01)
+// TP d_meter2.cpp:646-675: mNowLifeGauge climbs one quarter per 30 Hz frame towards the life and plays
+// Z2SE_HP_GAUGE_INC whenever it lands on a multiple of 4 (one tick per whole heart). Here: one quarter every
+// kRefillFrames 60 Hz frames of game time (133 ms a heart, 10 hearts in 1.33 s). Only the DRAWN value chases: the
+// native life changes at once, damage drops the drawing at once, Danger / LowHealth keep reading the real life.
+// Frozen out of play (case, menus, events) and animated from where it was when play resumes. Snaps without
+// animation or ticks on the first frame, a load (SYS_LOAD_GAME), a new character, a new room and death (hp <= 0,
+// and the first living frame after it: the continue). A new heart container (UnitCount changes, the painter
+// re-arms) is not a snap: the new heart is born empty and fills with its tick.
+// The tick: scripts/heart_refill_sound.py (Z2SE_HP_GAUGE_INC trimmed to 180 ms, 60 ms fade, peak 0.8, mono 16-bit
+// 32 kHz), Bin32/link_heart_refill.wav, SHA-pinned; missing or changed mutes the tick only.
+inline constexpr const wchar_t* kRefillSoundFile = L"link_heart_refill.wav";
+inline constexpr const char* kRefillSoundSha = "0491fc8d9424de95386c988d96a7188705e07e21e3ea20dc552a5dbb02d7033e";
+constexpr double kRefillFrames = 2;          // 60 Hz frames per quarter
+constexpr unsigned kRefillMaxPending = 4;    // ticks queued for the sound at most (a hitch never plays a long trail)
+enum class Snap : uint8_t { None, First, Load, Character, Room, Death };
+inline const char* SnapName(Snap s) {
+    switch (s) {
+    case Snap::First: return "first"; case Snap::Load: return "load"; case Snap::Character: return "character";
+    case Snap::Room: return "room"; case Snap::Death: return "death"; default: return "none";
+    }
+}
+struct RefillIn {
+    int target = 0;            // Quarters(hp, hearts, heart_life): what the real life shows
+    double dt = 1;             // 60 Hz frames of this logic frame (game_clock Step60)
+    bool play = true;          // in play: the HUD is up
+    uint32_t room = 0;         // global+0x4FAC
+    uint8_t character = 0;     // pl_type
+    int hp = 0;
+    bool load = false;         // SYS_LOAD_GAME seen since the last frame
+};
+struct RefillDone { int from = 0, to = 0; unsigned ticks = 0; double ms = 0; };
+class Refill {
+    bool init_ = false, dead_ = false, load_ = false; int shown_ = 0; double acc_ = 0;
+    uint32_t room_ = 0; uint8_t character_ = 0;
+    bool chasing_ = false; int from_ = 0; unsigned chase_ticks_ = 0; double chase_frames_ = 0;
+    unsigned pending_ = 0; bool end_tick_ = false;
+    bool done_ = false; RefillDone last_{};
+    void Queue() { if (pending_ < kRefillMaxPending) ++pending_; }
+    void Finish() {
+        chasing_ = false; acc_ = 0;
+        last_ = {from_, shown_, chase_ticks_, chase_frames_ * 1000.0 / 60.0}; done_ = true;
+        if (end_tick_ && shown_ > from_) Queue();   // plan B2: one tick when the drawing reaches the life
+    }
+public:
+    explicit Refill(bool end_tick = false) : end_tick_(end_tick) {}
+    int shown() const { return shown_; }
+    bool chasing() const { return chasing_; }
+    // One logic frame. Returns the snap reported this frame (None: no snap, or a silent one while dead / loading).
+    Snap Update(const RefillIn& in) {
+        const int target = in.target < 0 ? 0 : in.target;
+        Snap why = Snap::None; bool snap = false;
+        if (!init_) { why = Snap::First; snap = true; }
+        else if (in.load) { snap = true; if (!load_) why = Snap::Load; }
+        else if (in.character != character_) { why = Snap::Character; snap = true; }
+        else if (in.room != room_) { why = Snap::Room; snap = true; }
+        else if (in.hp <= 0) { snap = true; if (!dead_) why = Snap::Death; }
+        else if (dead_) { why = Snap::Death; snap = true; }   // the continue: back to life without a refill
+        init_ = true; load_ = in.load; room_ = in.room; character_ = in.character; dead_ = in.hp <= 0;
+        if (snap) { shown_ = target; acc_ = 0; chasing_ = false; return why; }
+        if (target < shown_) shown_ = target;   // damage: at once, the chase (if any) goes on from there
+        if (in.play && shown_ < target) {
+            if (!chasing_) { chasing_ = true; from_ = shown_; chase_ticks_ = 0; chase_frames_ = 0; acc_ = 0; }
+            const double dt = std::isfinite(in.dt) && in.dt > 0 && in.dt < 10 ? in.dt : 1.0;
+            acc_ += dt; chase_frames_ += dt;
+            while (acc_ >= kRefillFrames && shown_ < target) {
+                acc_ -= kRefillFrames; ++shown_;
+                if (shown_ % 4 == 0) { ++chase_ticks_; if (!end_tick_) Queue(); }
+            }
+        }
+        if (chasing_ && shown_ >= target) Finish();
+        return Snap::None;
+    }
+    // Ticks for the sound (game thread -> HudFrame's atomic -> poll thread).
+    unsigned TakeTicks() { const unsigned n = pending_; pending_ = 0; return n; }
+    bool TakeDone(RefillDone& out) { if (!done_) return false; out = last_; done_ = false; return true; }
+};
+// Poll thread: plays the queued ticks at most one per kTickGapMs, alternating two voices so a tick never cuts the
+// previous one short (no click on a chained refill).
+constexpr unsigned kTickGapMs = 60;
+struct TickPacer {
+    unsigned pending = 0, voice = 0; uint64_t last = 0; bool played = false;
+    // Adds the new ticks; returns the voice (0 / 1) to play now, or -1.
+    int Poll(unsigned added, uint64_t now_ms) {
+        pending += added;
+        if (pending > kRefillMaxPending) pending = kRefillMaxPending;
+        if (!pending || (played && now_ms - last < kTickGapMs)) return -1;
+        --pending; played = true; last = now_ms; voice ^= 1u;
+        return int(voice);
+    }
+};
+
 // ---------------------------------------------------------------- what the HUD shows
 struct UnitView { bool visible = false; uint8_t tex_no = 0; float x = 0, y = 0, w = 0, h = 0; uint8_t rgba[4] = {255, 255, 255, 255}; };
 struct Inputs {
     bool leon = false;          // life readable and the player is Leon/Link (pl_type 0); Zelda's segment draws nothing
     int hp = 0, max_hp = 0;
     MeterState meter;
+    // heart-refill-01: read only with HeartRefill=1 (the defaults keep the 3.4.3 path for every older caller).
+    bool play = true; uint32_t room = 0; uint8_t character = 0; bool load = false;
+    // ztarget-letterbox-01: Z-locked or neutral Z (ztarget runtime); read only with ZTargetLetterbox=1.
+    bool lock = false;
 };
+// ---------------------------------------------------------------- Z-target letterbox (ztarget-letterbox-01, 3.5.0 F-09)
+// TP d_camera.cpp:1549 eases the trim 0.25 per 30 Hz frame: per 60 Hz frame of dt, k = 1 - 0.75^(dt/2) (90 % in
+// ~0.27 s, out on the same curve). Two units always armed at the end (or the start, LetterboxOrder=start) of the
+// hearts' table while ZTargetLetterbox=1, invisible without a lock, so a lock never changes UnitCount nor re-arms the
+// painter. Frame 7 (kFrameFill, 64x32: rows 1..30 opaque) tinted 0x000000FF; the quad is kBarOverscan wider than the
+// 640 plane and 32/28 taller than the bar, so only its opaque rows fall on the bar and its soft rows outside the screen
+// (outer edge) or as a 1/28 fringe (inner edge). Out of play (case, menus) the bars drop at once.
+constexpr int kLetterboxUnits = 2;
+constexpr float kBarOverscan = 32.0f, kBarTexelSpan = 32.0f / 28.0f;
+constexpr double kBarEase = 0.75, kBarFull = 0.9, kBarClear = 0.1;
+enum BarEvent : unsigned { BarNone = 0, BarIn = 1, BarFull = 2, BarOut = 4, BarClear = 8 };
+inline double BarStep(double s, bool on, double dt) {
+    const double target = on ? 1.0 : 0.0;
+    if (!std::isfinite(dt) || dt <= 0 || dt >= 10) dt = 1.0;
+    s += (target - s) * (1.0 - std::pow(kBarEase, dt / 2.0));
+    if (std::fabs(target - s) < 0.002) s = target;
+    return s;
+}
 class Hud {
-    Config cfg_; Inputs in_; double t_ = 0; int hearts_ = 0, quarters_ = 0;
+    Config cfg_; Inputs in_; double t_ = 0; int hearts_ = 0, quarters_ = 0, target_ = 0;
+    Refill refill_; Snap snap_ = Snap::None;
+    double bar_ = 0, bar_ms_ = 0; bool bar_on_ = false, bar_full_ = false, bar_clear_ = true;
+    unsigned bar_events_ = BarNone; double bar_full_ms_ = 0, bar_clear_ms_ = 0;
+    void BarUpdate(const Inputs& in, double dt) {
+        if (!cfg_.letterbox) { bar_ = 0; return; }
+        const bool on = in.lock && in.play && hearts_ > 0;
+        if (!in.play) bar_ = 0;   // the case / menus: no bars, and none left to ease out on return
+        if (on != bar_on_) {
+            bar_on_ = on; bar_ms_ = 0; bar_full_ = false; bar_clear_ = false;
+            bar_events_ |= on ? BarIn : BarOut;
+        }
+        const double step = std::isfinite(dt) && dt > 0 && dt < 10 ? dt : 1.0;
+        bar_ms_ += step * 1000.0 / 60.0;
+        bar_ = cfg_.letterbox_instant ? (on ? 1.0 : 0.0) : BarStep(bar_, on, step);
+        if (on && !bar_full_ && bar_ >= kBarFull) { bar_full_ = true; bar_events_ |= BarFull; bar_full_ms_ = bar_ms_; }
+        if (!on && !bar_clear_ && bar_ <= kBarClear) { bar_clear_ = true; bar_events_ |= BarClear; bar_clear_ms_ = bar_ms_; }
+    }
+    // Unit index of the first bar and of the first heart, by LetterboxOrder.
+    int BarBase() const { return cfg_.letterbox_start ? 0 : hearts_ + (cfg_.meter ? kMeterUnits : 0); }
+    int HeartBase() const { return cfg_.letterbox && cfg_.letterbox_start ? kLetterboxUnits : 0; }
 public:
-    explicit Hud(Config c = {}) : cfg_(c) {}
-    void Configure(const Config& c) { cfg_ = c; }
+    explicit Hud(Config c = {}) : cfg_(c), refill_(c.refill_sound_end) {}
+    void Configure(const Config& c) { cfg_ = c; refill_ = Refill(c.refill_sound_end); }
     const Config& config() const { return cfg_; }
+    // LetterboxOrder changed live (the bot's A/B): the layout changes, so the painter re-arms (LayoutKey).
+    void SetOrder(bool start) { cfg_.letterbox_start = start; }
+    unsigned LayoutKey() const { return cfg_.letterbox && cfg_.letterbox_start ? 1u : 0u; }
     void Update(const Inputs& in, double dt) {
         in_ = in;
         if (std::isfinite(dt) && dt > 0 && dt < 10) t_ += dt;
         if (t_ > 1e7) t_ = std::fmod(t_, kBeatPeriod * kDangerPeriod);
         hearts_ = cfg_.hearts && in.leon ? HeartCount(in.max_hp, cfg_.heart_life) : 0;
-        quarters_ = Quarters(in.hp, hearts_, cfg_.heart_life);
+        target_ = Quarters(in.hp, hearts_, cfg_.heart_life);
+        snap_ = Snap::None;
+        if (!cfg_.refill) quarters_ = target_;   // HeartRefill=0: the 3.4.3 drawing
+        else {
+            RefillIn r; r.target = target_; r.dt = dt; r.play = in.play; r.room = in.room; r.character = in.character;
+            r.hp = in.hp; r.load = in.load;
+            snap_ = refill_.Update(r);
+            quarters_ = refill_.shown();
+        }
+        BarUpdate(in, dt);
+    }
+    double bar() const { return bar_; }             // 0..1 of the bars' height
+    bool bar_on() const { return bar_on_; }
+    // Edges since the last call (BarIn / BarFull / BarOut / BarClear) and the ms from the edge to full / clear.
+    unsigned TakeBarEvents(double& full_ms, double& clear_ms) {
+        const unsigned e = bar_events_; bar_events_ = BarNone; full_ms = bar_full_ms_; clear_ms = bar_clear_ms_; return e;
+    }
+    // A bar's height in HUD rows (top: LetterboxTopRows when set), at full extension.
+    float BarRows(const Geometry& g, bool top) const {
+        if (top && cfg_.letterbox_top_rows) return float(cfg_.letterbox_top_rows);
+        return float(cfg_.letterbox_height) * 0.01f * 2.0f * g.half_h;
+    }
+    UnitView BarView(int k, const Geometry& g) const {   // k 0 = top, 1 = bottom
+        UnitView v;
+        const bool top = k == 0;
+        if (!top && cfg_.letterbox_no_bottom) return v;
+        const float band = BarRows(g, top) * float(bar_);
+        if (band <= 0.25f) return v;
+        float left = -320.0f - kBarOverscan, right = 320.0f + kBarOverscan;
+        if (!top && cfg_.letterbox_clip) right = float(cfg_.letterbox_clip_x);
+        v.visible = right - left > 0.25f; v.tex_no = kFrameFill;
+        v.rgba[0] = v.rgba[1] = v.rgba[2] = 0; v.rgba[3] = 255;
+        v.w = right - left; v.x = (left + right) * 0.5f;
+        v.h = band * kBarTexelSpan;   // the opaque rows (2/32..30/32 of the quad) span exactly the band
+        const float c = g.half_h - band * 0.5f;
+        v.y = top ? c : -c;
+        return v;
     }
     int hearts() const { return hearts_; }
-    int quarters() const { return quarters_; }
+    int quarters() const { return quarters_; }      // drawn (the refill's value with HeartRefill=1)
+    int target_quarters() const { return target_; } // the real life's
+    Snap snap() const { return snap_; }             // reported by the last Update
+    Refill& refill() { return refill_; }
     bool HeartsShown() const { return hearts_ > 0; }
     bool MeterShown() const { return cfg_.meter && in_.leon && in_.meter.on && in_.meter.max > 0; }
     bool Shown() const { return HeartsShown() || MeterShown(); }
-    // Units: hearts first (as many as containers), then the meter's four. Changes when a herb adds a heart.
-    int UnitCount() const { return hearts_ + (cfg_.meter ? kMeterUnits : 0); }
+    // Units: hearts first (as many as containers), then the meter's four, then the letterbox's two (ZTargetLetterbox=1;
+    // first of all with LetterboxOrder=start). Changes when a herb adds a heart, never with a lock.
+    int UnitCount() const { return hearts_ + (cfg_.meter ? kMeterUnits : 0) + (cfg_.letterbox ? kLetterboxUnits : 0); }
     UnitView View(int unit, const Geometry& g) const {
         UnitView v;
         if (unit < 0 || unit >= UnitCount()) return v;
+        if (cfg_.letterbox) {
+            const int b = unit - BarBase();
+            if (b >= 0 && b < kLetterboxUnits) return BarView(b, g);
+            unit -= HeartBase();
+        }
         if (unit < hearts_) {
             v.visible = true; v.tex_no = uint8_t(kFrameHeart0 + HeartFrame(unit, quarters_));
             const double s = unit == BeatHeart(quarters_) ? BeatScale(t_, Danger(in_.hp)) : 1.0;
@@ -224,7 +461,8 @@ public:
 };
 
 // ---------------------------------------------------------------- IDSystem::set v2 table (ocarina_staff.h BuildTable)
-constexpr int kMaxUnits = kMaxHearts + kMeterUnits;
+// ztarget-letterbox-01: + the two bars (20 hearts + meter + bars = 26; without the 2 the bars would be cut at 24).
+constexpr int kMaxUnits = kMaxHearts + kMeterUnits + kLetterboxUnits;
 constexpr size_t kEntry = staff::kEntry, kTableSize = 8 + kMaxUnits * kEntry;
 inline void BuildTable(uint8_t* t, int units, const Geometry& g) {
     std::memset(t, 0, kTableSize);
@@ -291,7 +529,7 @@ constexpr unsigned kRetryTicks = 600;      // logic frames: 10 s at 60, 20 s at 
 constexpr unsigned kRetriesPerRoom = 3;
 template <class Native> class Painter {
     uint8_t table_[kTableSize] = {}; void* block_ = nullptr; Geometry g_{};
-    uint32_t unit_[kMaxUnits] = {}; int units_ = 0; int rows_ = -1;
+    uint32_t unit_[kMaxUnits] = {}; int units_ = 0; int rows_ = -1; unsigned layout_ = 0;
     bool live_ = false, tex_ = false, failed_ = false;
     bool have_room_ = false; uint32_t room_ = 0; unsigned wait_ = 0, retries_ = 0;
     void Clear() { failed_ = false; wait_ = 0; retries_ = 0; }
@@ -360,7 +598,7 @@ public:
         const int want = hud.UnitCount();
         if (live_) {
             for (int i = 0; i < units_; ++i) if (!Ours(n, unit_[i], uint8_t(i))) { live_ = false; units_ = 0; return PaintWhy::Lost; }
-            if (want != units_) KillUnits(n);   // a heart more (or less): re-arm with the new count
+            if (want != units_ || hud.LayoutKey() != layout_) KillUnits(n);   // a heart more (or less), a new bar order: re-arm
         }
         if (!live_) {
             bool taken = false;
@@ -375,7 +613,7 @@ public:
             g_ = Fit(staff::VisibleHalfHeight(post_y_ > 0 ? post_y_ : staff::kDefaultPostY), rows_);
             BuildTable(table_, want, g_);
             n.Set(table_);
-            live_ = true; units_ = want;
+            live_ = true; units_ = want; layout_ = hud.LayoutKey();
             for (int i = 0; i < want; ++i) {
                 unit_[i] = n.UnitPtr(uint8_t(i));
                 if (!Ours(n, unit_[i], uint8_t(i))) { Drop(n); failed_ = true; return PaintWhy::SetFailed; }   // pool full

@@ -28,7 +28,7 @@ set VCVARS32=C:\path\to\VC\Auxiliary\Build\vcvars32.bat
 scripts\build_link_runtime.bat build
 ```
 
-The script downloads MinHook 1.3.4 (SHA-256 pinned), compiles it, builds and runs the native tests (core, health, damage, trace, log, low health, parry line, direct parry routes, parry pushback and the secondary motion slot), compiles
+The script downloads MinHook 1.3.4 (SHA-256 pinned), compiles it, builds and runs the native tests (core, health, damage, trace, log, low health, parry line, direct parry routes, parry pushback, the secondary motion slot and the parry observation log), compiles
 `dll/link_runtime.cpp` with `/std:c++17 /W4 /WX /O2 /MT /experimental:deterministic` (source paths mapped with
 `/pathmap`) into `build\dinput8.dll` with its version resource (product "Hyrule Evil 4", version from
 `dll/link_runtime_version.h`), and finally checks that the proxy loads and forwards `DirectInput8Create`. It prints
@@ -38,8 +38,8 @@ to the shipped DLL.
 
 ## Version
 
-This source corresponds to Hyrule Evil 4 **3.4.3** (shipped `dinput8.dll` SHA-256
-`def25400912abd52b7aae5bc97feb3e6edda783ae79d4ab53a693e9c7ceaaa0d`). Every released version has a tag: [v3.2.0](../../tree/v3.2.0), [v3.2.1](../../tree/v3.2.1), [v3.3.0](../../tree/v3.3.0), [v3.4.0](../../tree/v3.4.0), [v3.4.1](../../tree/v3.4.1), [v3.4.2](../../tree/v3.4.2), [v3.4.3](../../tree/v3.4.3).
+This source corresponds to Hyrule Evil 4 **3.5.0** (shipped `dinput8.dll` SHA-256
+`8c63bcd07af69a61f89815dc442d969e8b64a2a7852b6236214cf66e2ed10e2e`). Every released version has a tag: [v3.2.0](../../tree/v3.2.0), [v3.2.1](../../tree/v3.2.1), [v3.3.0](../../tree/v3.3.0), [v3.4.0](../../tree/v3.4.0), [v3.4.1](../../tree/v3.4.1), [v3.4.2](../../tree/v3.4.2), [v3.4.3](../../tree/v3.4.3), [v3.5.0](../../tree/v3.5.0).
 Download mirror for the mod releases: https://github.com/Donixar/HyruleEvil4/releases
 
 ## Disclaimer

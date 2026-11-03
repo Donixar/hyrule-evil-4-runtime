@@ -8,6 +8,13 @@
 // player's MotionMove (CmbMoveDetour), after the original call, only when no sword action owns the move; Apply writes
 // X/Z before cPlayer::move runs the native collision on them (as the backflip), so walls stop the slide. A new player,
 // a damaged/dead routine or a failed write ends it. Pure logic plus a templated Apply: no process access of its own.
+//
+// Pause, menu, event (pending 14, 3-nov; review note on 3.4.0 "the heavy pushback can resume late"): the slide only
+// advances by the game step of the player's own MotionMove, so a pause that freezes the game (frame counter still)
+// just suspends it and it finishes the remaining game frames afterwards. When the game ran ticks without that
+// MotionMove (an event, a menu that keeps the counter going, a sword action owning the move) or the counter went back
+// (a load), the native frame counter given to Start/Step jumps: the slide is cancelled (Stop::Gap) instead of
+// resuming late. Frame 0 = counter unknown: no gap check (the legacy wiring and tests).
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -46,26 +53,38 @@ inline bool Direction(const float hit[3], const float link[3], float yaw, float&
     return true;
 }
 
-enum class Stop : uint8_t {None, Finished, Player, Damaged, Write};
+enum class Stop : uint8_t {None, Finished, Player, Damaged, Write, Gap};
 inline const char* StopName(Stop s) {
     switch (s) {case Stop::Finished: return "finished"; case Stop::Player: return "player"; case Stop::Damaged: return "damaged";
-    case Stop::Write: return "write"; default: return "-";}
+    case Stop::Write: return "write"; case Stop::Gap: return "gap"; default: return "-";}
 }
+
+// Native ticks (frame counter +0x530C, one per logic tick at any FPS) the game may run between two of the slide's
+// MotionMoves before the slide counts as interrupted: slack for a native hit-stop (0.18 s at 165 FPS, 0.5 s at 60),
+// far below any menu or event.
+inline constexpr int32_t kMaxGapTicks = 30;
 
 class Slide {
 public:
     // A new heavy block restarts the slide from where Link is (the remaining part of an older one is dropped).
-    bool Start(const Config& c, uint32_t player, float ux, float uz) {
+    // frame: the native frame counter now (0 = unknown).
+    bool Start(const Config& c, uint32_t player, float ux, float uz, uint32_t frame = 0) {
         if (!player || !(c.distance > 0.f) || !std::isfinite(ux) || !std::isfinite(uz)) return false;
         on_ = true; player_ = player; ux_ = ux; uz_ = uz; dist_ = c.distance; frames_ = c.frames < 1.f ? 1.f : c.frames;
-        t_ = 0.f; moved_ = 0.f; stop_ = Stop::None;
+        t_ = 0.f; moved_ = 0.f; stop_ = Stop::None; frame_ = frame;
         return true;
     }
-    // One player MotionMove of `step` 60 Hz frames: the displacement for this tick (0 once finished).
-    bool Step(uint32_t player, float step, float& dx, float& dz) {
+    // One player MotionMove of `step` 60 Hz frames: the displacement for this tick (0 once finished). frame: the
+    // native frame counter of this tick (0 = unknown); a jump past kMaxGapTicks, or back, since the last one cancels.
+    bool Step(uint32_t player, float step, float& dx, float& dz, uint32_t frame = 0) {
         dx = dz = 0.f;
         if (!on_) return false;
         if (player != player_) { Halt(Stop::Player); return false; }
+        if (frame && frame_) {
+            const int32_t gap = static_cast<int32_t>(frame - frame_);   // wraps like the counter
+            if (gap < 0 || gap > kMaxGapTicks) { Halt(Stop::Gap); return false; }
+        }
+        if (frame) frame_ = frame;
         if (!std::isfinite(step) || step <= 0.f) return false;
         const float t0 = t_;
         t_ = t_ + step > frames_ ? frames_ : t_ + step;
@@ -80,7 +99,7 @@ public:
     Stop stop() const { return stop_; }
 private:
     void Halt(Stop why) { if (on_) { on_ = false; stop_ = why; } }
-    bool on_ = false; uint32_t player_ = 0; float ux_ = 0, uz_ = 0, dist_ = 0, frames_ = 1, t_ = 0, moved_ = 0; Stop stop_ = Stop::None;
+    bool on_ = false; uint32_t player_ = 0, frame_ = 0; float ux_ = 0, uz_ = 0, dist_ = 0, frames_ = 1, t_ = 0, moved_ = 0; Stop stop_ = Stop::None;
 };
 
 // Memory: Read / Writable / Write. Adds (dx, dz) to Link's X/Z (+0x94/+0x9C) when both reads agree.
