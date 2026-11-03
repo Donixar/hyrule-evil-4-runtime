@@ -101,6 +101,33 @@ inline uint32_t HandBack(uint32_t previous, uint32_t player, uint32_t image_base
     return 0;
 }
 
+// ------------------------------------------------------------------------------------------------ blend key history
+// arm-fix-01 (2-nov, live repro D:/link-in-re4-work/arm-trace-01): MotionMove sets Mot_flag bit 27 on whatever work 2A8
+// holds, so MotionMoveCore samples every 2A8 work with the parts' "flipped" key histories (cParts+0x19C hist[3..5]: the
+// key index HermiteInterpolation starts its search from; the primary uses hist[0..2]). Our reaction (720 frames) and guard
+// clips leave those indices deep into their own key tables; handed back, the knife stance (42 frames) searched from them,
+// read past its keys and wrote NaN into the forearms' rotation (arm_bad part=8 ang=nan, the stance at weight 0.029). The
+// native code never hands a work back: every MotionSetCore (2611A0) clears all six histories of every part first. A layer
+// that gives 2A8 back to a native work clears hist[3..5] the same way (a search from key 0 is always in range).
+namespace blend_history {
+constexpr uint32_t kFirstPart = 0xF4, kNextPart = 0xF4, kFlipped = 0x19C + 3 * 6, kBytes = 3 * 6;
+constexpr unsigned kMaxParts = 256;
+// Memory: bool Read32(uint32_t address, uint32_t& out); bool Write(uint32_t address, const void* in, size_t n).
+// The number of parts cleared (0: no model or an unreadable chain).
+template <class Memory> unsigned Reset(Memory& m, uint32_t model) {
+    static const unsigned char zero[kBytes] = {};
+    uint32_t node = 0;
+    if (!model || !m.Read32(model + kFirstPart, node)) return 0;
+    unsigned n = 0;
+    while (node >= 0x10000 && n < kMaxParts) {
+        if (!m.Write(node + kFlipped, zero, kBytes)) break;
+        ++n;
+        if (!m.Read32(node + kNextPart, node)) break;
+    }
+    return n;
+}
+}  // namespace blend_history
+
 // ------------------------------------------------------------------------------------------------ watchdog
 // Run once per player MotionMove, after our layers ticked and before the original MotionMove. It acts only on a slot
 // it can attribute: a stance work that is no longer the player's live blend, or one of our works whose layer is idle

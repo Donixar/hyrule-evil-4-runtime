@@ -2364,6 +2364,18 @@ static bool CmbRxInit(uint32_t player){
 // Port of parry_reaction.h. Install mirrors the executed fixture (test_parry_secondary_route.cpp):
 // work+44 = 10000000 only during init, init(player, work, FCV, SEQ, hokan 0, attr 0, 0.0, keep 0),
 // then 2A8 = work, speed C0 = 1 and weight C8 = 0 (override mode, no 80000000).
+// arm-fix-01 (secondary_slot.h blend_history): a hand-back to a native work (the stance, the neck) clears the parts'
+// flipped key histories our clip left, as MotionSetCore does, so the work's next sample searches its own keys from 0.
+struct HistMemory {
+    bool Read32(uint32_t a,uint32_t& v){CmbMem m;return m.Read(a,&v,4);}
+    bool Write(uint32_t a,const void* in,size_t n){CmbMem m;return m.Write(a,in,n);}
+};
+static unsigned g_hist_resets=0;
+static bool CmbGiveSecondary(uint32_t player,uint32_t expected,uint32_t value){
+    LocalMemory m;if(!m.Compare32(player+0x2A8,expected,value))return false;
+    if(value){HistMemory h;if(link_runtime::secondary_slot::blend_history::Reset(h,player))++g_hist_resets;}
+    return true;
+}
 struct CmbReactionPort {
     bool Install(uint32_t player,uint32_t& work){
         if(!g_rx_fcv||!g_rx_seq)return false;
@@ -2376,7 +2388,7 @@ struct CmbReactionPort {
         CmbMem m;return m.Write(player+0x2A8,&work,4);
     }
     uint32_t Secondary(uint32_t player){return CmbGet<uint32_t>(player+0x2A8);}
-    bool ReplaceSecondary(uint32_t player,uint32_t expected,uint32_t value){LocalMemory m;return m.Compare32(player+0x2A8,expected,value);}
+    bool ReplaceSecondary(uint32_t player,uint32_t expected,uint32_t value){return CmbGiveSecondary(player,expected,value);}
     float Weight(uint32_t work){return CmbGet<float>(work+0xC8);}
     void SetWeight(uint32_t work,float w){CmbMem m;m.Write(work+0xC8,&w,4);}
     uint16_t Status(uint32_t work){return CmbGet<uint16_t>(work+0x42);}
@@ -2441,7 +2453,7 @@ struct GuardPort {
         CmbMem m;return m.Write(player+0x2A8,&work,4);
     }
     uint32_t Secondary(uint32_t player){return CmbGet<uint32_t>(player+0x2A8);}
-    bool ReplaceSecondary(uint32_t player,uint32_t expected,uint32_t value){LocalMemory m;return m.Compare32(player+0x2A8,expected,value);}
+    bool ReplaceSecondary(uint32_t player,uint32_t expected,uint32_t value){return CmbGiveSecondary(player,expected,value);}
     float Weight(uint32_t work){return CmbGet<float>(work+0xC8);}
     void SetWeight(uint32_t work,float w){CmbMem m;m.Write(work+0xC8,&w,4);}
     uint16_t Status(uint32_t work){return CmbGet<uint16_t>(work+0x42);}
@@ -2547,6 +2559,31 @@ static const char* SlotKind(uint32_t value,uint32_t player){return ssl::Name(ssl
 static ssl::StanceState SlotStance(uint32_t player){SlotMemory m;return ssl::Check(ssl::ReadStance(m,g_cmb_base,player),player);}
 static bool SlotStanceLive(uint32_t player){return SlotStance(player)==ssl::StanceState::Live;}
 static bool BadArm(ssl::arm::Health h){return h!=ssl::arm::Health::Ok&&h!=ssl::arm::Health::Unread;}
+// arm-trace (2-nov, docs/combate-2026-11-01.md §1): the arm probe runs every frame from a layer's install until 48 frames
+// after it hands 2A8 back, and dumps the first bone that goes bad (cCoord/cParts fields, re4-decomp model.h). Read-only.
+static uint32_t g_arm_trace_until=0;
+static void ArmTraceArm(uint32_t frame){g_arm_trace_until=frame+48;if(!g_arm_trace_until)g_arm_trace_until=1;}
+static uint32_t ArmPartAddr(uint32_t model,unsigned index){
+    uint32_t node=CmbGet<uint32_t>(model+0xF4);
+    for(unsigned i=0;i<index&&node>=0x10000;++i)node=CmbGet<uint32_t>(node+0xF4);
+    return node>=0x10000?node:0;
+}
+static void ArmBadDump(uint32_t who,unsigned part){
+    const uint32_t a=ArmPartAddr(who,part);
+    if(!a){CmbLog("arm_bad part=%u unreadable",part);return;}
+    float f[0x1C4/4]{};CmbMem mem;
+    if(!mem.Read(a,f,sizeof(f))){CmbLog("arm_bad part=%u unreadable",part);return;}
+    auto v=[&](uint32_t off,unsigned k){return f[off/4+k];};
+    uint32_t flags=0;std::memcpy(&flags,&f[0x1C0/4],4);
+    const uint16_t* hist=reinterpret_cast<const uint16_t*>(&f[0x19C/4]);
+    CmbLog("arm_bad part=%u at=0x%08X pos=%g,%g,%g ang=%g,%g,%g scale=%g,%g,%g r_scale=%g,%g,%g lmat=%g,%g,%g,%g|%g,%g,%g,%g|%g,%g,%g,%g "
+        "prev=%g,%g,%g,%g|%g,%g,%g,%g|%g,%g,%g,%g mp_pos=%g,%g,%g mp_rot=%g,%g,%g mp_scale=%g,%g,%g ik=%g flags=0x%08X "
+        "hist=%u,%u,%u %u,%u,%u %u,%u,%u",part,a,v(0x94,0),v(0x94,1),v(0x94,2),v(0xA0,0),v(0xA0,1),v(0xA0,2),v(0xAC,0),v(0xAC,1),v(0xAC,2),
+        v(0xB8,0),v(0xB8,1),v(0xB8,2),v(0x3C,0),v(0x3C,1),v(0x3C,2),v(0x3C,3),v(0x3C,4),v(0x3C,5),v(0x3C,6),v(0x3C,7),v(0x3C,8),v(0x3C,9),
+        v(0x3C,10),v(0x3C,11),v(0xC4,0),v(0xC4,1),v(0xC4,2),v(0xC4,3),v(0xC4,4),v(0xC4,5),v(0xC4,6),v(0xC4,7),v(0xC4,8),v(0xC4,9),
+        v(0xC4,10),v(0xC4,11),v(0x174,0),v(0x174,1),v(0x174,2),v(0x180,0),v(0x180,1),v(0x180,2),v(0x18C,0),v(0x18C,1),v(0x18C,2),
+        v(0x198,0),flags,hist[0],hist[1],hist[2],hist[3],hist[4],hist[5],hist[6],hist[7],hist[8]);
+}
 static void SlotWatch(uint32_t frame,const CmbPlayer& p,bool player,void* model){
     if(!player||!model)return;
     const uint32_t who=reinterpret_cast<uint32_t>(model);
@@ -2569,14 +2606,16 @@ static void SlotWatch(uint32_t frame,const CmbPlayer& p,bool player,void* model)
         CmbLog("secondary_slot foreign slot=0x%08X weight=%.3f frame=%u routine=0x%08X primary=0x%08X (not ours: left alone)",
             slot,CmbGet<float>(slot+ssl::kWeight),frame,p.routine,CmbGet<uint32_t>(who+ssl::kPrimaryMotion));
     }
-    // Arm probe (read-only), every 8 frames in gameplay: a line when an arm bone goes bad, changes, recovers, and every
-    // ~3000 frames while it stays bad, with what 2A8 holds.
-    if(!p.facts.gameplay||(frame-g_arm_frame<8&&frame>=g_arm_frame))return;
+    // Arm probe (read-only), every 8 frames in gameplay (every frame inside an arm trace window): a line when an
+    // arm bone goes bad, changes, recovers, and every ~3000 frames while it stays bad, with what 2A8 holds.
+    const bool tracing=g_arm_trace_until&&frame<=g_arm_trace_until&&frame+64>=g_arm_trace_until;
+    if(!p.facts.gameplay||(!tracing&&frame-g_arm_frame<8&&frame>=g_arm_frame))return;
     g_arm_frame=frame;
     ssl::arm::Part parts[ssl::arm::kLast+1]{};ssl::arm::Report r;
     if(ssl::arm::ReadParts(mem,who,parts))r=ssl::arm::Judge(parts);
     if(r.health==ssl::arm::Health::Unread)return;
     const bool bad=BadArm(r.health),was=BadArm(g_arm_last);
+    if(bad&&!was)ArmBadDump(who,r.part);
     const bool log=(bad&&(!was||r.health!=g_arm_last||r.part!=g_arm_part))||(!bad&&was)||(bad&&frame-g_arm_logged>=3000);
     g_arm_last=r.health;g_arm_part=bad?r.part:0;
     if(!log)return;
@@ -2628,7 +2667,7 @@ static void GuardTick(uint32_t frame,const CmbPlayer& p,bool player,void* model)
     const unsigned gives_before=g_sg_layer->stats().completed+g_sg_layer->stats().cancelled;
     g_sg_layer->Tick(w,port);g_sg_last_tick=GetTickCount64();
     if(g_sg_layer->stats().completed+g_sg_layer->stats().cancelled!=gives_before){   // slot-guard-01: what the exit gave 2A8 back to
-        const auto& e=g_sg_layer->last_exit();
+        const auto& e=g_sg_layer->last_exit();ArmTraceArm(frame);
         CmbLog("shield_guard layer exit previous=0x%08X (%s) restored=0x%08X (%s) wrote=%u cleared=%u stance=%s frame=%u",
             e.previous,SlotKind(e.previous,w.player),e.restored,SlotKind(e.restored,w.player),e.wrote?1U:0U,e.cleared?1U:0U,
             ssl::Name(SlotStance(w.player)),frame);
@@ -3078,6 +3117,7 @@ static void CmbStats(uint32_t frame){
     if(k>=0){const auto& s=g_slot_dog.stats();   // slot-guard-01
         if(s.releases||s.foreign)k+=_snprintf_s(text+k,sizeof(text)-k,_TRUNCATE,"slot releases=%u stale_stance=%u orphan_reaction=%u orphan_guard=%u foreign=%u; ",
             s.releases,s.stale_stance,s.orphan_reaction,s.orphan_guard,s.foreign);}
+    if(k>=0&&g_hist_resets)k+=_snprintf_s(text+k,sizeof(text)-k,_TRUNCATE,"hist_resets=%u; ",g_hist_resets);   // arm-fix-01
     if(g_rip&&k>=0){const auto& s=g_rip->stats();
         k+=_snprintf_s(text+k,sizeof(text)-k,_TRUNCATE,"riposte armed=%u published=%u applied=%u unconfirmed=%u expired=%u busy=%u no_hitpart=%u no_record=%u identity=%u dead=%u excluded=%u rejected=%u lost=%u owner_id=0x%X last_status=%s last_outcome=%s verdict=%s expired_flags=0x%X/0x%X",
             s.armed,s.published,s.applied,s.unconfirmed,s.expired,s.busy,s.no_hitpart,s.no_record,s.identity,s.dead,s.excluded,s.rejected,s.lost,
@@ -3116,6 +3156,7 @@ static void CmbPlayerMove(void* model){
     const bool was=g_rx->Active();CmbReactionPort port;g_rx->Tick(w,port);
     g_rx_last_tick=GetTickCount64();
     if(was!=g_rx->Active()){
+        ArmTraceArm(frame);   // arm-trace: the whole reaction and 48 frames after its hand-back
         if(g_rx->Active())
             CmbLog("parry reaction start frame=%u owner_id=0x%X previous=0x%08X (%s) primary=0x%08X routine=0x%08X",frame,g_rx->stats().owner_id,
                 g_rx->previous(),SlotKind(g_rx->previous(),w.player),CmbGet<uint32_t>(w.player+ssl::kPrimaryMotion),p.routine);

@@ -23,6 +23,12 @@ struct Mem {
             if (a >= at && a + n <= at + bytes.size()) { std::memcpy(out, bytes.data() + (a - at), n); return true; }
         return false;
     }
+    bool Write(uint32_t a, const void* in, size_t n) {
+        if (fail) return false;
+        for (auto& [at, bytes] : blocks)
+            if (a >= at && a + n <= at + bytes.size()) { std::memcpy(bytes.data() + (a - at), in, n); return true; }
+        return false;
+    }
 };
 constexpr uint32_t kBase = 0x540000, kPlayer = 0x2000000;
 constexpr uint32_t kMot0 = 0x30000000, kMot1 = 0x30100000, kMot2 = 0x30200000;
@@ -205,12 +211,38 @@ static void Pins(const char* path) {
     std::printf("secondary slot: %zu native pins match\n", sizeof(pins) / sizeof(pins[0]));
 }
 
+static void TestBlendHistory() {
+    namespace bh = ss::blend_history;
+    Check(bh::kFlipped == 0x1AE && bh::kBytes == 18, "hist[3..5] of cParts::motParts (0x19C + 3 * 6, 3 * 6 bytes)");
+    Mem m;
+    const uint32_t model = 0x5000000, p0 = 0x5100000, p1 = 0x5200000;
+    m.words[model + bh::kFirstPart] = p0; m.words[p0 + bh::kNextPart] = p1; m.words[p1 + bh::kNextPart] = 0;
+    for (uint32_t p : {p0, p1}) m.blocks[p] = std::vector<unsigned char>(0x1D8, 0xAB);
+    Check(bh::Reset(m, model) == 2, "every part of the chain");
+    for (uint32_t p : {p0, p1}) {
+        const auto& b = m.blocks[p];
+        bool zero = true, kept = true;
+        for (uint32_t i = 0; i < 0x1D8; ++i) {
+            const bool in = i >= bh::kFlipped && i < bh::kFlipped + bh::kBytes;
+            if (in) zero = zero && b[i] == 0; else kept = kept && b[i] == 0xAB;
+        }
+        Check(zero, "flipped histories cleared");
+        Check(kept, "the primary's histories (hist[0..2]) and the rest of the part untouched");
+    }
+    Check(bh::Reset(m, 0) == 0, "no model: nothing");
+    Mem bad; bad.words[model + bh::kFirstPart] = p0;
+    Check(bh::Reset(bad, model) == 0, "an unwritable part stops the walk");
+    m.fail = true;
+    Check(bh::Reset(m, model) == 0, "unreadable model: nothing");
+}
+
 int main(int argc, char** argv) {
     Check(argc <= 2, "optional pinned mapped image");
     TestStance();
     TestClassifyAndHandBack();
     TestWatchdog();
     TestArmProbe();
+    TestBlendHistory();
     if (argc == 2) Pins(argv[1]);
     std::printf("secondary slot: %u checks passed%s\n", checks, argc == 2 ? "" : " (no image: native pins skipped)");
     return 0;
