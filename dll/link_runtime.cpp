@@ -46,6 +46,41 @@
 #include "ocarina_staff.h"
 #include "hud_tp.h"
 #include "ocarina_song_effects.h"
+#include "sword_lock_probe.h"
+#include "sword_lock_glyphs.h"
+#include "sword_lock_lab.h"
+// H1c lab duel (sword_lock_lab.h): its runtime code and strings are compiled only into the lab DLL. The lab runner
+// (D:/link-in-re4-work/swordlock-h1c/tools/build.bat) sets CL=/DLINK_SWORD_LOCK_LAB=1; the public build leaves it 0 and
+// carries none of it (scripts/package/build_package.py refuses a DLL that carries the duel's startup line before H1d).
+#include "sword_lock_build.h"   // LINK_SWORD_LOCK (the duel) / LINK_SWORD_LOCK_LAB (the lab tools) / _GRADUATED (3.6.0)
+// The graduated 3.6.0 DLL carries none of the lab's markers (build_package.py LAB_DLL_*): its freeze engine logs as "hold"
+// (the H0 probe's machine without its key), its lines say lab=0 and its assets sit in Bin32\sword_lock\. The lab and public
+// builds keep their exact literals (adjacent literals concatenate: their bytes do not change).
+#if LINK_SWORD_LOCK_GRADUATED
+#define SWL_PROBE_NAME "hold"
+#define SWL_LAB_TAG "lab=0"
+#define SWL_DIR L"sword_lock\\"
+#define SWL_DIR_NAME "sword_lock"
+#else
+#define SWL_PROBE_NAME "probe"
+#define SWL_LAB_TAG "lab=1"
+#define SWL_DIR L"sword_lock_lab\\"
+#define SWL_DIR_NAME "sword_lock_lab"
+#endif
+#if LINK_SWORD_LOCK
+#include "sword_lock_icons.h"   // the duel's own icons (route B1): the lab DLL only, wired inside the H1c block
+#include "sword_lock_force.h"   // [Combat] SwordLockLabForce: the lab-only trigger, wired inside the H1c block
+#include "sword_lock_winspin.h" // [Combat] SwordLockWinSpin: a win's Great Spin and the lab crowd default, inside the H1c block
+#include "sword_lock_anim.h"    // H2b: Link's TP blade-lock clips on the duel's lease ([Combat] SwordLockClips), inside the H1c block
+#include "sword_lock_assets.h"  // H2b: the five clips' sizes and SHA (scripts/sword_lock_anim.py header_rows) and the lose carry
+#include "sword_lock_draw.h"    // H1d: the drawn duel (keyboard bag, Sorter, offers per step), inside the H1c block
+#include "sword_lock_sound.h"   // H3: TP's lock sounds and the sparks ([Combat] SwordLockSound / SwordLockSparks), inside the H1c block
+#include "sword_lock_cinema.h" // H2c: the duel camera, the cinema bars and the owner's sway ([Combat] SwordLockCamera/Bars/Sway), inside the H1c block
+#include "sword_lock_darklink.h" // Dark Link (em39) as the duel's owner ([Combat] SwordLockDarkLink), inside the lab blocks
+#include "sword_lock_hand.h"     // candidate 5: the Master Sword in the hand from the lock to the release, inside the lab blocks
+#include "sword_lock_gate.h"     // candidate 1: the difficulty from the mode, the admission (Salvador only, no pad: [Combat] SwordLockPad)
+#include "sword_lock_salvador.h" // candidate 9: the Salvador's struggle, engine, clash and grunts ([Combat] SwordLockSalvadorMotion/Sound)
+#endif
 #include "save_anywhere.h"
 #include "combat_runtime.h"
 #include "mortal_draw_runtime.h"
@@ -362,6 +397,12 @@ static uint32_t g_parry_window_ms=link_runtime::defense::kParryWindowDefault;   
 static void CombatCommitted(const link_runtime::parry::Candidate& candidate,LONG serial);
 static void CombatGeneralBlocked(uint32_t serial,uint32_t owner_id);
 static void ParryHeavyBlock(const link_runtime::parry::general::Applied& applied);   // parry-heavy-01
+static void SwordLockBlocked(const link_runtime::parry::general::Applied& applied);   // H0 probe: queue only (off with the key 0)
+static bool SwordLockGuard(const link_runtime::parry::Candidate& candidate);   // H0 probe: lab guard (false with the key 0)
+#if LINK_SWORD_LOCK
+static void SwordLockBlockedLab(const link_runtime::parry::general::Applied& applied,const link_runtime::parry::Candidate& candidate);
+#endif
+static void SwkQueued(const link_runtime::parry::general::Applied& applied);   // H1c lab duel: the block's Follow (off: never called)
 static bool GuardResolve(const link_runtime::parry::Candidate& candidate);   // tier 3, shield-guard-01
 // Order (section 2.1): tier 1 first. Committed ends it; PartialFailure keeps the damage and skips
 // tier 2 for this invocation; NotCommitted falls to tier 2, which may use the same press only when
@@ -399,12 +440,18 @@ static bool __cdecl ResolveParry(const link_runtime::parry::Candidate& candidate
             g_parry_audio.Publish(true,GetTickCount64());
             CombatGeneralBlocked(applied.serial,applied.owner_id);   // Link's reaction only; no riposte, no stagger
             ParryHeavyBlock(applied);   // power >= ParryHeavyPower: Link slides back (TP)
+#if LINK_SWORD_LOCK
+            SwordLockBlockedLab(applied,candidate);  // lab: the chainsaw's (SwordLockBlocked) or Dark Link's blade (em39 0x15585F)
+#else
+            SwordLockBlocked(applied);  // [Combat] SwordLockProbe=1 only: a chainsaw block with its owner queues the lock
+#endif
         }
         if(applied.cancel)return true;
     }
     // Tier 3 (shield-guard-01): the raised shield. Never after a tier-1 partial write.
     if(tier_one==g::TierOne::Partial)return false;
-    return GuardResolve(candidate);
+    if(GuardResolve(candidate))return true;
+    return SwordLockGuard(candidate);   // [Combat] SwordLockProbe=1 only: the held/released owner's chainsaw, last of all
 }
 static void StopParryObservation() {
     link_runtime::parry::direct::Stop();
@@ -1385,22 +1432,29 @@ static void StartEm3fAttackTimer(const wchar_t* ini){
 }
 // --- case-key-debounce-01 (21-oct): one TAB press = one attache-case toggle (case_key_debounce.h). MinHook on PadRead,
 // filter on the game thread right after it; all pins or nothing. Masked edges log at LogLevel 1, passes at 2.
+// H1c (sword_lock_lab.h, "Cableado" 1): the same hook also runs the Blade Lock lab duel's pad step for [Combat] SwordLock=1;
+// the TAB debounce runs only with CaseKeyDebounce=1. With SwordLock=0 (or missing) this is exactly the 3.5.0 startup.
+namespace swk=link_runtime::sword_lock::lab;
+static swk::Config g_swk_cfg;                  // [Combat] SwordLock* keys, read with the other lab keys before this runs
 static uint64_t CaseKeyNow(){return GetTickCount64();}
 static void StartCaseKeyDebounce(const wchar_t* ini){
     namespace ck=link_runtime::case_key_debounce;
-    if(GetPrivateProfileIntW(L"LinkRuntime",L"CaseKeyDebounce",1,ini)!=1){Log("case_key_debounce installed=0 reason=off");return;}
+    const swk::HookPlan plan=swk::PadHook(GetPrivateProfileIntW(L"LinkRuntime",L"CaseKeyDebounce",1,ini)==1,g_swk_cfg);
+    if(!plan.install){Log("case_key_debounce installed=0 reason=off");return;}
     unsigned ms=GetPrivateProfileIntW(L"LinkRuntime",L"CaseKeyDebounceMs",ck::kDefaultMs,ini);
     if(!ck::ValidMs(ms)){Log("CaseKeyDebounceMs=%u invalid (0..%u); %u used",ms,ck::kMaxMs,ck::kDefaultMs);ms=ck::kDefaultMs;}
     const uint32_t base=reinterpret_cast<uint32_t>(GetModuleHandleW(nullptr));
     MH_STATUS s=MH_Initialize();
     if(s!=MH_OK&&s!=MH_ERROR_ALREADY_INITIALIZED){Log("case_key_debounce installed=0 reason=minhook_%s",MH_StatusToString(s));return;}
-    ck::g_line=&GiganteTreeLine;ck::g_now=&CaseKeyNow;
+    ck::g_line=&GiganteTreeLine;ck::g_now=&CaseKeyNow;ck::g_debounce=plan.debounce;
     OcaPatchMem m;uint32_t bad=0;
     const ck::Verdict v=ck::Install(m,base,ms,bad,[](void* target,void* detour,void** original){
         if(MH_CreateHook(target,detour,original)!=MH_OK)return false;
         if(MH_EnableHook(target)==MH_OK)return true;
         MH_RemoveHook(target);return false;});
-    if(v==ck::Verdict::Installed)Log("case_key_debounce installed=1 base=0x%X hook=0x%X key=0x%X debounce_ms=%u max_latch_ms=%u clock=real",
+    if(v==ck::Verdict::Installed&&!plan.debounce)Log("case_key_debounce installed=0 reason=off pad_hook=1 base=0x%X hook=0x%X "
+        "(CaseKeyDebounce=0: the PadRead hook runs for [Combat] SwordLock=1 only, no TAB debounce)",base,ck::rva::kPadRead);
+    else if(v==ck::Verdict::Installed)Log("case_key_debounce installed=1 base=0x%X hook=0x%X key=0x%X debounce_ms=%u max_latch_ms=%u clock=real",
         base,ck::rva::kPadRead,ck::layout::kKeySscrn,ms,static_cast<unsigned>(ck::kMaxLatchMs));
     else Log("case_key_debounce installed=0 reason=%s pin=0x%X base=0x%X",ck::Name(v),bad,base);
 }
@@ -2930,9 +2984,14 @@ static void CmbPromptLog(uint32_t frame,bool displayed){
 #include "spin_attack_runtime.h"
 #include "zelda_cast_pose_runtime.h"   // Zelda's cast pose (zelda-cast-pose): arm, stop, hand
 #include "zelda_light_runtime.h"   // Zelda's light ray (pl_type 1), called once per player dispatch
-static void CmbArbiterExit(bool pre,mctx::Sample sample){
+// H1c lab duel (sword_lock_lab.h, [Combat] SwordLock=1 and SwordLockLab=1 only): its offer was queued this frame.
+static bool g_swk_own=false;
+// census_own: the H1a glyph census (lab) offered this frame; like the prompt's, its NULL-func offer is not a native one.
+static void CmbArbiterExit(bool pre,mctx::Sample sample,bool census_own){
     CmbMem m;
     if(!pre||!mctx::ReadPostArbiter(m,g_cmb_base,sample))sample.readable=sample.after_arbiter=false;  // N-3
+    mdp::ClaimOwnOffer(sample,census_own);   // before SwordArbiter and the Mortal Draw arbiter (false: no-op)
+    mdp::ClaimOwnOffer(sample,g_swk_own);    // H1c lab duel: its offer of this frame, the same way (false: no-op)
     const uint32_t frame=CmbFrame();sample.frame=frame;
     CmbPlayer p;const bool player=CmbReadPlayer(p);
     if(player)CmbScene(p.player);
@@ -2993,14 +3052,26 @@ static void CmbArbiterExit(bool pre,mctx::Sample sample){
 }
 using CmbArbiterFn=void(__thiscall*)(void*);
 static CmbArbiterFn g_cmb_arbiter_original=nullptr;
+// H1a glyph census (sword_lock_glyphs.h): [Combat] SwordLockGlyphCensus=1 only (lab); nothing with the key 0.
+static void SwordLockCensusEntry(void* self,bool md_offered);
+static bool SwordLockCensusExit();
+// H1c lab duel: its one native offer, after the census (which wins the detour when it runs) and the Mortal Draw prompt.
+static void SwordLockDuelEntry(void* self,bool md_offered);
+static void SwordLockDuelExit();
 static void __fastcall CmbArbiterDetour(void* self,void*){
     const DWORD error=GetLastError();
     CmbMem m;mctx::Sample sample;const bool pre=mctx::ReadPreArbiter(m,g_cmb_base,sample);
+    SwordOfferEntry(pre,sample);   // offer-fix-01: the native works, read before the mod queues its own prompts
     if(g_cmb_prompt_cfg.on)CmbPromptEntry(self);   // after the native sample: its offers count only native works
+    // H1a census after the Mortal Draw prompt, which keeps priority: a frame the prompt offered, the census only counts it.
+    SwordLockCensusEntry(self,g_cmb_prompt_cfg.on&&g_cmb_prompt.Injected());
+    SwordLockDuelEntry(self,g_cmb_prompt_cfg.on&&g_cmb_prompt.Injected());   // H1c lab duel: returns at once with the keys 0
     SetLastError(error);
     g_cmb_arbiter_original(self);
     const DWORD after=GetLastError();
-    CmbArbiterExit(pre,sample);
+    const bool census_own=SwordLockCensusExit();   // H1a census: whether ours was queued (and drawn); false unless it injected
+    SwordLockDuelExit();   // H1c lab duel: whether its offer was drawn (g_swk_own); nothing unless it injected
+    CmbArbiterExit(pre,sample,census_own);
     SetLastError(after);
 }
 static void CmbStrike(uint32_t frame){
@@ -3353,12 +3424,21 @@ static int CmbPushMove(void* model){
     SetLastError(error);
     return result;
 }
+#if LINK_SWORD_LOCK
+// Blade Lock H2b (lab DLL only, sword_lock_anim.h): the lose clip's carry owns the dispatch's own MotionMove of the duel's
+// lease (defined in the H1c block below).
+static bool SwaCarryOwns(void* model);
+static int SwaCarryMove(void* model);
+#endif
 static int __cdecl CmbMoveDetour(void* model){
     const bool player=model&&reinterpret_cast<uint32_t>(model)==CmbGet<uint32_t>(g_cmb_player_slot);
     if(player){
         const DWORD error=GetLastError();CmbPlayerMove(model);SetLastError(error);
     }
     if(!player)return g_cmb_move_original(model);
+#if LINK_SWORD_LOCK
+    if(SwaCarryOwns(model))return SwaCarryMove(model);   // H2b lab: the lose clip's carry (only on the duel's own lease)
+#endif
     // Magnet first, then the leap: exclusive by lease kind.
     if(!CmbMagnetOwns(model))return CmbLeapOwns(model)?CmbLeapMove(model):CmbBackOwns(model)?CmbBackMove(model):
         CmbFlipOwns(model)?CmbFlipMove(model):CmbLeapSettleOwns(model)?CmbLeapMove(model):
@@ -3713,6 +3793,9 @@ static void PollHudLetterbox(){   // poll thread
 // releases its HD texture, so the native screens get that memory back, and re-arms when play resumes. Leon's ring stays
 // hidden meanwhile (the hearts come back) instead of flashing on.
 static bool g_hud_play=true;
+#if LINK_SWORD_LOCK
+static bool SwcBars(bool ztarget);   // Blade Lock H2c (lab DLL only): the bars' owner, the duel or the Z-lock (defined in the H1c block)
+#endif
 static void HudFrame(){
     if(!g_hud_ready.load(std::memory_order_acquire))return;
     LocalMemory m;uint32_t g=0,frame=0;
@@ -3731,7 +3814,11 @@ static void HudFrame(){
     if(m.Read32(g+0x4FAC,room))room&=0xFFFFu;
     g_hud_in.play=g_hud_play;g_hud_in.room=room;   // heart-refill-01: read only with HeartRefill=1
     g_hud_in.load=g_hud_cfg.refill&&(g_hud_load_seen.exchange(false,std::memory_order_acq_rel)||HudLoadFlag(g));
+#if LINK_SWORD_LOCK
+    g_hud_in.lock=SwcBars(HudLock());HudLetterboxOrder();   // H2c lab: the duel owns the bars while it holds the world
+#else
     g_hud_in.lock=HudLock();HudLetterboxOrder();   // ztarget-letterbox-01: no-op unless ZTargetLetterbox=1
+#endif
     g_hud.Update(g_hud_in,GameStep(g_hud_global_slot));
     HudRefillFrame();   // heart-refill-01: no-op unless HeartRefill=1
     HudLetterboxFrame();   // ztarget-letterbox-01
@@ -3767,13 +3854,2601 @@ static void HudMenuFrame(){
         g_hud_why=why;
     }__except(EXCEPTION_EXECUTE_HANDLER){}
 }
+// ---------------------------------------------------------------------------------------------
+// Master Sword Blade Lock, experiment H0 (sword_lock_probe.h, docs/idea-ambiciosa-2026-11-03.md "Experimento inicial").
+// [Combat] SwordLockProbe=1 only: a lab DLL, never published. With the key missing or 0 nothing of this block runs and
+// nothing is installed: no hook (there is none even with 1), no write, the dispatch lifecycle/proceed keep their own
+// callbacks and player_frame stays as [Hud] and the companion set it.
+// Game thread: SwordLockBlocked (inside the EmAtkHitCk resolver: it only queues), SwordLockGuard (same resolver, last
+// after every tier: cancels the lock owner's unblocked chainsaw contacts while held, watched or just abandoned, and logs
+// every landing chainsaw contact; a return value, no write), SwordLockDecide (the dispatch decide:
+// admission, the freeze Begin, the lease, the release that cancels it) and SwordLockFrame (the player's core, damage and
+// death frames included: the same-frame abandons, the samples, the watch). Worker: StartSwordLock and PollSwordLock.
+// The freeze is a second oca::FreezeOwner (bit ownership, pending End in a saver window, Abandoned after a load); the
+// hold clip is the resident ocarina loop (Ocarina Pose=1), looped by Replace while the lock holds; the exit blow is the
+// Sheik/Epona publisher (0x1AEEF0) on the owner alone, re-identified right before (never a stale pointer).
+namespace swl=link_runtime::sword_lock::probe;
+static swl::Config g_swl_cfg;
+static bool g_swl_wanted=false;                // the key and tier 2 active: the wrappers are published before Observe
+static std::atomic<bool> g_swl_on{false};      // StartSwordLock succeeded
+static swl::Probe g_swl;                       // game thread
+static oca::FreezeOwner g_swl_freeze;          // the probe's own Stop_flg lease (the ocarina keeps g_oca_freeze)
+static oca::FreezeResult g_swl_freeze_result=oca::FreezeResult::NotActive;
+static uint32_t g_swl_base=0,g_swl_player_slot=0,g_swl_global_slot=0;
+static bool g_swl_clip=false;                  // the hold clip is resident (g_oca_clip[2]/[3], the ocarina loop)
+static uint64_t g_swl_lease=0;                 // our dispatch lease (0 = none); armed before TryStartClip (Started is
+static bool g_swl_cancelling=false;            // published inside Start, as the ocarina's g_oca_route)
+static uint32_t g_swl_stop_before=0,g_swl_stop_after=0,g_swl_wait_routine=0xFFFFFFFF,g_swl_refused_routine=0;
+static int g_swl_refused_status=-1;
+static uint8_t g_swl_id=0,g_swl_type=0,g_swl_wep=0;static int16_t g_swl_hp_max=0;   // the admitted owner
+static uint8_t g_swl_first_r0=0,g_swl_first_r1=0;static bool g_swl_first=false;
+static const char* g_swl_shot="none";
+static DWORD g_swl_start_tick=0;
+static uint32_t g_swl_epoch0=0;                // the ocarina worker's load epoch at Begin (0 with the ocarina off)
+static mortal::dispatch::Lifecycle g_swl_next_lifecycle=nullptr;
+static mortal::dispatch::Proceed g_swl_next_proceed=nullptr;
+// H1c lab duel (sword_lock_lab.h): the pieces the probe's ticks call; all inert unless StartSwordLockDuel succeeded.
+static std::atomic<bool> g_swk_on{false};
+static swk::Lab g_swk;                         // game thread
+static bool SwkCrowd(const swl::World& w);     // the 8 m rule at the admission (true = crowd)
+static void SwkRefusedCrowd();
+static void SwkStart(const swl::World& w);
+static void SwkFrame(mortal::dispatch::Runtime* run,const swl::World& w);
+static void SwkRelease(mortal::dispatch::Runtime* run,const swl::World& w);
+static void SwkAbandoned(const swl::World& w,swl::Abandon why);
+static bool SwkGuarding();
+static void SwkHit();
+static bool SwkNoSwing();                       // the block's Follow has no owner routine to arm again (Refuse::NoSwing)
+#if LINK_SWORD_LOCK
+static void SwkForce(void* player);            // [Combat] SwordLockLabForce: the lab-only trigger (lab DLL only)
+static void SwsPollAudio();                     // H3: the duel's sounds on the poll thread (lab DLL only)
+static void SwdlPollAudio();                    // Dark Link's voices on the poll thread (lab DLL only)
+static void SwsvPollAudio();                    // candidate 9: the Salvador's sounds on the poll thread (lab DLL only)
+static void SwsContact();                       // H3: a chainsaw contact the lab guard took (HIT_SWORD, rate-limited)
+// Blade Lock H2b (sword_lock_anim.h, lab DLL only): the hold lease starts with clip a once the clips are resident.
+static mortal::dispatch::Lease SwaHoldLease(uint64_t token);
+static void SwaLeaseStarted(uint64_t token,double now);
+static bool SwaOwns(const mortal::dispatch::Runtime& run);
+static bool SwaProceed(mortal::dispatch::Runtime& run);   // our lease's clip ended: set again (a loop, or a late one-shot)
+#endif
+static bool g_swk_actbtn_own=false;            // SPF_ACTBTN raised by our own offer (not a native QTE): not an abandon
+// Copied lines (game thread -> worker), as parry::general::Log. Every line carries tick= (GetTickCount when it was made).
+struct SwlLine{char text[512];};
+static SwlLine g_swl_lines[64];
+static std::atomic<unsigned> g_swl_write{0},g_swl_read{0},g_swl_dropped{0};
+static void SwlLog(const char* format,...){
+    const unsigned w=g_swl_write.load(std::memory_order_relaxed),r=g_swl_read.load(std::memory_order_acquire);
+    if(w-r>=64){g_swl_dropped.fetch_add(1);return;}
+    va_list args;va_start(args,format);
+    vsnprintf_s(g_swl_lines[w%64].text,sizeof(g_swl_lines[0].text),_TRUNCATE,format,args);
+    va_end(args);
+    g_swl_write.store(w+1,std::memory_order_release);
+}
+static void PollSwordLock(){
+    unsigned r=g_swl_read.load(std::memory_order_relaxed);const unsigned w=g_swl_write.load(std::memory_order_acquire);
+    while(r!=w){Log("%s",g_swl_lines[r%64].text);g_swl_read.store(++r,std::memory_order_release);}
+    const unsigned dropped=g_swl_dropped.exchange(0);
+    if(dropped)Log("sword_lock dropped=%u lines",dropped);
+#if LINK_SWORD_LOCK
+    SwsPollAudio();   // H3: inert until StartSwordLockDuel loaded the sounds
+    SwdlPollAudio();  // Dark Link's voices: inert until loaded
+    SwsvPollAudio();  // candidate 9: the Salvador's sounds, inert until loaded
+#endif
+}
+static const char* SwlFreezeName(oca::FreezeResult r){
+    switch(r){
+    case oca::FreezeResult::Frozen:return "frozen";case oca::FreezeResult::Restored:return "restored";
+    case oca::FreezeResult::PartlyForeign:return "partly_foreign";case oca::FreezeResult::Pending:return "pending";
+    case oca::FreezeResult::Abandoned:return "abandoned";case oca::FreezeResult::AlreadyActive:return "already_active";
+    case oca::FreezeResult::Refused:return "refused";case oca::FreezeResult::InvalidMemory:return "invalid_memory";
+    case oca::FreezeResult::RaceLost:return "race_lost";default:return "not_active";
+    }
+}
+static const char* SwlTrialName(mortal::trial::Status s){
+    switch(s){
+    case mortal::trial::Status::Started:return "started";case mortal::trial::Status::NotInHandler:return "not_in_handler";
+    case mortal::trial::Status::IdentityMismatch:return "identity";case mortal::trial::Status::BaselineMismatch:return "baseline";
+    case mortal::trial::Status::NativeMismatch:return "native";case mortal::trial::Status::AssetsMissing:return "assets";
+    case mortal::trial::Status::StartRejected:return "rejected";default:return "ready";
+    }
+}
+static uint32_t SwlEpoch(){return g_oca_on.load(std::memory_order_acquire)?g_oca_epoch.Current():0;}   // the ocarina worker's load epoch
+static bool SwlOcarinaOut(){
+    return g_oca_session.state()!=oca::State::Idle||g_oca_freeze.Active()||OcaOwnsLease()||g_oca_unmount_pending||g_oca_weapon_pending;
+}
+static bool SwlOwnerRaw(uint32_t owner,mtg::Raw& r){ImageMem m;return owner&&mtg::ReadRaw(m,owner,r)==mtg::Reject::None;}
+#if LINK_SWORD_LOCK
+// Dark Link (sword_lock_darklink.h, lab DLL only): the duel's owner kind, set when the probe took the request.
+namespace swdl=link_runtime::sword_lock::darklink;
+static swdl::Config g_swdl_cfg;                // [Combat] SwordLockDarkLink as read (missing = 1)
+static swdl::Foe g_swdl_foe=swdl::Foe::Salvador;
+// candidate 9 (sword_lock_salvador.h): the Salvador's struggle and sounds ([Combat] SwordLockSalvadorMotion/Sound)
+namespace swsv=link_runtime::sword_lock::salvador;
+static swsv::Config g_swsv_cfg;
+static swsv::Director g_swsv;                 // game thread
+static std::atomic<uint32_t> g_swsv_loops{0},g_swsv_shots[swsv::kShotCount]{};
+static std::atomic<bool> g_swsv_ready{false}; // the WAVs loaded (worker)
+namespace swgt=link_runtime::sword_lock::gate;
+static swgt::Config g_swgt_cfg;                // [Combat] SwordLockPad as read (missing = 0: no duel on a pad)
+static swdl::Owner SwdlOwner(uint32_t owner){
+    swdl::Owner o;o.ptr=owner;mtg::Raw r;
+    if(!SwlOwnerRaw(owner,r))return o;
+    o.read=true;o.vtable=r.vtable;o.be_flag=r.be_flag;o.id=r.id;o.type=r.type;o.r0=r.r0;o.r1=r.r1;o.hp=r.hp;o.hp_max=r.hp_max;
+    return o;
+}
+#endif
+// A live em10 Ganado, not dying; admitted: also the same id/type/max HP/weapon as at the admission (the pointer was
+// not reused by another work).
+static bool SwlOwnerAlive(uint32_t owner,bool admitted){
+#if LINK_SWORD_LOCK
+    if(g_swdl_foe==swdl::Foe::DarkLink)   // the lab's Dark Link: a live em39, the same one (no weapon byte of em10's)
+        return swdl::Alive(SwdlOwner(owner),g_swl_base,admitted,g_swl_id,g_swl_type,g_swl_hp_max);
+#endif
+    mtg::Raw r;
+    if(!SwlOwnerRaw(owner,r)||(r.be_flag&0x201)!=1||r.vtable!=g_swl_base+mtg::layout::em10_vtable_rva||!mtg::GanadoFamily(r.id)||
+       r.hp<=0||r.hp_max<=0||r.hp>r.hp_max||r.r0==3)return false;
+    return !admitted||(r.id==g_swl_id&&r.type==g_swl_type&&r.hp_max==g_swl_hp_max&&r.wep_type==g_swl_wep);
+}
+// Live Ganados other than the owner within `radius` mm of Link (XZ): case (b) of the live check, log only.
+static unsigned SwlOthers(uint32_t owner,const float* link,float radius){
+    ImageMem m;mtg::Manager pool;unsigned n=0;
+    if(mtg::ReadManager(m,g_swl_base,mtg::Config{},pool)!=mtg::Reject::None)return 0;
+    for(unsigned i=0;i<pool.count;++i){
+        const uint32_t at=pool.array+i*pool.block;mtg::Raw r;
+        if(at==owner||mtg::ReadRaw(m,at,r)!=mtg::Reject::None)continue;
+        if((r.be_flag&0x201)!=1||r.vtable!=g_swl_base+mtg::layout::em10_vtable_rva||!mtg::GanadoFamily(r.id)||r.hp<=0||!(r.status&0x20))continue;
+        const float dx=r.pos.x-link[0],dz=r.pos.z-link[2];
+        if(dx*dx+dz*dz<=radius*radius)++n;
+    }
+    return n;
+}
+static swl::World SwlWorld(){
+    namespace fl=oca::freeze_layout;
+    swl::World w;LocalMemory m;uint32_t player=0,global=0;
+    if(!m.Read32(g_swl_player_slot,player)||!link_runtime::IsPointer(player)||!m.Read32(g_swl_global_slot,global)||!link_runtime::IsPointer(global))return w;
+    uint32_t room=0,life=0,routine=0,stop=0,s0=0,s2=0,frame=0;
+    if(!m.Read32(global+fl::kRoomId,room)||!m.Read32(global+0x4FB4,life)||!m.Read32(player+0xFC,routine)||   // pl_life
+       !m.Read32(global+fl::kStopFlg,stop)||!m.Read32(global+fl::kStatus0,s0)||!m.Read32(global+fl::kStatus2,s2)||
+       !m.Read32(global+link_runtime::game_clock::kFrameCounterOffset,frame))return w;
+    w.readable=true;w.player=player;w.global=global;w.room=room&0xFFFF;w.link_hp=static_cast<int16_t>(life&0xFFFF);
+    w.link_routine=routine;w.stop=stop;w.status0=s0;w.status2=s2;w.frame=frame;w.now=GameNow(g_swl_global_slot);
+    w.owner_alive=SwlOwnerAlive(g_swl.owner(),true);
+    w.ocarina=SwlOcarinaOut();
+    const auto& run=mortal::dispatch_hooks::runtime;
+    w.lease=g_swl_lease&&run.active&&run.lease.token==g_swl_lease;
+    w.freeze_owned=g_swl_freeze.Freeze().Owned();
+    // H1c lab: SPF_ACTBTN that our own offer raised is told apart from a native QTE before the abandon rules (Modder).
+    if(g_swk_actbtn_own&&g_swk_on.load(std::memory_order_acquire))w.stop&=~swl::native::kSpfActBtn;
+    return w;
+}
+// One sample: the owner's routine, Seq_frame (Motion +0xB8 = model+0x290, grab_hit_once.h) and HP; Link's HP, routine,
+// 2A8 and arm health (secondary_slot.h, read-only); Stop_flg. label -1 is taken right before Begin.
+static void SwlSample(int label,const swl::World& w){
+    mtg::Raw r;const bool owner=SwlOwnerRaw(g_swl.owner(),r);
+    float seq=0.f;ImageMem m;if(!owner||!m.Read(g_swl.owner()+0x290,&seq,4))seq=0.f;
+    const uint32_t slot=w.player?CmbGet<uint32_t>(w.player+0x2A8):0;
+    ssl::arm::Part parts[ssl::arm::kLast+1]{};SlotMemory sm;
+    const ssl::arm::Health arm=w.player&&ssl::arm::ReadParts(sm,w.player,parts)?ssl::arm::Judge(parts).health:ssl::arm::Health::Unread;
+    SwlLog("sword_lock sample t=%d t_ms=%.1f owner=0x%08X r0=%u r1=%u seq=%.2f owner_hp=%d link_hp=%d stop=0x%08X slot=0x%08X routine=0x%08X lease=%u arm=%s frame=%u tick=%lu",
+        label,label<0?0.0:g_swl.ElapsedMs(w.now),g_swl.owner(),owner?unsigned(r.r0):0U,owner?unsigned(r.r1):0U,static_cast<double>(seq),
+        owner?int(r.hp):0,w.link_hp,w.stop,slot,w.link_routine,w.lease?1U:0U,ssl::arm::Name(arm),w.frame,GetTickCount());
+}
+static void SwlStopNow(const swl::World& w){uint32_t v=0;LocalMemory m;if(w.global&&m.Read32(w.global+oca::freeze_layout::kStopFlg,v))g_swl_stop_after=v;}
+static oca::FreezeResult SwlFreezeEnd(const swl::World& w){
+    LocalMemory m;const auto r=g_swl_freeze.Release(m,SwlEpoch());
+    g_swl_freeze_result=r;SwlStopNow(w);
+    return r;
+}
+// Every probe tick: a pending End (a saver held Stop_flg) retried, or the held freeze polled (ocarina_freeze.h Service).
+static void SwlFreezeService(){
+    LocalMemory m;const auto r=g_swl_freeze.Service(m,SwlEpoch());
+    if(!oca::FreezeOwner::Finished(r))return;
+    g_swl_freeze_result=r;uint32_t g=0,stop=0;
+    if(m.Read32(g_swl_global_slot,g)&&link_runtime::IsPointer(g)&&m.Read32(g+oca::freeze_layout::kStopFlg,stop))g_swl_stop_after=stop;
+    SwlLog("sword_lock freeze end result=%s pending=1 stop=0x%08X tick=%lu",SwlFreezeName(r),g_swl_stop_after,GetTickCount());
+}
+// Our lease, from the decide only (Runtime::Cancel needs the handler). The lifecycle sees it as ours.
+static bool SwlCancel(mortal::dispatch::Runtime* run){
+    if(!run||!g_swl_lease||!run->active||run->lease.token!=g_swl_lease)return false;
+    g_swl_cancelling=true;const bool ok=run->Cancel(g_swl_lease);g_swl_cancelling=false;
+    return ok;
+}
+static void __cdecl SwlLifecycle(void* context,mortal::dispatch::Event event,uint64_t token){
+    if(!token||token!=g_swl_lease){if(g_swl_next_lifecycle)g_swl_next_lifecycle(context,event,token);return;}
+    if(event==mortal::dispatch::Event::Started)return;   // never the Mortal Draw voice mailbox: not forwarded
+    const bool ours=g_swl_cancelling;g_swl_lease=0;
+    if(!ours)g_swl.LeaseLost();
+    SwlLog("sword_lock lease end event=%u by_probe=%u token=%u tick=%lu",static_cast<unsigned>(event),ours?1U:0U,static_cast<unsigned>(token),GetTickCount());
+}
+// The hold loops (same clip again) while the lock holds; any other lease keeps its own proceed.
+static bool __cdecl SwlProceed(mortal::dispatch::Runtime& run,unsigned char* p){
+    if(g_swl_lease&&run.active&&run.lease.token==g_swl_lease)
+#if LINK_SWORD_LOCK   // H2b: the lab's clips loop (or a late win/lose holds) through their director
+        return g_swl.Holding()&&g_swl_clip&&(SwaOwns(run)?SwaProceed(run):run.Replace(g_oca_clip[2],g_oca_clip[3],g_oca_clip[3]+4));
+#else
+        return g_swl.Holding()&&g_swl_clip&&run.Replace(g_oca_clip[2],g_oca_clip[3],g_oca_clip[3]+4);
+#endif
+    return g_swl_next_proceed&&g_swl_next_proceed(run,p);
+}
+static bool SwlPublish(const ose::dmg::PublishArgs& a){
+    __try{ose::dmg::CallPublisher(g_swl_base+ose::dmg::layout::publisher_rva,a);return true;}
+    __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+// Resolver (game thread, inside EmAtkHitCk): a press-blocked chainsaw swing with its owner. Queue only, no game write.
+static void SwordLockBlocked(const link_runtime::parry::general::Applied& applied){
+    if(!g_swl_on.load(std::memory_order_acquire)||!applied.chainsaw)return;
+    if(g_swl.Queue(applied.owner,applied.serial,GameNow(g_swl_global_slot))&&g_swk_on.load(std::memory_order_acquire))SwkQueued(applied);
+}
+// Resolver (game thread, inside EmAtkHitCk), after every tier let the contact through: a chainsaw contact (Chainsaw()
+// descriptor from em10AtkCk or em10CsawHitCk) with a known owner. The held, released or just abandoned owner's is
+// cancelled (Probe::Guarding; the return value only, nothing written) and logged as `guard`; any other is logged as
+// `pass`, one line per contact (H0 counts every chainsaw contact that lands, not the tier-2 pass line's 1/s).
+static bool SwordLockGuard(const link_runtime::parry::Candidate& c){
+    if(!g_swl_on.load(std::memory_order_acquire))return false;
+    namespace g=link_runtime::parry::general;
+    const uint32_t base=g_gen.access.image_base;
+    if(!base||c.outer_caller<base)return false;
+    const uint32_t ret=c.outer_caller-base;
+#if LINK_SWORD_LOCK
+    // Dark Link (lab): an attack-sphere contact of the held em39 is taken while the world is ours, as the chainsaw's.
+    if(g_swdl_foe==swdl::Foe::DarkLink&&g_swk_on.load(std::memory_order_acquire)&&swdl::HeldContact(ret,c.producer_esi,g_swl.owner())){
+        const bool held=SwkGuarding();
+        if(!held)SwkHit();
+        else SwsContact();
+        SwlLog("sword_lock %s owner=0x%08X lock_owner=0x%08X serial=0x%08X state=%s producer=0x%X t_ms=%.1f tick=%lu",held?"guard":"pass",
+            c.producer_esi,g_swl.owner(),g_swl.serial(),swl::StateName(g_swl.state()),ret,g_swl.ElapsedMs(GameNow(g_swl_global_slot)),GetTickCount());
+        return held;
+    }
+#endif
+    const bool atk=ret==0x55CE2;
+    if(!atk&&!g::ChainsawProducer(ret))return false;
+    g::NativeSources s{g_gen};g::Descriptor d{};
+    if(!s.Descriptor(c.attack,d)||!g::Chainsaw(atk?g::kEm10AtkCk:g::kEm10CsawHitCk,d))return false;
+    const uint32_t owner=s.Owner(c);
+    if(!owner)return false;
+    const double now=GameNow(g_swl_global_slot);
+    // H1c lab: only while the world is ours (the duel and its exit slide); afterwards the rearmed Follow alone (no extra
+    // invulnerability), and a landing contact of the owner counts in the after watch.
+    const bool lab=g_swk_on.load(std::memory_order_acquire);
+    const bool guard=owner==g_swl.owner()&&(lab?SwkGuarding():g_swl.Guarding(now));
+    if(lab&&!guard&&owner==g_swl.owner())SwkHit();
+#if LINK_SWORD_LOCK
+    if(lab&&guard)SwsContact();   // H3: HIT_SWORD on the frozen chainsaw's contact (one every 300 ms at most)
+#endif
+    SwlLog("sword_lock %s owner=0x%08X lock_owner=0x%08X serial=0x%08X state=%s producer=0x%X t_ms=%.1f tick=%lu",guard?"guard":"pass",owner,
+        g_swl.owner(),g_swl.serial(),swl::StateName(g_swl.state()),ret,g_swl.ElapsedMs(now),GetTickCount());
+    return guard;
+}
+// The decide frame after the block: admission, -1 sample, freeze Begin. False: refused (the parry stays as it is).
+static bool SwlBegin(swl::World& w){
+    swl::Gate g;g.ocarina=w.ocarina;
+    LocalMemory lm;link_runtime::HealthState health;
+    g.gameplay=link_runtime::ReadHealth(lm,g_swl_player_slot,g_swl_global_slot,health)&&health.eligible;
+    g.owner_alive=SwlOwnerAlive(g_swl.owner(),false);
+    if(g_swk_on.load(std::memory_order_acquire)){g.crowd=SwkCrowd(w);g.no_swing=SwkNoSwing();}   // H1c lab (H0 never sets them)
+    const swl::Refuse refuse=g_swl.Admit(g,w.now);
+    if(refuse!=swl::Refuse::None){
+        SwlLog("sword_lock refused reason=%s owner=0x%08X serial=0x%08X tick=%lu",swl::RefuseName(refuse),g_swl.owner(),g_swl.serial(),GetTickCount());
+        if(refuse==swl::Refuse::Crowd)SwkRefusedCrowd();
+        return false;
+    }
+    mtg::Raw r;SwlOwnerRaw(g_swl.owner(),r);
+    g_swl_id=r.id;g_swl_type=r.type;g_swl_hp_max=r.hp_max;g_swl_wep=r.wep_type;
+    w.owner_alive=SwlOwnerAlive(g_swl.owner(),true);
+    SwlSample(-1,w);
+    g_swl_stop_before=w.stop;g_swl_stop_after=0;g_swl_shot="none";g_swl_first=false;g_swl_first_r0=g_swl_first_r1=0;g_swl_epoch0=SwlEpoch();
+    const auto fr=g_swl_freeze.Begin(lm,g_swl_player_slot,g_swl_global_slot,SwlEpoch());
+    const uint32_t owned=g_swl_freeze.Freeze().Owned();g_swl_freeze_result=fr;
+    // b = the Stop_flg bits taken (SPF_EM 0x20000000 | SPF_SUBCHAR 0x1000), as the ocarina's "freeze begin".
+    SwlLog("sword_lock freeze begin result=%s code=%d refused_at=%d b=0x%08X stop_before=0x%08X tick=%lu",SwlFreezeName(fr),
+        static_cast<int>(fr),g_swl_freeze.Freeze().RefusedAt(),owned,g_swl_stop_before,GetTickCount());
+    w.freeze_owned=owned;
+    if(!g_swl.Began(fr==oca::FreezeResult::Frozen,owned,w)){
+        oca::FreezeResult end=oca::FreezeResult::NotActive;
+        if(g_swl_freeze.Active())end=SwlFreezeEnd(w);   // frozen with no bit of ours: drop the lease (nothing to clear)
+        SwlLog("sword_lock refused reason=%s owner=0x%08X serial=0x%08X freeze=%s end=%s tick=%lu",swl::RefuseName(g_swl.last_refuse()),
+            g_swl.owner(),g_swl.serial(),SwlFreezeName(fr),SwlFreezeName(end),GetTickCount());
+        return false;
+    }
+    g_swl_start_tick=GetTickCount();g_swl_wait_routine=0xFFFFFFFF;g_swl_refused_status=-1;g_swl_refused_routine=0;
+    float pos[3]{};ImageMem m;const bool here=m.Read(w.player+0x94,pos,sizeof(pos));
+    SwlLog("sword_lock start owner=0x%08X owner_id=0x%02X type=0x%02X wep=%u owner_hp=%d serial=0x%08X freeze=1 b=0x%08X exit=%s weapon=0x%02X "
+        "clip=%u others_5m=%u routine=0x%08X slot=0x%08X link_hp=%d tick=%lu",g_swl.owner(),unsigned(g_swl_id),unsigned(g_swl_type),
+        unsigned(g_swl_wep),int(r.hp),g_swl.serial(),owned,swl::ExitName(g_swl_cfg.exit),unsigned(swl::ExitWeapon(g_swl_cfg.exit)),
+        g_swl_clip?1U:0U,here?SwlOthers(g_swl.owner(),pos,5000.f):0U,w.link_routine,CmbGet<uint32_t>(w.player+0x2A8),w.link_hp,g_swl_start_tick);
+    return true;
+}
+// Lease the dispatch slot with the hold clip from the knife hold or idle; any other routine waits (logged once per routine).
+static void SwlLease(mortal::dispatch::Runtime& run,const swl::World& w){
+    const uint32_t routine=w.link_routine;
+    const bool knife=routine==swl::native::kKnifeHold,idle=mortal::dispatch::NormalIdleRoutine(routine);
+    if(!g_swl_clip||run.active||(!knife&&!idle)){
+        g_swl.LeaseTried(false,w.now);
+        const uint32_t key=!g_swl_clip?0xFFFFFFFEU:run.active?0xFFFFFFFDU:routine;
+        if(key!=g_swl_wait_routine){
+            g_swl_wait_routine=key;
+            SwlLog("sword_lock lease wait reason=%s routine=0x%08X slot=0x%08X t_ms=%.1f tick=%lu",!g_swl_clip?"no_clip":run.active?"dispatch_busy":"routine",
+                routine,CmbGet<uint32_t>(w.player+0x2A8),g_swl.ElapsedMs(w.now),GetTickCount());
+        }
+        return;
+    }
+    const auto from=knife?mortal::dispatch::StartFrom::KnifeHoldTrial:mortal::dispatch::StartFrom::NormalIdle;
+    const uint32_t slot=CmbGet<uint32_t>(w.player+0x2A8);
+    const uint64_t token=mortal::resident_assets::ReserveToken();
+#if LINK_SWORD_LOCK
+    const mortal::dispatch::Lease lease=SwaHoldLease(token);   // H2b: clip a with the lab's clips resident, else the ocarina loop
+#else
+    const mortal::dispatch::Lease lease{token,g_oca_clip[2],g_oca_clip[3],g_oca_clip[3]+4};
+#endif
+    g_swl_lease=token;
+    const auto result=token?mortal::trial::TryStartClip(run,g_mortal_native,lease,from):mortal::trial::Attempt{mortal::trial::Status::AssetsMissing};
+    const bool started=result.status==mortal::trial::Status::Started&&g_swl_lease==token;
+    if(!started)g_swl_lease=0;
+    g_swl.LeaseTried(started,w.now);
+    if(started){
+        SwlLog("sword_lock lease result=started from=%s routine=0x%08X slot_before=0x%08X slot=0x%08X after_ms=%.1f tries=%u token=%u tick=%lu",
+            knife?"knife":"idle",routine,slot,CmbGet<uint32_t>(w.player+0x2A8),g_swl.lease_ms(),g_swl.lease_tries(),static_cast<unsigned>(token),GetTickCount());
+#if LINK_SWORD_LOCK
+        SwaLeaseStarted(token,w.now);   // H2b: the clip director starts on clip a (its lock runs from here)
+#endif
+        return;
+    }
+    if(static_cast<int>(result.status)!=g_swl_refused_status||routine!=g_swl_refused_routine){
+        g_swl_refused_status=static_cast<int>(result.status);g_swl_refused_routine=routine;
+        SwlLog("sword_lock lease result=refused status=%s from=%s routine=0x%08X slot=0x%08X t_ms=%.1f tries=%u tick=%lu",SwlTrialName(result.status),
+            knife?"knife":"idle",routine,slot,g_swl.ElapsedMs(w.now),g_swl.lease_tries(),GetTickCount());
+    }
+}
+static void SwlEnd(const swl::World& w,const char* result,const char* reason){
+    uint32_t stop_end=0;LocalMemory m;if(w.global)m.Read32(w.global+oca::freeze_layout::kStopFlg,stop_end);
+    ssl::arm::Part parts[ssl::arm::kLast+1]{};SlotMemory sm;
+    const ssl::arm::Health arm=w.player&&ssl::arm::ReadParts(sm,w.player,parts)?ssl::arm::Judge(parts).health:ssl::arm::Health::Unread;
+    const bool restored=(g_swl_freeze_result==oca::FreezeResult::Restored)&&g_swl_stop_after==g_swl_stop_before;
+    SwlLog("sword_lock end result=%s reason=%s exit=%s owner=0x%08X serial=0x%08X b=0x%08X lease=%u lease_ms=%.1f lease_tries=%u shot=%s "
+        "first_r0=%u first_r1=%u first=%u hp_release=%d hp_min=%d hp_drop=%d freeze=%s stop_before=0x%08X stop_after=0x%08X stop_end=0x%08X "
+        "stop_restored=%u arm=%s watch_cut=%u start_tick=%lu end_tick=%lu t_ms=%.1f",result,reason,swl::ExitName(g_swl_cfg.exit),g_swl.owner(),
+        g_swl.serial(),g_swl.owned(),g_swl.lease_started()?1U:0U,g_swl.lease_ms(),g_swl.lease_tries(),g_swl_shot,unsigned(g_swl_first_r0),
+        unsigned(g_swl_first_r1),g_swl_first?1U:0U,g_swl.hp_release(),g_swl.hp_min(),g_swl.hp_release()-g_swl.hp_min(),
+        SwlFreezeName(g_swl_freeze_result),g_swl_stop_before,g_swl_stop_after,stop_end,restored?1U:0U,ssl::arm::Name(arm),
+        g_swl.watch_cut()?1U:0U,g_swl_start_tick,GetTickCount(),w.readable?g_swl.ElapsedMs(w.now):-1.0);
+}
+// The exit blow on the owner, re-identified first (never a stale pointer): g_swl_shot says what happened.
+static void SwlFire(const swl::World& w){
+    const ose::Blow blow=g_swl_cfg.exit==swl::Exit::Kick?ose::Blow::Charge:ose::Blow::Flash;
+    if(!SwlOwnerAlive(g_swl.owner(),true))g_swl_shot="owner_gone";
+    else{
+        ImageMem m;float pos[3]{};
+        if(!m.Read(w.player+0x94,pos,sizeof(pos)))g_swl_shot="no_link";
+#if LINK_SWORD_LOCK
+        else if(g_swdl_foe==swdl::Foe::DarkLink){   // the flash, else his own knock-down (the kick record); the log says which
+            const auto publish=[](const ose::dmg::PublishArgs& a){return SwlPublish(a);};
+            const ose::Shot flash=ose::Fire(m,g_swl_base,g_swl.owner(),blow,pos,publish);
+            const bool charge=blow==ose::Blow::Flash&&swdl::ChargeAfter(static_cast<swdl::Shot>(flash));
+            const ose::Shot kick=charge?ose::Fire(m,g_swl_base,g_swl.owner(),ose::Blow::Charge,pos,publish):flash;
+            g_swl_shot=ose::ShotName(kick);
+            SwlLog("sword_lock darklink exit blow=%s flash=%s fallback=%s shot=%s owner=0x%08X tick=%lu",charge?"charge":ose::BlowName(blow),
+                ose::ShotName(flash),charge?"kick_0x14":"-",ose::ShotName(kick),g_swl.owner(),GetTickCount());
+        }
+#endif
+        else g_swl_shot=ose::ShotName(ose::Fire(m,g_swl_base,g_swl.owner(),blow,pos,[](const ose::dmg::PublishArgs& a){return SwlPublish(a);}));
+    }
+}
+// Same frame: the exit blow first when the world goes on (swl::AbandonFires and the same load epoch; review 3-nov: else
+// the frozen swing resumes at point blank), then freeze End (Abandoned after a load writes nothing), our lease
+// cancelled when this is the decide. shot=none for a reason that never fires.
+static void SwlAbandon(mortal::dispatch::Runtime* run,const swl::World& w,swl::Abandon why){
+    if(w.readable&&swl::AbandonFires(why)&&SwlEpoch()==g_swl_epoch0)SwlFire(w);
+    const auto fr=SwlFreezeEnd(w);
+    const bool cancelled=SwlCancel(run);
+    SwlLog("sword_lock abandoned reason=%s t_ms=%.1f shot=%s freeze=%s lease_cancel=%u lease_held=%u stop_before=0x%08X stop_after=0x%08X tick=%lu",
+        swl::AbandonName(why),w.readable?g_swl.ElapsedMs(w.now):-1.0,g_swl_shot,SwlFreezeName(fr),cancelled?1U:0U,g_swl_lease?1U:0U,
+        g_swl_stop_before,g_swl_stop_after,GetTickCount());
+    SwlEnd(w,"abandoned",swl::AbandonName(why));
+}
+// At kHoldMs: sample 2000, the exit blow on the owner, then freeze End, then our lease back.
+static void SwlRelease(mortal::dispatch::Runtime* run,const swl::World& w){
+    SwlSample(2000,w);
+    SwlFire(w);
+    const auto fr=SwlFreezeEnd(w);
+    const bool cancelled=SwlCancel(run);
+    ArmTraceArm(CmbFrame());   // arm-trace: every frame for 48 frames after Link is handed back
+    SwlLog("sword_lock release exit=%s weapon=0x%02X shot=%s freeze=%s stop_before=0x%08X stop_after=0x%08X lease_cancel=%u t_ms=%.1f tick=%lu",
+        swl::ExitName(g_swl_cfg.exit),unsigned(swl::ExitWeapon(g_swl_cfg.exit)),g_swl_shot,SwlFreezeName(fr),g_swl_stop_before,g_swl_stop_after,
+        cancelled?1U:0U,g_swl.ElapsedMs(w.now),GetTickCount());
+}
+#if LINK_SWORD_LOCK
+static bool SwkWinSpinHoldsOwner();       // the win spin's hold runs (the H1c block below)
+static void SwkWinSpinDeferOwnerMove();
+static void SwcSwayRestore(const char* why);   // H2c: the owner back at his start before the world goes on
+static void SwsvMotionRestore(const char* why); // candidate 9: the Salvador's parts back where his motion left them
+static void SwhTick();                         // candidate 5: the duel's sword in the hand, every probe tick
+static void SwhEnd(const char* why);            // candidate 5: the hand back (every exit)
+#endif
+static void SwlTick(mortal::dispatch::Runtime* run,void* player){
+    SwlFreezeService();
+#if LINK_SWORD_LOCK
+    SwhTick();   // candidate 5: a pending restore retried, or the sword handed back the frame the duel stops holding Link
+#endif
+    // A lease the lock no longer needs (abandoned on a core frame, where no cancel is possible): handed back here.
+    if(run&&!g_swl.Holding()&&g_swl_lease&&run->active&&run->lease.token==g_swl_lease)SwlCancel(run);
+    const swl::State state=g_swl.state();
+    const bool lab=g_swk_on.load(std::memory_order_acquire);   // H1c lab duel ([Combat] SwordLockLab=1 only)
+    if(state!=swl::State::Queued&&state!=swl::State::Frozen&&state!=swl::State::Releasing){
+        if(lab&&g_swk.stage()!=swk::Stage::Off&&g_swk.stage()!=swk::Stage::Done)SwkFrame(run,SwlWorld());   // its slide or after watch
+#if LINK_SWORD_LOCK
+        else if(lab&&!run)SwkForce(player);   // SwordLockLabForce=1 only: the player's core frame queues as the tier-2 block would
+#endif
+        return;
+    }
+    const bool begin=state==swl::State::Queued;
+    if(begin&&!run)return;   // admission on the decide frame only
+    swl::World w=SwlWorld();
+    if(begin&&(!w.readable||w.player!=reinterpret_cast<uint32_t>(player)||!SwlBegin(w)))return;   // of the current player
+    // A hold the lab never ticks (its startup failed after the probe's): released on the next decide, never left frozen.
+    if(!lab&&g_swl_cfg.external_release&&g_swl.Holding())g_swl.RequestRelease();
+    const swl::Action a=g_swl.Step(w,run!=nullptr);
+#if LINK_SWORD_LOCK
+    if(a.abandon!=swl::Abandon::None&&lab)SwsvMotionRestore("abandon");   // candidate 9: his parts first (they carry the sway too)
+    if(a.abandon!=swl::Abandon::None&&lab)SwcSwayRestore("abandon");   // H2c: before the exit blow and the freeze End
+    if(a.abandon!=swl::Abandon::None&&lab)SwhEnd(swl::AbandonName(a.abandon));   // candidate 5: before the lease is cancelled
+#endif
+    if(a.abandon!=swl::Abandon::None){SwlAbandon(run,w,a.abandon);if(lab)SwkAbandoned(w,a.abandon);return;}
+    if(a.try_lease&&run)SwlLease(*run,w);
+    // last_wait: the last waiting routine (FFFFFFFE no clip, FFFFFFFD dispatch busy, FFFFFFFF none); last_status: TryStartClip's.
+    if(a.lease_gave_up)SwlLog("sword_lock lease result=never tries=%u last_status=%d last_wait=0x%08X t_ms=%.1f tick=%lu",g_swl.lease_tries(),
+        g_swl_refused_status,g_swl_wait_routine,g_swl.ElapsedMs(w.now),GetTickCount());
+    if(a.lease_gave_up&&lab)g_swk.Abort("lease");   // no hold pose: the duel ends at once, released with the flash
+    if(begin)SwlSample(0,SwlWorld());   // the Begin frame, after the lease try
+    if(begin&&lab)SwkStart(w);          // H1c: the duel opens on the Begin frame (the Lock: no input)
+    if(a.samples&swl::Bit(swl::kMid))SwlSample(1000,w);
+    if(a.release){if(lab)SwkRelease(run,w);else SwlRelease(run,w);}
+#if LINK_SWORD_LOCK
+    // A win's Great Spin keeps the world held past the probe's release frame: the owner has not moved yet, so H0's line
+    // waits for the first frame after the hold (SwkWinSpinOwnerMove, `sword_lock duel winspin owner_move`).
+    if(a.first_move&&lab&&SwkWinSpinHoldsOwner())SwkWinSpinDeferOwnerMove();
+    else
+#endif
+    if(a.first_move){   // the owner after its first move with the world running again
+        mtg::Raw r;g_swl_first=SwlOwnerRaw(g_swl.owner(),r);g_swl_first_r0=g_swl_first?r.r0:0;g_swl_first_r1=g_swl_first?r.r1:0;
+        SwlLog("sword_lock owner_move r0=%u r1=%u owner_hp=%d dmg_flag=%u t_ms=%.1f since_release_ms=%.1f tick=%lu",unsigned(g_swl_first_r0),
+            unsigned(g_swl_first_r1),g_swl_first?int(r.hp):0,g_swl_first?unsigned(r.dmg_flag):0U,g_swl.ElapsedMs(w.now),g_swl.SinceReleaseMs(w.now),GetTickCount());
+    }
+    if(a.samples&swl::Bit(swl::kAfter))SwlSample(2016,w);
+    if(a.finished){
+        if(a.samples&swl::Bit(swl::kEnd))SwlSample(3000,w);
+        SwlEnd(w,"released",g_swl.watch_cut()?"watch_cut":"-");
+    }
+    if(lab)SwkFrame(run,w);   // H1c: the duel tick, the release request, the slide, the after watch
+}
+// The dispatch decide (CombinedDecide, before the sword and combat starts) and the player's core frame.
+static void SwordLockDecide(mortal::dispatch::Runtime& run,void* player){SwlTick(&run,player);}
+static void SwordLockFrame(void* player){if(g_swl_on.load(std::memory_order_acquire))SwlTick(nullptr,player);}
+// Worker, after the dispatch is up. Logs nothing with the key off (the 3.5.0 log).
+static void StartSwordLock(unsigned char* base,uint32_t player_slot,uint32_t global_slot,bool dispatch_up){
+    if(!g_swl_cfg.enabled)return;
+    if(!g_swl_wanted){Log("sword_lock probe ready=0: needs ParryGeneralBlock=1 (tier 2 active)");return;}
+    if(!dispatch_up||!player_slot||!global_slot){Log("sword_lock probe ready=0: player dispatch not running");return;}
+    g_swl_base=reinterpret_cast<uint32_t>(base);g_swl_player_slot=player_slot;g_swl_global_slot=global_slot;
+    if(!PinsAt(g_swl_base,link_runtime::native_pins::kOcarinaSongStrike)){Log("sword_lock probe ready=0: publisher native pins (0x1AEEF0) at base 0x%X",g_swl_base);return;}
+    g_swl_clip=g_oca_clip[2]&&g_oca_clip[3];
+    g_swl.Configure(g_swl_cfg);
+    g_swl_on.store(true,std::memory_order_release);
+    Log("sword_lock " SWL_PROBE_NAME " ready=1 exit=%s weapon=0x%02X hold_ms=%.0f watch_ms=%.0f cooldown_ms=%.0f lease_wait_ms=%.0f clip=%s publisher=0x%X " SWL_LAB_TAG,
+        swl::ExitName(g_swl_cfg.exit),unsigned(swl::ExitWeapon(g_swl_cfg.exit)),swl::kHoldMs,swl::kWatchMs,swl::kCooldownMs,swl::kLeaseWaitMs,
+        g_swl_clip?"ocarina_loop":"none (Ocarina Pose=0: freeze and exit only)",g_swl_base+ose::dmg::layout::publisher_rva);
+}
 // dispatch_hooks::player_frame: once the player's core has run, Normal, damage and death frames alike. Each part is
 // inert until its own startup succeeded (g_hud_ready; zlr g_on and the companion's g_comp_on) and runs once per native
-// frame however often it is called (CombinedDecide runs both too). Published only when [Hud] or the companion is asked for.
-static void __cdecl PlayerFrame(void*){
+// frame however often it is called (CombinedDecide runs both too). Published only when [Hud] or the companion is asked for
+// (or the H0 probe's key, which also ticks here on damage and death frames).
+static void __cdecl PlayerFrame(void* player){
     HudFrame();
     zlr::CompanionTick();   // the partner's cast and ray keep going while Link is hit (review 30-oct)
+    SwordLockFrame(player); // H0 probe: inert unless StartSwordLock succeeded ([Combat] SwordLockProbe=1)
 }
+// Master Sword Blade Lock H1a: the glyph census (sword_lock_glyphs.h; docs/idea-ambiciosa-2026-11-03.md, hito H1a).
+// [Combat] SwordLockGlyphCensus=1 only: a lab DLL, never published. With the key missing or 0 nothing of this block is
+// installed or runs: no hook, no write, no line (the arbiter detour's two calls return at once).
+// Game thread (the combat arbiter detour 0x18AB40, which must be installed: MortalDrawContextual or the sword actions):
+// SwordLockCensusEntry, before the native arbiter and after the Mortal Draw prompt: one census tick (the key-bit line on
+// a change of Key_btn_on; the cycle; our offer through cActionButton::set with func NULL, kind 0x44, flags ENFORCE_EXEC,
+// only with the native queue empty and no Mortal Draw prompt offered this frame, and the work set() filled);
+// SwordLockCensusExit, after it: whether the arbiter drew ours (+0x42 and the cockpit btn/kind disp wrote) and the QTE
+// byte. CmbArbiterExit subtracts our offer from the post-arbiter sample (ClaimOwnOffer), so neither the Mortal Draw
+// arbiter nor SwordArbiter takes it for a native prompt. The pad pass writes the selector [0xE224B0] to 1 only inside our set() call and
+// inside ActionButton::move (hooked, kMovePins) while the cockpit holds our kind; it is put back right after either.
+// Worker: StartSwordLockCensus; its lines go through the H0 ring (SwlLog / PollSwordLock).
+namespace swg=link_runtime::sword_lock::glyphs;
+static swg::CensusConfig g_swg_cfg;
+static std::atomic<bool> g_swg_on{false};      // StartSwordLockCensus succeeded
+static swg::Census g_swg;                      // game thread
+static swg::KeyWatch g_swg_keys;
+static uint32_t g_swg_base=0,g_swg_player_slot=0,g_swg_global_slot=0;
+static bool g_swg_injected=false,g_swg_pad=false;
+static std::atomic<bool> g_swg_force{false};         // the pad pass's offer is open (move may force the selector)
+static std::atomic<uint32_t> g_swg_forced{0};        // moves run with the forced selector (all offers)
+static uint32_t g_swg_forced_base=0;
+using SwgMoveFn=void(__thiscall*)(void*);
+static SwgMoveFn g_swg_move_original=nullptr;
+using SwgActSet=void(__thiscall*)(void*,int,int,void*,void*,int,int,int,void*);
+static int32_t SwgRead32(uint32_t rva){int32_t v=-1;CmbMem m;if(!g_swg_base||!m.Read(g_swg_base+rva,&v,4))v=-1;return v;}
+static unsigned SwgRead8(uint32_t rva){uint8_t v=0;CmbMem m;if(!g_swg_base||!m.Read(g_swg_base+rva,&v,1))v=0;return v;}
+static swg::CensusWorld SwgWorld(){
+    namespace fl=oca::freeze_layout;
+    swg::CensusWorld w;LocalMemory m;uint32_t player=0,global=0,room=0,frame=0;
+    if(!m.Read32(g_swg_player_slot,player)||!link_runtime::IsPointer(player)||!m.Read32(g_swg_global_slot,global)||!link_runtime::IsPointer(global)||
+       !m.Read32(global+fl::kRoomId,room)||!m.Read32(global+link_runtime::game_clock::kFrameCounterOffset,frame))return w;
+    LocalMemory lm;link_runtime::HealthState health;
+    w.readable=true;w.player=player;w.global=global;w.room=room&0xFFFF;w.frame=frame;w.now=GameNow(g_swg_global_slot);
+    w.gameplay=link_runtime::ReadHealth(lm,g_swg_player_slot,g_swg_global_slot,health)&&health.eligible;
+    return w;
+}
+// Our set(): the selector forced to 1 for the call only (pad pass), put back whatever happens inside.
+static bool SwgSet(void* manager,uint8_t b,bool force){
+    volatile int32_t* selector=reinterpret_cast<volatile int32_t*>(g_swg_base+swg::rva::kSelector);
+    __try{
+        const int32_t old=*selector;
+        if(force)*selector=1;
+        __try{reinterpret_cast<SwgActSet>(g_swg_base+mdp::layout::set_rva)(manager,swg::kCensusKind,0,nullptr,nullptr,static_cast<int>(swg::kCensusFlags),b,0,nullptr);}
+        __finally{if(force)*selector=old;}
+        return true;
+    }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
+// ActionButton::move (thiscall, ECX = the cockpit 0x8510B5): with the pad pass's offer open and our kind in the cockpit,
+// the icon is picked with the selector at 1 (0x1A2FF6), then the selector goes back. Anything else passes through.
+static void __fastcall SwgMoveDetour(void* self,void*){
+    const uint32_t cockpit=g_swg_base+swg::rva::kCockpit;
+    if(!g_swg_force.load(std::memory_order_acquire)||reinterpret_cast<uint32_t>(self)!=cockpit||SwgRead8(swg::rva::kCockpitKind)!=swg::kCensusKind){
+        g_swg_move_original(self);return;
+    }
+    volatile int32_t* selector=reinterpret_cast<volatile int32_t*>(g_swg_base+swg::rva::kSelector);
+    const int32_t old=*selector;
+    *selector=1;
+    __try{g_swg_move_original(self);}__finally{*selector=old;}
+    g_swg_forced.fetch_add(1,std::memory_order_relaxed);
+}
+static void SwgOfferLine(const swg::OfferStats& s){
+    const int32_t used=s.Used();
+    SwlLog("sword_lock glyph census btn=0x%02X device=%s selector=%d shown=%u remapped=0x%02X glyph=0x%02X pass=%s name=%s forced=%u frames=%u "
+        "injected=%u own=%u displayed=%u native=%u paused=%u unreadable=%u set_failed=%u remap_ok=%u work=%u:0x%02X work_btn=0x%02X "
+        "work_func=0x%08X work_flags=0x%X cockpit_btn=0x%02X cockpit_kind=0x%02X forced_moves=%u qte=%u renderer=%d selector_changes=%u "
+        "md=%u aborted=%u t_ms=%.0f tick=%lu",
+        unsigned(s.btn),swg::PadColumn(used)?"pad":"pc",s.selector,s.Shown()?1U:0U,unsigned(s.remapped),unsigned(s.glyph),swg::PassName(s.pass),
+        swg::BtnName(s.btn),s.pass==swg::Pass::PadForced&&s.forced_moves?1U:0U,s.frames,s.injected,s.own,s.displayed,s.native,s.paused,s.unreadable,s.set_failed,
+        s.injected&&!s.remap_bad?1U:0U,unsigned(s.work_count),unsigned(s.work_kind),unsigned(s.work_btn),s.work_func,s.work_flags,
+        unsigned(s.cockpit_btn),unsigned(s.cockpit_kind),s.forced_moves,s.qte,s.renderer,s.selector_changes,s.md,s.aborted?1U:0U,s.t_ms,
+        GetTickCount());
+}
+static void SwgKeys(uint8_t offer){
+    CmbMem m;uint64_t on=0,trg=0;
+    if(!m.Read(g_swg_base+swg::rva::kKeyOn,&on,8)||!m.Read(g_swg_base+swg::rva::kKeyTrg,&trg,8))return;
+    const swg::KeyChange k=g_swg_keys.Step(on,GetTickCount64());
+    if(!k.log)return;
+    SwlLog("sword_lock glyph census key bits=0x%016llX trg=0x%016llX rise=0x%016llX fall=0x%016llX offer=0x%02X selector=%d renderer=%d "
+        "qte=%u skipped=%u frame=%u tick=%lu",on,trg,k.rise,k.fall,unsigned(offer),SwgRead32(swg::rva::kSelector),
+        SwgRead32(swg::rva::kRendererDevice),SwgRead8(swg::rva::kQteFlag),k.skipped,CmbFrame(),GetTickCount());
+}
+static void SwordLockCensusEntry(void* self,bool md_offered){
+    if(!g_swg_on.load(std::memory_order_acquire))return;
+    g_swg_injected=false;
+    if(g_swg.Offering())g_swg.current().forced_moves=g_swg_forced.load(std::memory_order_relaxed)-g_swg_forced_base;
+    const swg::CensusWorld w=SwgWorld();
+    const swg::CensusPlan p=g_swg.Step(w);
+    SwgKeys(g_swg.Offering()?g_swg.current().btn:0);
+    if(p.offer_end)SwgOfferLine(g_swg.last());
+    if(p.restart)SwlLog("sword_lock glyph census restart reason=%s room=0x%04X tick=%lu",p.restart_reason,w.room,GetTickCount());
+    if(p.cycle_end)SwlLog("sword_lock glyph census cycle end n=%u offers=%u shown=%u tick=%lu",g_swg.cycles(),g_swg.cycle_offers(),
+        g_swg.cycle_shown(),GetTickCount());
+    if(p.cycle_begin)SwlLog("sword_lock glyph census cycle begin n=%u room=0x%04X passes=%u offers=%u selector=%d renderer=%d tick=%lu",
+        g_swg.cycles(),w.room,g_swg.Passes(),g_swg.Slots(),SwgRead32(swg::rva::kSelector),SwgRead32(swg::rva::kRendererDevice),GetTickCount());
+    if(p.offer_begin){
+        const swg::OfferStats& c=g_swg.current();
+        const int32_t selector=SwgRead32(swg::rva::kSelector),used=c.pass==swg::Pass::PadForced?1:selector;
+        const uint8_t remap=swg::Remap(c.btn,used);
+        g_swg_forced_base=g_swg_forced.load(std::memory_order_relaxed);
+        SwlLog("sword_lock glyph census offer btn=0x%02X name=%s pass=%s slot=%u selector=%d expect_remap=0x%02X expect_glyph=0x%02X tick=%lu",
+            unsigned(c.btn),swg::BtnName(c.btn),swg::PassName(c.pass),c.slot,selector,unsigned(remap),unsigned(swg::Glyph(remap,used)),GetTickCount());
+    }
+    g_swg_force.store(g_swg_pad&&g_swg.Offering()&&g_swg.current().pass==swg::Pass::PadForced,std::memory_order_release);
+    if(!p.inject)return;
+    swg::OfferStats& s=g_swg.current();
+    if(md_offered){++s.md;return;}   // the Mortal Draw prompt keeps priority
+    CmbMem m;mdp::EntryFacts e;
+    if(!mdp::ReadEntry(m,g_swg_base,e)){++s.unreadable;return;}
+    if(e.offers||e.lock||e.actions_disabled){++s.native;return;}   // native offers always win
+    if(reinterpret_cast<uint32_t>(self)!=g_swg_base+swg::rva::kManager){++s.set_failed;return;}
+    const int32_t selector=SwgRead32(swg::rva::kSelector);
+    if(!SwgSet(self,p.btn,p.pass==swg::Pass::PadForced)){++s.set_failed;return;}
+    g_swg_injected=true;   // queued: the post-arbiter sample must not take it for a native offer, whatever the read below
+    swg::WorkFacts work;
+    if(swg::ReadWork(m,g_swg_base,work))g_swg.Injected(selector,SwgRead32(swg::rva::kRendererDevice),work);
+    else ++s.unreadable;   // no remap verdict from a failed read
+}
+static bool SwordLockCensusExit(){
+    if(!g_swg_injected)return false;
+    g_swg_injected=false;
+    g_swg.Exit(static_cast<uint8_t>(SwgRead8(swg::rva::kManager+swg::rva::kManagerActive)),static_cast<uint8_t>(SwgRead8(swg::rva::kCockpit)),
+        static_cast<uint8_t>(SwgRead8(swg::rva::kCockpitKind)),static_cast<uint8_t>(SwgRead8(swg::rva::kQteFlag)));
+    return true;
+}
+// Worker, after StartCombat (the arbiter hook). Logs nothing with the key off (the 3.5.0 log).
+static void StartSwordLockCensus(unsigned char* base,uint32_t player_slot,uint32_t global_slot){
+    if(!g_swg_cfg.enabled)return;
+    const uint32_t b=reinterpret_cast<uint32_t>(base);
+    const char* why=nullptr;
+    if(!g_cmb_arbiter_original)why="arbiter_hook";   // the combat arbiter hook (MortalDrawContextual or the sword actions)
+    else if(!b||!player_slot||!global_slot)why="slots";
+    else if(!PinsAt(b,link_runtime::native_pins::kMortalDrawPrompt)||!PinsAt(b,swg::kCensusPins))why="pins";
+    if(why){Log("sword_lock glyph census ready=0 reason=%s base=0x%X",why,b);return;}
+    g_swg_base=b;g_swg_player_slot=player_slot;g_swg_global_slot=global_slot;
+    const bool bits=PinsAt(b,swg::kBitPins);
+    const char* pad="off";
+    if(g_swg_cfg.pad){
+        if(!PinsAt(b,swg::kMovePins))pad="pins";
+        else{
+            void* target=reinterpret_cast<void*>(b+swg::rva::kMove);
+            MH_STATUS s=MH_CreateHook(target,reinterpret_cast<void*>(&SwgMoveDetour),reinterpret_cast<void**>(&g_swg_move_original));
+            if(s==MH_OK&&(s=MH_EnableHook(target))!=MH_OK)MH_RemoveHook(target);
+            g_swg_pad=s==MH_OK&&g_swg_move_original;
+            pad=g_swg_pad?"on":"hook";
+        }
+    }
+    swg::CensusConfig cfg=g_swg_cfg;cfg.pad=g_swg_pad;
+    g_swg.Configure(cfg);
+    g_swg_on.store(true,std::memory_order_release);
+#if !LINK_SWORD_LOCK_GRADUATED
+    Log("sword_lock glyph census ready=1 pad_pass=%s offer_ms=%u gap_ms=%u settle_ms=%u kind=0x%02X flags=0x%X btns=0x%02X..0x%02X selector=%d "
+        "renderer=%d bits_pinned=%u lab=1",pad,cfg.offer_ms,cfg.gap_ms,cfg.settle_ms,unsigned(swg::kCensusKind),swg::kCensusFlags,
+        unsigned(swg::btn::kFirst),unsigned(swg::btn::kLast),SwgRead32(swg::rva::kSelector),SwgRead32(swg::rva::kRendererDevice),bits?1U:0U);
+#else
+    (void)bits;(void)pad;   // 3.6.0: never reached (no census key is read); no census line in the DLL
+#endif
+}
+// ---------------------------------------------------------------------------------------------
+#if LINK_SWORD_LOCK
+// Master Sword Blade Lock H1c: the minimal playable lab duel (sword_lock_lab.h; docs/idea-ambiciosa-2026-11-03.md, "Plan de
+// H1c y camino al 100% (ronda 5)"). [Combat] SwordLock=1 and SwordLockLab=1 only: a lab DLL, never published, never in a
+// layer. With the keys missing or 0 nothing of this block runs or is installed: the PadRead hook stays CaseKeyDebounce's
+// (its duel slot null), the arbiter detour's two calls and the probe's ticks return at once, no write, no line.
+// It drives the H0 machine above with Config::external_release: the same queue from the tier-2 chainsaw block, the
+// admission (plus the crowd rule), WorldFreeze, lease and same-frame abandons; the duel decides the release.
+// Game thread: SwordLockPad (case_key_debounce's first after-slot: the duel's input, then the mask; HudMenuFrame runs
+// after it and every later reader of 0x862F08/0x862F10 in the frame, parry_input_runtime, zelda_light, ztarget_native and
+// zelda_cast_pose_runtime among them, reads the masked words), SwordLockDuelEntry/Exit (the arbiter: one native offer
+// and whether it was drawn), Swk* from the probe's ticks (decide and core frames). Worker: StartSwordLockDuel. Lines go
+// through the H0 ring (SwlLog / PollSwordLock), every one starting "sword_lock duel ".
+static uint32_t g_swk_base=0;
+static double g_swk_gain=swk::kDefaultMashGain; // [Combat] SwordLockMashGain: PV per counted mash flank (lab DLL only)
+static swl::Config g_swl_probe_key;            // [Combat] SwordLockProbe as read (put back if the lab cannot start)
+static swk::SavedSwing g_swk_swing;            // the parry's Follow right after the block that queued the duel
+static float g_swk_hit[3]{};                   // the block's contact point (the Traba's sparks)
+static swk::Crowd g_swk_crowd;
+static unsigned g_swk_opens=0,g_swk_crowd_refusals=0,g_swk_hits=0;
+static int g_swk_level=-1,g_swk_mode=-1;
+// H1d (sword_lock_draw.h): the drawn duel. The Drawer (its Sorter and history) lives for the whole session: two duels in a
+// row never ask for the same physical signature. [Combat] SwordLockPool/WindowScale/Hold/Seed/CapMs/MashGain as read.
+namespace swd=link_runtime::sword_lock::draw;
+static swd::Config g_swd_cfg;
+static swd::Drawer g_swd;
+static swd::Plan g_swd_plan;                   // this duel's (drawn, or H1c's fixed sequence with its why)
+static swd::Offers g_swd_offers;               // one native offer per step (game thread)
+// H3 (sword_lock_sound.h): TP's lock sounds and the sparks. The director runs on the game thread and publishes what to
+// play through these atomics; the poll thread (PollSwordLock) plays it on its own waveOut devices, never the game's.
+namespace sws=link_runtime::sword_lock::sound;
+static sws::Config g_sws_cfg;
+static sws::Director g_sws;                    // game thread
+static std::atomic<uint32_t> g_sws_loops{0},g_sws_shots[sws::kShotCount]{};
+static std::atomic<bool> g_sws_ready{false};   // the WAVs loaded (worker), the poll thread may play
+static unsigned g_sws_sparks[4]{};             // bursts submitted per Spark kind (lock, hit, win), this duel
+// A looped buffer on its own device (WHDR_BEGINLOOP|ENDLOOP): the WAV's seam was crossfaded offline
+// (scripts/sword_lock_sounds.py), so the device loops it with no click. Poll thread only after Load.
+class SwsLoop {
+    HWAVEOUT out=nullptr;WAVEHDR header{};link_runtime::WaveData wave;bool playing=false;
+public:
+    SwsLoop()=default;SwsLoop(const SwsLoop&)=delete;SwsLoop& operator=(const SwsLoop&)=delete;
+    ~SwsLoop(){if(out){waveOutReset(out);waveOutUnprepareHeader(out,&header,sizeof(header));waveOutClose(out);}}
+    bool Loaded()const{return out!=nullptr;}
+    bool Load(const wchar_t* path,unsigned volume,const char* sha){
+        std::vector<unsigned char> bytes;FILE* file=nullptr;
+        if(_wfopen_s(&file,path,L"rb")||!file)return false;
+        std::fseek(file,0,SEEK_END);const long length=std::ftell(file);std::rewind(file);
+        if(length<44||length>2*1024*1024){std::fclose(file);return false;}
+        bytes.resize(size_t(length));const size_t read=std::fread(bytes.data(),1,bytes.size(),file);std::fclose(file);
+        unsigned char digest[32]{};namespace hash=link_runtime::mortal_draw::resident_assets::detail;
+        if(read!=bytes.size()||!hash::Hash(bytes.data(),bytes.size(),digest)||!hash::Matches(digest,sha)||
+           !link_runtime::ParseWave(bytes,wave)||!wave.channels)return false;
+        link_runtime::ScaleWave(wave,volume);
+        WAVEFORMATEX f{};f.wFormatTag=WAVE_FORMAT_PCM;f.nChannels=WORD(wave.channels);f.nSamplesPerSec=wave.rate;
+        f.wBitsPerSample=16;f.nBlockAlign=WORD(wave.channels*2);f.nAvgBytesPerSec=f.nSamplesPerSec*f.nBlockAlign;
+        if(waveOutOpen(&out,WAVE_MAPPER,&f,0,0,CALLBACK_NULL)!=MMSYSERR_NOERROR){out=nullptr;return false;}
+        header.lpData=reinterpret_cast<LPSTR>(wave.pcm.data());header.dwBufferLength=DWORD(wave.pcm.size());
+        if(waveOutPrepareHeader(out,&header,sizeof(header))!=MMSYSERR_NOERROR){waveOutClose(out);out=nullptr;return false;}
+        return true;
+    }
+    bool Play(){
+        if(!out||playing)return playing;
+        waveOutReset(out);
+        header.dwFlags=(header.dwFlags&WHDR_PREPARED)|WHDR_BEGINLOOP|WHDR_ENDLOOP;header.dwLoops=0x7FFFFFFF;
+        playing=waveOutWrite(out,&header,sizeof(header))==MMSYSERR_NOERROR;
+        return playing;
+    }
+    void Stop(){if(out&&playing)waveOutReset(out);playing=false;}
+};
+static SwsLoop g_sws_loop[sws::kLoopCount];
+static link_runtime::ztarget::voice::Voice g_sws_shot[sws::kShotCount];
+static void SwsPublish(){
+    const sws::Out& o=g_sws.out();
+    g_sws_loops.store(o.loops,std::memory_order_release);
+    for(unsigned i=0;i<sws::kShotCount;++i)g_sws_shots[i].store(o.shots[i],std::memory_order_release);
+}
+static void SwsContact(){
+    if(!g_sws_cfg.sound||!g_sws.on())return;
+    g_sws.Contact(g_swk.duel().game_ms());SwsPublish();
+}
+// Poll thread: the loops wanted now (all off when RE4 is not in front), and one play per one-shot counter step.
+static void SwsPollAudio(){
+    if(!g_sws_ready.load(std::memory_order_acquire))return;
+    static uint32_t played[sws::kShotCount]{};static bool first=true;
+    DWORD pid=0;GetWindowThreadProcessId(GetForegroundWindow(),&pid);
+    const bool front=pid==GetCurrentProcessId();
+    const uint32_t loops=front?g_sws_loops.load(std::memory_order_acquire):0;
+    for(unsigned i=0;i<sws::kLoopCount;++i){if(loops&sws::LoopBit(i))g_sws_loop[i].Play();else g_sws_loop[i].Stop();}
+    for(unsigned i=0;i<sws::kShotCount;++i){
+        const uint32_t n=g_sws_shots[i].load(std::memory_order_acquire);
+        if(!first&&n!=played[i]&&front)g_sws_shot[i].Play();
+        played[i]=n;
+    }
+    first=false;
+}
+// The native parry sparks (CORE 0x1F/0x20, parry_spark_runtime.h EmitFree) at the block's contact point, turned from
+// Link toward it as the Traba's. Cosmetic: a submission only.
+static unsigned SwsSpark(sws::Spark kind){
+    if(!g_sws_cfg.sparks||kind==sws::Spark::None)return 0;
+    uint32_t player=0;LocalMemory lm;float link[3]{},rot[3]{};ImageMem m;
+    if(!lm.Read32(g_swl_player_slot,player)||!link_runtime::IsPointer(player)||!m.Read(player+0x94,link,sizeof(link)))return 0;
+    const float dx=g_swk_hit[0]-link[0],dy=g_swk_hit[1]-link[1],dz=g_swk_hit[2]-link[2];
+    rot[0]=-std::atan2(dy,std::sqrt(dx*dx+dz*dz));rot[1]=std::atan2(dx,dz);
+    const unsigned n=link_runtime::parry::spark::EmitFree(g_gen.sparks,&g_swk_hit,&rot,1);
+    g_sws_sparks[static_cast<unsigned>(kind)]+=n;
+    return n;
+}
+static const char* g_swk_draw_stun="-";   // candidate 3: the draw stun's shot for the end line (SwkDrawStun)
+static bool g_swk_follow=false,g_swk_push_pending=false,g_swk_readers_mid=false,g_swk_readers_after=false,g_swk_actbtn_logged=false;
+static unsigned g_swk_entries=0,g_swk_own_entry=0;   // arbiter entries in the duel, and the last one that queued our offer
+static bool g_swk_slide_hook=false,g_swk_offer_hook=false;
+static swk::ExitPlan g_swk_push;
+static float g_swk_push_from[3]{};static bool g_swk_push_from_ok=false;   // Link at the push release (the real travel)
+static bool g_swk_push_started=false;          // our slide started (g_push may still hold the parry's own aborted one)
+static swk::Offer g_swk_offer;                 // the offer wanted on the last arbiter frame (gaps excluded)
+static bool g_swk_offer_shown=false;           // that offer was drawn once (its line is out)
+static unsigned g_swk_offer_frames=0,g_swk_offers=0,g_swk_shown=0,g_swk_native=0,g_swk_md=0,g_swk_unread=0,g_swk_set_failed=0;
+static unsigned g_swk_qte_raised=0,g_swk_actbtn=0;
+static uint32_t g_swk_entry_stop=0;static uint8_t g_swk_entry_qte=0;
+// [Combat] SwordLockLabForce=1 (sword_lock_lab.h Force): the request queued last was the trigger's, not a parry's.
+static swk::ForceConfig g_swk_force_cfg;
+static swk::Force g_swk_force;
+static bool g_swk_forced=false;
+static swk::ForceWhy g_swk_force_why=swk::ForceWhy::Off;   // the last owner/crowd reason logged (one line per change)
+static DWORD g_swk_force_log=0;
+// [Combat] SwordLockWinSpin (sword_lock_winspin.h; missing = 1): a win's Great Spin with the world still held.
+static swk::WinSpinConfig g_swkw_cfg;
+static swk::WinSpinReady g_swkw_ready=swk::WinSpinReady::Off;   // StartSwordLockDuel's verdict (SpinAttack, clip, waiver, adapter)
+static swk::WinSpinHold g_swkw;                // game thread: from the probe's release frame to the freeze End
+static swk::Pushes g_swkw_push;                // the spin's targets at its strike, watched in the after watch (pushed=)
+static bool g_swkw_due=false;                  // this duel was a win with the key on: its `winspin end` line is due
+static bool g_swkw_struck=false,g_swkw_lease_over=false;
+static uint64_t g_swkw_lease=0;
+static unsigned g_swkw_targets=0,g_swkw_close=0,g_swkw_need=0,g_swkw_dropped=0,g_swkw_published=0,g_swkw_applied=0,g_swkw_skipped=0;
+static const char* g_swkw_why="-";             // why the world went on (SpinWhyName) or why there was no spin (readiness)
+static const char* g_swkw_wait="-";            // what kept SwordDecide's gate shut on the last decide without a request
+static const char* g_swkw_lease_end="-";       // the spin lease's end event (finished, cancelled, abandoned)
+static uint32_t g_swkw_player=0,g_swkw_global=0,g_swkw_room=0;   // the world at the release frame (a load ends the hold)
+static double g_swkw_deadline=0;               // the hit list's deadline set at the strike (WinSpinDeadline, game frames)
+static bool g_swkw_expired=false;              // that deadline passed while held (released as `expired`)
+// H0's owner_move would read the owner still frozen during the hold: deferred to the first frame after the world goes on.
+static bool g_swkw_owner_due=false;
+static uint32_t g_swkw_world_frame=0;          // the frame the hold ended (SwlFreezeEnd)
+static swk::Crowd g_swk_crowd3,g_swk_crowd8;   // the admission's scene against 3 m and the old 8 m rule (log only)
+static void SwkWinSpinReset();
+static void SwkWinSpinClose(const swl::World& w,swk::SpinWhy why);
+static int32_t SwkSelector(){return g_swk_base?CmbGet<int32_t>(g_swk_base+swg::rva::kSelector):-1;}
+static uint32_t SwkStop(){const uint32_t g=CmbGet<uint32_t>(g_swl_global_slot);return link_runtime::IsPointer(g)?CmbGet<uint32_t>(g+oca::freeze_layout::kStopFlg):0;}
+static const char* SwkResult(){return g_swk.abandoned()?"abandoned":swk::sd::ResultName(g_swk.duel().result());}
+static const char* SwkArm(const swl::World& w){
+    ssl::arm::Part parts[ssl::arm::kLast+1]{};SlotMemory sm;
+    return ssl::arm::Name(w.player&&ssl::arm::ReadParts(sm,w.player,parts)?ssl::arm::Judge(parts).health:ssl::arm::Health::Unread);
+}
+static bool SwkRestored(){return g_swl_freeze_result==oca::FreezeResult::Restored&&g_swl_stop_after==g_swl_stop_before;}
+// The duel's own icons (sword_lock_icons.h, route B1 of D:/link-in-re4-work/swordlock-icons/ruta.md): the key bound to
+// KEY_KAMAE_KNIFE (the mashes) and KEY_A (the break) drawn from the native atlas 0xA5 with the UV of its record, at the QTE
+// prompt's place (0,-89), animated with the duel (8 Hz hammer, a ring per counted flank, the break's ring closing with the
+// window, gold flash on a hit, red shake on a miss), class 0x3E, 6 units, no texture of its own. With the icon live the
+// offers go out with btn 0 (move() skips the glyph); without it (pins, a pad, a key without face, no_tex, set_failed,
+// class_taken) they are H1c's exactly. Game thread: SwiStart (the Begin frame: the faces through the native chain),
+// SwiFrame (the duel's ticks, once per native frame), SwiPause (after PadRead: a pause hides the icon even with no player
+// frame), SwiReset (the end or an abandon), SwiIcon (the arbiter's choice). Lines "sword_lock icon " through the H0 ring.
+namespace swi=link_runtime::sword_lock::icons;
+struct SwiNative {   // the staff's IdSys calls with our class, and the key chain of sword_lock_icons.h Query (SEH around each)
+    uint32_t base=g_swk_base;
+    bool Read(uint32_t a,void* out,size_t n){CmbMem m;return m.Read(a,out,n);}
+    bool Write(uint32_t a,const void* in,size_t n){CmbMem m;return m.Write(a,in,n);}
+    void Set(const void* table){__try{reinterpret_cast<void(__thiscall*)(void*,const void*,uint8_t,int,uint8_t,uint8_t,uint32_t)>(base+swi::layout::set_thunk_rva)(
+        reinterpret_cast<void*>(base+swi::layout::idsys_rva),table,0xFF,swi::layout::id_class,swi::layout::ot_type,swi::layout::ot_no,0);}__except(EXCEPTION_EXECUTE_HANDLER){}}
+    void Kill(){__try{reinterpret_cast<void(__thiscall*)(void*,uint8_t,int)>(base+swi::layout::kill_thunk_rva)(reinterpret_cast<void*>(base+swi::layout::idsys_rva),0xFF,swi::layout::id_class);}__except(EXCEPTION_EXECUTE_HANDLER){}}
+    uint32_t UnitPtr(uint8_t mark){__try{return reinterpret_cast<uint32_t(__thiscall*)(void*,uint8_t,int)>(base+swi::layout::unit_ptr_thunk_rva)(reinterpret_cast<void*>(base+swi::layout::idsys_rva),mark,swi::layout::id_class);}__except(EXCEPTION_EXECUTE_HANDLER){return 0;}}
+    bool ActiveMap(uint32_t mgr,uint32_t& map){
+        __try{map=reinterpret_cast<uint32_t(__thiscall*)(void*)>(base+swi::rva::kActiveMap)(reinterpret_cast<void*>(mgr));return true;}__except(EXCEPTION_EXECUTE_HANDLER){return false;}
+    }
+    bool Find(uint32_t map,uint64_t logical,uint32_t& node){
+        __try{uint32_t it=0;reinterpret_cast<uint32_t*(__thiscall*)(void*,uint32_t*,const uint64_t*)>(base+swi::rva::kFind)(reinterpret_cast<void*>(map),&it,&logical);
+            node=it;return true;}__except(EXCEPTION_EXECUTE_HANDLER){return false;}
+    }
+    bool KeyGlyph(uint32_t lo,uint32_t hi,swi::Record& out){
+        __try{reinterpret_cast<void*(__cdecl*)(swi::Record*,uint32_t,uint32_t)>(base+swi::rva::kKeyGlyph)(&out,lo,hi);return true;}__except(EXCEPTION_EXECUTE_HANDLER){return false;}
+    }
+};
+static bool g_swi_ready=false;                 // the icon's pins and the IdSys pins matched (worker, before g_swk_on)
+static swi::Faces g_swi_faces;
+static swi::Icon g_swi;
+static swi::Painter<SwiNative> g_swi_painter;
+static swi::PaintWhy g_swi_why=swi::PaintWhy::Idle;
+static swi::Hide g_swi_hide=swi::Hide::Off;static swi::Mode g_swi_mode=swi::Mode::None;static uint8_t g_swi_ctl=0xFF;
+static uint32_t g_swi_frame=0xFFFFFFFFu,g_swi_ev=0;
+static int32_t g_swi_device=-1,g_swi_sel=-1;
+static double g_swi_retry=0;                   // duel game ms of the next try of a face that was not ready
+static bool g_swi_live=false,g_swi_stats_due=false;
+static int g_swi_choice=-1;                    // the last offer: 1 our icon (btn 0), 0 H1c's (logged on change)
+static unsigned g_swi_shown=0,g_swi_hidden=0,g_swi_paused=0,g_swi_fallback=0,g_swi_lost=0,g_swi_notex=0,g_swi_gaps=0,g_swi_retries=0;
+static void SwiKeyLine(const char* ctl,const swi::Face& f){
+    SwlLog("sword_lock icon key ctl=%s logical=0x%08X code=0x%X:0x%X idx=%d uv=%.4f,%.4f,%.4f,%.4f px=%.0fx%.0f size=%.1fx%.1f why=%s device=%d "
+        "sel=%d tick=%lu",ctl,static_cast<uint32_t>(f.logical),f.lo,f.hi,f.idx,f.uv[0],f.uv[1],f.uv[2],f.uv[3],f.px_w,f.px_h,f.w,f.h,
+        swi::WhyName(f.why),g_swi_device,g_swi_sel,GetTickCount());
+}
+// The faces of the bound keys through the native chain (H1d: the knife, the action, D, A and the right mouse button of the
+// gameplay set); a pad draws other cockpit textures (out of scope): every face why=device. Reads only, logs nothing.
+static swi::Faces SwiQueryFaces(int32_t device,int32_t sel){
+    swi::Faces f;
+    swi::Face* const all[]={&f.knife,&f.action,&f.right,&f.left,&f.aim};
+    const uint64_t logical[]={swi::kLogicalKnife,swi::kLogicalAction,swi::kLogicalRight,swi::kLogicalLeft,swi::kLogicalAim};
+    const bool pc=g_swi_ready&&swi::KeyboardGlyphs(device,sel);
+    SwiNative n;
+    for(unsigned i=0;i<5;++i){
+        if(pc)*all[i]=swi::Resolve(swi::Query(n,logical[i]));
+        else{*all[i]=swi::Face{};all[i]->why=g_swi_ready?swi::Why::Device:swi::Why::Off;all[i]->logical=logical[i];}
+    }
+    return f;
+}
+// The key lines go out on the duel's first resolve (log) and then only when a face really changes (swi::KeyLineDue: its
+// ok, why, code or idx; H1d review 4-nov: a device flip keyboard <-> mouse, 0x806F44 0/1, draws the same keys and logs
+// nothing): a transient face asked again every 500 ms counts in the stats line (retries=).
+static void SwiResolve(bool log){
+    const swi::Faces was=g_swi_faces;
+    g_swi_faces=SwiQueryFaces(g_swi_device,g_swi_sel);
+    const swi::Face* const before[]={&was.knife,&was.action,&was.right,&was.left,&was.aim};
+    const swi::Face* const now[]={&g_swi_faces.knife,&g_swi_faces.action,&g_swi_faces.right,&g_swi_faces.left,&g_swi_faces.aim};
+    const char* const name[]={"knife","action","right","left","aim"};
+    for(unsigned i=0;i<5;++i)if(swi::KeyLineDue(log,*before[i],*now[i]))SwiKeyLine(name[i],*now[i]);
+}
+// The Begin frame: a fresh icon and the faces of this duel (the bindings cannot change while the world is held; a device
+// change or a face that was not ready is asked again from SwiFrame).
+static void SwiStart(){
+    if(!g_swi_ready)return;
+    g_swi.Reset();g_swi_ev=0;g_swi_frame=0xFFFFFFFFu;g_swi_why=swi::PaintWhy::Idle;g_swi_hide=swi::Hide::Off;g_swi_mode=swi::Mode::None;
+    g_swi.SetScale(g_swd_cfg.prompt_scale);   // candidate 5: the larger prompt (SwordLockPromptScale)
+    g_swi.SetSwingPair(true);                  // candidate 5: the A/D mash as both keys
+    g_swi_ctl=0xFF;g_swi_choice=-1;g_swi_retry=0;g_swi_stats_due=true;
+    g_swi_shown=g_swi_hidden=g_swi_paused=g_swi_fallback=g_swi_lost=g_swi_notex=g_swi_gaps=g_swi_retries=0;
+    g_swi_device=CmbGet<int32_t>(g_swk_base+swi::rva::kDevice);g_swi_sel=SwkSelector();
+    SwiResolve(true);
+    g_swi_live=swi::KeyboardGlyphs(g_swi_device,g_swi_sel)&&g_swi_faces.Any();
+}
+// The end of the duel (its last tick, the release, an abandon): the units go back to the pool, once, with the stats.
+static void SwiReset(const char* why){
+    if(!g_swi_ready)return;
+    SwiNative n;const bool live=g_swi_painter.Live();const unsigned visible=g_swi_painter.visible();
+    if(live||g_swi_stats_due)SwlLog("sword_lock icon hide why=%s units=%d live=%u visible=%u t_ms=%.1f tick=%lu",why,swi::kUnits,live?1U:0U,visible,
+        g_swi.now(),GetTickCount());
+    if(g_swi_stats_due){
+        g_swi_stats_due=false;
+        SwlLog("sword_lock icon stats shown=%u hidden=%u paused=%u rings=%u flashes=%u misses=%u locked=%u fallback=%u gaps_skipped=%u lost=%u "
+            "no_tex=%u failed=%u retries=%u last=%s tick=%lu",g_swi_shown,g_swi_hidden,g_swi_paused,g_swi.rings(),g_swi.flashes(),g_swi.misses(),
+            g_swi.locked(),g_swi_fallback,g_swi_gaps,g_swi_lost,g_swi_notex,g_swi_painter.failed()?1U:0U,g_swi_retries,swi::PaintWhyName(g_swi_why),
+            GetTickCount());
+    }
+    g_swi_painter.Reset(n);g_swi.Reset();g_swi_live=false;g_swi_why=swi::PaintWhy::Idle;g_swi_hide=swi::Hide::Off;
+}
+// Each duel tick (SwkFrame, both probe calls of a frame): painted once per native frame, on the call that carried the
+// tick's game time (its events are kept until then).
+static void SwiFrame(bool paused,uint32_t ev,double t_ms){
+    g_swi_ev|=ev;
+    if(!g_swi_ready)return;
+    const uint32_t g=CmbGet<uint32_t>(g_swl_global_slot),frame=link_runtime::IsPointer(g)?CmbGet<uint32_t>(g+0x530C):0;
+    if(frame&&frame==g_swi_frame)return;   // once per native frame (an unreadable counter paints on every call)
+    g_swi_frame=frame;
+    const swk::sd::Duel& d=g_swk.duel();
+    const bool on=g_swk.stage()==swk::Stage::Duel&&d.Running();
+    if(!on){SwiReset(g_swk.abandoned()?"abandon":"end");return;}
+    const int32_t dev=CmbGet<int32_t>(g_swk_base+swi::rva::kDevice),sel=SwkSelector();
+    if(dev!=g_swi_device||sel!=g_swi_sel||(g_swi_faces.Transient()&&d.game_ms()>=g_swi_retry)){
+        const bool moved=dev!=g_swi_device||sel!=g_swi_sel;
+        if(!moved)++g_swi_retries;
+        g_swi_device=dev;g_swi_sel=sel;g_swi_retry=d.game_ms()+500;SwiResolve(false);   // a line only for a face that changed
+    }
+    swi::Input in;in.on=true;in.paused=paused;in.keyboard=swi::KeyboardGlyphs(dev,sel);in.prompt=d.prompt();in.ev=g_swi_ev;g_swi_ev=0;
+    in.break_ok=d.last_break().valid&&d.last_break().ok;in.now_ms=d.game_ms();in.window_ms=d.window_ms();
+    in.needle=d.last_break().valid?d.last_break().needle:-1;   // cand2: where the timing break was pressed
+    in.wide=true;in.held=g_swk.last_input().held;   // H1d: every step paints its key (PaintCtlWide; H1c's two steps the same)
+    g_swi.Update(in,g_swi_faces);
+    SwiNative n;
+    const swi::PaintWhy why=g_swi_painter.Tick(n,g_swi,in.keyboard&&g_swi_faces.Any());
+    if(why==swi::PaintWhy::Shown)++g_swi_shown;else if(why==swi::PaintWhy::Hidden)++g_swi_hidden;
+    if(why==swi::PaintWhy::Lost)++g_swi_lost;
+    if(why==swi::PaintWhy::NoTex)++g_swi_notex;
+    g_swi_live=in.keyboard&&g_swi_faces.Any()&&!g_swi_painter.failed()&&!swi::Failure(why);
+    if(why!=g_swi_why||g_swi.hidden()!=g_swi_hide||g_swi.mode()!=g_swi_mode||g_swi.ctl()!=g_swi_ctl){
+        const swi::Face& f=g_swi.face();
+        SwlLog("sword_lock icon paint=%s mode=%s hide=%s phase=%s want=%s key=0x%X idx=%d uv=%.4f,%.4f,%.4f,%.4f size=%.1fx%.1f units=%d visible=%u "
+            "live=%u missing=0x%02X duel_ms=%.1f t_ms=%.1f tick=%lu",swi::PaintWhyName(why),swi::ModeName(g_swi.mode()),swi::HideName(g_swi.hidden()),
+            swk::sd::PhaseName(in.prompt.phase),swk::sd::CtlName(g_swi.ctl()),f.lo,f.idx,f.uv[0],f.uv[1],
+            f.uv[2],f.uv[3],f.w,f.h,swi::kUnits,g_swi_painter.visible(),g_swi_live?1U:0U,unsigned(g_swi_painter.missing()),d.duel_ms(),t_ms,GetTickCount());
+        g_swi_why=why;g_swi_hide=g_swi.hidden();g_swi_mode=g_swi.mode();g_swi_ctl=g_swi.ctl();
+    }
+}
+// After PadRead (menus included): a pause hides the icon at once; play shows it again from SwiFrame.
+static void SwiPause(){
+    if(!g_swi_ready||!g_swi_painter.Live()||!g_swi_painter.visible())return;
+    SwiNative n;g_swi_painter.Hide(n);++g_swi_paused;
+    SwlLog("sword_lock icon hide why=pause units=%d live=1 visible=0 t_ms=%.1f tick=%lu",swi::kUnits,g_swi.now(),GetTickCount());
+}
+// The arbiter's choice for one offer: our icon (btn 0, no gap) or H1c's offer (the fallback), logged when it changes.
+static const char* SwiWhyNot(const swk::Offer& o){
+    if(!g_swi_ready)return "pins";
+    if(!swi::KeyboardGlyphs(g_swi_device,g_swi_sel))return "device";
+    if(g_swi_painter.failed()||swi::Failure(g_swi_why))return swi::PaintWhyName(g_swi_why);
+    const swi::Face* f=g_swi_faces.For(swi::OfferCtlWide(o,g_swk.duel().prompt(),g_swi.break_ctl(),g_swk.last_input().held));
+    return !f?"no_ctl":f->ok?"none":swi::WhyName(f->why);
+}
+// The control the icon paints for this offer (the prompt's, or the resolved break's for its feedback; H1d: every step,
+// swi::OfferCtlWide): a control without a face keeps the native offer (sword_lock_draw.h OfferFor's btn).
+static bool SwiIcon(const swk::Offer& o){
+    return g_swi_ready&&g_swi_live&&swi::Covers(o,g_swi_faces,swi::OfferCtlWide(o,g_swk.duel().prompt(),g_swi.break_ctl(),g_swk.last_input().held));
+}
+static swk::Offer SwiOffer(const swk::Offer& raw){
+    const bool icon=SwiIcon(raw);
+    if(raw.show||raw.gap){
+        if(!icon)++g_swi_fallback;else if(raw.gap)++g_swi_gaps;
+        const int c=icon?1:0;
+        if(c!=g_swi_choice){
+            g_swi_choice=c;
+            SwlLog("sword_lock icon offer icon=%u kind=0x%02X btn=%u h1c_btn=%u why=%s tick=%lu",icon?1U:0U,unsigned(raw.kind),icon?0U:unsigned(raw.btn),
+                unsigned(raw.btn),icon?"-":SwiWhyNot(raw),GetTickCount());
+        }
+    }
+    return swi::NativeOffer(raw,icon);
+}
+// ---- H2b: Link's TP blade-lock clips on the duel's lease (sword_lock_anim.h; [Combat] SwordLockClips, missing = 1) -----
+// The five clips of scripts/sword_lock_anim.py (dll/sword_lock_assets.h, SHA-pinned) are read at startup from
+// Bin32\sword_lock_lab\ (the lab's own folder next to the lab DLL: no layer file is touched) or, failing that, from Bin32
+// itself (where H3's layer will put them); none read = H1c's hold exactly (the ocarina loop, no win/lose clip). Game
+// thread: SwaLeaseStarted (SwlLease: the lease started with clip a), SwaDuelTick (the duel's decide: the band clip with the
+// 1000 ms game_clock lock, Replace), SwaOver/SwaWaiting (the win or lose clip once, on a decide; the release held until the
+// clip's ask tick: SwaHoldsRelease), SwaProceed (SwlProceed: a loop restarts with the same clip), SwaCarryMove (the lose
+// carry around the lease's own MotionMove, CmbMoveDetour), SwaEnd (the release or the duel's end). Lines go through the H0
+// ring, every one starting "sword_lock anim ". Nothing here runs without a lease of ours started on clip a.
+namespace swa=link_runtime::sword_lock::anim;
+namespace swas=link_runtime::sword_lock::assets;
+struct SwaClip {unsigned char* fcv=nullptr;unsigned char* seq=nullptr;};
+static SwaClip g_swa_clip[swa::kClipCount];   // by swa::Clip (None empty), resident and never released
+static swa::ClipsConfig g_swa_cfg;
+static bool g_swa_ready=false;                 // the five clips resident (StartSwordLockDuel)
+static const wchar_t* g_swa_from=L"-";         // where they were read
+static swa::Director g_swa;                    // game thread
+static swa::Carry g_swa_carry;
+static uint64_t g_swa_lease=0;                 // the lease token the director runs on
+static double g_swa_t0=0;                      // game time at that lease's start (t_ms of the lines)
+static bool g_swa_start_due=false;             // the start line waits for the duel's start line (the Begin frame)
+static bool g_swa_ended=true;                  // the end line is out (or no lease of ours started)
+static bool g_swa_carried=false;               // this duel's lose clip carried Link: its release has no slide
+static unsigned g_swa_set_failed=0;
+static bool SwaUsing(){return g_swa_ready&&g_swa_cfg.on;}
+static bool SwaOwns(const mortal::dispatch::Runtime& run){
+    return SwaUsing()&&g_swa.Active()&&g_swa_lease&&g_swa_lease==g_swl_lease&&run.active&&run.lease.token==g_swa_lease;
+}
+static mortal::dispatch::Lease SwaHoldLease(uint64_t token){
+    if(SwaUsing()){const SwaClip& a=g_swa_clip[static_cast<unsigned>(swa::Clip::A)];return mortal::dispatch::Lease{token,a.fcv,a.seq,a.seq+4};}
+    return mortal::dispatch::Lease{token,g_oca_clip[2],g_oca_clip[3],g_oca_clip[3]+4};
+}
+// Link-owner XZ distance (mm) from their positions now; -1 when either is not read.
+static double SwaOwnerMm(uint32_t player){
+    mtg::Raw r;ImageMem m;float link[3]{};
+    if(!player||!SwlOwnerRaw(g_swl.owner(),r)||!m.Read(player+0x94,link,sizeof(link)))return -1;
+    const double dx=double(r.pos.x)-link[0],dz=double(r.pos.z)-link[2],d=std::sqrt(dx*dx+dz*dz);
+    return std::isfinite(d)?d:-1;
+}
+// Runtime::Replace on our lease; with SwordLockClipHokan the same checks and the setter's hokan instead of 0.
+static bool SwaSet(mortal::dispatch::Runtime& run,swa::Clip c,unsigned hokan){
+    const SwaClip& k=g_swa_clip[static_cast<unsigned>(c)];
+    if(!k.fcv||!k.seq)return false;
+    if(!hokan)return run.Replace(k.fcv,k.seq,k.seq+4);
+    if(!run.busy||run.observing||!run.current||!run.Owns(run.current)||!run.api.set)return false;
+    run.api.set(run.current,k.fcv,hokan,0,1,k.seq);
+    run.lease.fcv=k.fcv;run.lease.seq=k.seq;run.lease.entries=k.seq+4;run.residue_fcv=k.fcv;
+    if(!run.Owns(run.current)){run.Abandon();return false;}
+    return true;
+}
+static void SwaLine(const swa::Plan& p,bool ok,unsigned hokan,double now,const char* extra=""){
+    SwlLog("sword_lock anim clip=%s band=%s pv=%.3f lock_ms=%.1f reason=%s hokan=%u ok=%u phase=%s t_ms=%.1f%s tick=%lu",swa::ClipName(p.clip),
+        swa::ClipName(p.band),p.pv,p.lock_ms,swa::ReasonName(p.reason),hokan,ok?1U:0U,swk::sd::PhaseName(g_swk.duel().phase()),
+        swa::Ms(now-g_swa_t0),extra,GetTickCount());
+}
+static void SwaLogStart(){
+    swa::Plan p;p.set=true;p.clip=p.band=swa::Clip::A;p.reason=swa::Reason::Start;
+    SwaLine(p,true,0,g_swa_t0);
+}
+static void SwaLeaseStarted(uint64_t token,double now){
+    if(!SwaUsing())return;
+    g_swa.Start(now);g_swa_lease=token;g_swa_t0=now;g_swa_ended=false;g_swa_carried=false;g_swa_carry=swa::Carry{};g_swa_set_failed=0;
+    if(g_swk.stage()==swk::Stage::Duel)SwaLogStart();else g_swa_start_due=true;   // the Begin frame: after the duel's start line
+}
+static void SwaCarryLine(){
+    char line[sizeof(SwlLine::text)-48];
+    if(swa::FormatCarry(line,sizeof(line),g_swa_carry.summary())>0)SwlLog("sword_lock anim carry %s tick=%lu",line,GetTickCount());
+}
+// The lose carry (sword_lock_anim.h Carry): Link away from the owner (ppb::Direction, as H1c's slide; his facing's back
+// with the owner unread) by assets::lose_travel_mm, only with the MotionMove hook (the seam of the backflip and of H1c's
+// slide); its start is the end line's travel origin.
+static bool SwaCarryBegin(const swl::World& w){
+    if(!g_swk_slide_hook||!w.player)return false;
+    ImageMem m;float pos[3]{};
+    if(!m.Read(w.player+0x94,pos,sizeof(pos)))return false;
+    const float yaw=CmbGet<float>(w.player+0xA4);
+    float ux=-std::sin(yaw),uz=-std::cos(yaw);bool away=false;
+    mtg::Raw r;
+    if(SwlOwnerRaw(g_swl.owner(),r)){
+        const float from[3]={r.pos.x,r.pos.y,r.pos.z};
+        float ox=0,oz=0;
+        if(ppb::Direction(from,pos,yaw,ox,oz)){
+            const float dx=pos[0]-from[0],dz=pos[2]-from[2];
+            away=std::isfinite(dx)&&std::isfinite(dz)&&dx*dx+dz*dz>=1.f;   // ppb::Direction fell back to the facing otherwise
+            ux=ox;uz=oz;
+        }
+    }
+    constexpr unsigned n=sizeof(swas::lose_travel_mm)/sizeof(swas::lose_travel_mm[0]);
+    if(!g_swa_carry.Begin(g_swa_lease,swa::Vec{pos[0],pos[1],pos[2]},yaw,ux,uz,away,w.now,swas::lose_travel_mm,n))return false;
+    g_swa_carried=true;
+    std::memcpy(g_swk_push_from,pos,sizeof(pos));g_swk_push_from_ok=true;
+    return true;
+}
+static bool SwaCarryOwns(void* model){
+    return g_swa_carry.Active()&&g_swl_lease&&g_swa_carry.lease()==g_swl_lease&&
+        ending::leap::MoveOwner(mortal::dispatch_hooks::runtime,model,g_swl_lease);
+}
+// Around the lease's own MotionMove, as CmbFlipMove: Link before/after, then X/Z (and the yaw kept) of this tick's carry
+// point, written before cPlayer::move runs the native collision on it.
+static int SwaCarryMove(void* model){
+    namespace lp=ending::leap;
+    const uint32_t player=reinterpret_cast<uint32_t>(model);
+    CmbMem m;lp::Body before,after;
+    const bool have_before=lp::ReadPos(m,player,before);
+    const int result=g_cmb_move_original(model);
+    const DWORD error=GetLastError();
+    swa::Frame f;f.frame=CmbFrame();f.time=GameNow(g_swl_global_slot);f.step=static_cast<float>(GameStep(g_swl_global_slot));
+    const bool have_after=lp::ReadPos(m,player,after);
+    f.before=have_before&&have_after?swa::Vec{before.x,before.y,before.z}:swa::Vec{NAN,NAN,NAN};
+    f.after=have_after?swa::Vec{after.x,after.y,after.z}:swa::Vec{NAN,NAN,NAN};
+    f.collision=lp::ReadCollision(m,player);
+    const swa::Output o=g_swa_carry.Step(f);
+    link_runtime::ztarget::runtime::Memory w;
+    if(o.write&&!bks::Apply(w,player,o))g_swa_carry.Abort(swa::Stop::WriteFailed);
+    if(!g_swa_carry.Active())SwaCarryLine();
+    SetLastError(error);
+    return result;
+}
+// The duel's decide (it runs): the band's clip once the band left the clip and the lock ran out.
+static void SwaDuelTick(mortal::dispatch::Runtime* run,const swl::World& w){
+    if(!run||!SwaOwns(*run)||!g_swk.duel().Running())return;
+    const swa::Plan p=g_swa.Band(w.now,g_swk.duel().pv(),g_swk.duel().phase());
+    if(!p.set)return;
+    const bool ok=SwaSet(*run,p.clip,g_swa_cfg.hokan);
+    if(!ok){++g_swa_set_failed;g_swa.Undo();}   // the director keeps the clip really on the model and its lock
+    SwaLine(p,ok,g_swa_cfg.hokan,w.now);
+}
+// The pending win or lose clip, on a decide with our lease: set at once (no lock); a lose starts its carry.
+static void SwaFinal(mortal::dispatch::Runtime* run,const swl::World& w){
+    if(!run||g_swa.pending()==swa::Clip::None||!SwaOwns(*run))return;
+    const bool win=g_swa.pending()==swa::Clip::Win;
+    const swa::Plan p=g_swa.Final(w.now,g_swk.duel().pv(),win?SwaOwnerMm(w.player):-1,swdl::WinCutMm(g_swdl_foe,g_swa_cfg.win_cut_mm));
+    const bool ok=SwaSet(*run,p.clip,g_swa_cfg.hokan);
+    if(!ok){++g_swa_set_failed;g_swa.Undo();}   // still due: the next decide tries again (the release waits 250 ms at most)
+    const bool carry=ok&&!win&&SwaCarryBegin(w);
+    char extra[128];
+    std::snprintf(extra,sizeof(extra)," owner_mm=%.0f cut=%u cut_mm=%.0f ask_tick=%.0f carry=%u slide_hook=%u",p.owner_mm,p.cut?1U:0U,
+        swdl::WinCutMm(g_swdl_foe,g_swa_cfg.win_cut_mm),p.ask_tick,carry?1U:0U,g_swk_slide_hook?1U:0U);
+    SwaLine(p,ok,g_swa_cfg.hokan,w.now,extra);
+}
+// The duel ended (its tick, decide or core): a win or a lose on our lease waits for its clip (now when this is a decide).
+static void SwaOver(mortal::dispatch::Runtime* run,const swl::World& w){
+    if(!SwaUsing()||!g_swa.Active()||g_swk.abandoned()||!g_swa.Ended(g_swk.duel().result(),w.now))return;
+    SwaFinal(run,w);
+}
+static void SwaWaiting(mortal::dispatch::Runtime* run,const swl::World& w){
+    if(SwaUsing()&&g_swa.Active()&&g_swa.pending()!=swa::Clip::None)SwaFinal(run,w);
+}
+// True while the release must wait: a win/lose clip due (at most 250 ms) or playing before its ask tick, on our lease.
+static bool SwaHoldsRelease(const swl::World& w){
+    return SwaUsing()&&g_swa.Active()&&g_swa_lease&&g_swa_lease==g_swl_lease&&g_swa.HoldsRelease(w.now);
+}
+// Dispatch Proceed (inside the handler): the clip that ended is set again; the lock is not touched.
+static bool SwaProceed(mortal::dispatch::Runtime& run){
+    const double now=GameNow(g_swl_global_slot);
+    const swa::Clip c=g_swa.Loop(now);
+    if(c==swa::Clip::None)return false;
+    const bool ok=SwaSet(run,c,0);   // a loop's frame 640 is its frame 0: no blend
+    if(!swa::Loops(c)){   // a one-shot outran its ask (a hitch): held on, released on the next decide
+        swa::Plan p;p.clip=c;p.band=swa::BandOf(g_swk.duel().pv());p.pv=g_swk.duel().pv();p.reason=swa::Reason::Late;
+        p.lock_ms=-1;
+        SwaLine(p,ok,0,now);
+    }
+    return ok;
+}
+// The clip's end: the probe's release frame (its lease handed back right after) or the duel's end on an abandon.
+static void SwaEnd(const char* why,double now){
+    if(g_swa_ended)return;
+    g_swa_ended=true;
+    if(g_swa_carry.Active()){g_swa_carry.Abort(swa::Stop::Released);SwaCarryLine();}
+    const swa::Summary& c=g_swa_carry.summary();
+    SwlLog("sword_lock anim end why=%s clip=%s final=%s cut=%u changes=%u loops=%u late=%u held=%u min_gap_ms=%.1f hokan=%u set_failed=%u "
+        "carry=%s travelled=%.0f t_ms=%.1f tick=%lu",why,swa::ClipName(g_swa.clip()),swa::ClipName(g_swa.final_clip()),g_swa.cut()?1U:0U,
+        g_swa.changes(),g_swa.loops(),g_swa.late(),g_swa.held(),g_swa.min_gap_ms(),g_swa_cfg.hokan,g_swa_set_failed,
+        g_swa_carried?swa::StopName(c.stop):"-",g_swa_carried?static_cast<double>(c.travelled):0.0,swa::Ms(now-g_swa_t0),GetTickCount());
+    g_swa.Reset();g_swa_lease=0;g_swa_start_due=false;
+}
+// Worker (StartSwordLockDuel): the five clips, all from one folder, SHA-checked; else none (H1c's hold).
+static bool SwaLoadFrom(const wchar_t* directory,const wchar_t* sub){
+    static const swas::Clip* const specs[swa::kClipCount]={nullptr,&swas::a,&swas::b,&swas::c,&swas::win,&swas::lose};
+    SwaClip got[swa::kClipCount]{};
+    const auto drop=[&got]{   // a file missing or changed half way: the clips already made resident go back
+        for(SwaClip& g:got){if(g.fcv)VirtualFree(g.fcv,0,MEM_RELEASE);if(g.seq)VirtualFree(g.seq,0,MEM_RELEASE);g=SwaClip{};}
+        return false;
+    };
+    for(unsigned i=1;i<swa::kClipCount;++i){
+        wchar_t name[128]{};
+        if(link_runtime::paths::Format(name,L"%lslink_%ls.fcv",sub,specs[i]->name)<0||
+           !CmbResident(directory,name,specs[i]->fcv_size,specs[i]->fcv_sha,got[i].fcv))return drop();
+        if(link_runtime::paths::Format(name,L"%lslink_%ls.seq",sub,specs[i]->name)<0||
+           !CmbResident(directory,name,specs[i]->seq_size,specs[i]->seq_sha,got[i].seq))return drop();
+    }
+    for(unsigned i=0;i<swa::kClipCount;++i)g_swa_clip[i]=got[i];
+    return true;
+}
+static void SwaLoad(const wchar_t* directory){
+    g_swa_ready=false;g_swa_from=L"-";
+    if(!g_swa_cfg.on){Log("sword_lock anim ready=0 why=off (SwordLockClips=0: H1c's hold, the ocarina loop)");return;}
+    if(!directory){Log("sword_lock anim ready=0 why=no_directory");return;}
+    wchar_t probe[MAX_PATH]{};
+    const bool lab_dir=link_runtime::paths::Format(probe,L"%ls" SWL_DIR L"link_lock_a.fcv",directory)>=0&&
+        GetFileAttributesW(probe)!=INVALID_FILE_ATTRIBUTES;
+    g_swa_ready=SwaLoadFrom(directory,lab_dir?SWL_DIR:L"");
+#if LINK_SWORD_LOCK_GRADUATED
+    g_swa_from=lab_dir?L"Bin32\\sword_lock":L"Bin32";
+#else
+    g_swa_from=lab_dir?L"Bin32\\sword_lock_lab":L"Bin32";
+#endif
+    if(g_swa_ready)g_swl_clip=true;   // the probe's hold is clip a now (with or without the ocarina)
+    Log("sword_lock anim ready=%u why=%s dir=%ls clips=a,b,c,win,lose hokan=%u win_cut_mm=%.0f lunge_tick=%u ask_ahead=%u end_margin=%u "
+        "lock_ms=%.0f band=%.2f lose_carry=%s",g_swa_ready?1U:0U,g_swa_ready?"-":"files",g_swa_from,g_swa_cfg.hokan,g_swa_cfg.win_cut_mm,
+        swa::kWinLungeTick,swa::kAskAheadTicks,swa::kEndMarginTicks,swa::kLockMs,swa::kBand,
+        g_swk_slide_hook?"motion_move":"none(no_motion_move_hook: the lose clip in place, H1c's slide)");
+    if(!g_swa_ready)Log("sword_lock anim: link_lock_{a,b,c,win,lose}.fcv/.seq missing or changed in %ls (the duel keeps H1c's hold)",g_swa_from);
+}
+// ---- H2c: the duel's presentation (sword_lock_cinema.h; [Combat] SwordLockCamera / SwordLockBars / SwordLockSway) -----
+// The camera: a last stage in the camera hooks' hitCheck (ztarget_runtime.h duel_prepare / duel_finish /
+// duel_after_front, lab-guarded), set by SwcStart after ztarget::runtime::Start, live only with those hooks installed
+// (ZTarget, the Ending Blow lift or the Back Slice camera on). While the duel holds the world (stage Duel or Waiting,
+// the probe holding) the director frames Link and the Salvador from the side; every exit eases back; a frame it cannot
+// read ends it at once (native from that call) with its end line. The bars: SwcBars inside HudFrame, the duel owning
+// [Hud] ZTargetLetterbox's two units while it holds the world unpaused, else the Z-lock. The sway: the owner's X/Z, on
+// the duel's ticks (SwkFrame), back at his exact start on every exit (SwkRelease, the abandon in SwlTick, SwkEnded)
+// before the world goes on. Game thread only; lines through the H0 ring, every one starting "sword_lock cinema ".
+namespace swc=link_runtime::sword_lock::cinema;
+namespace swcz=link_runtime::ztarget;
+namespace swczr=link_runtime::ztarget::runtime;
+namespace swce=link_runtime::ending_blow::camera;
+namespace swcb=link_runtime::back_slice::camera;
+static swc::Config g_swc_cfg;                  // [Combat] SwordLockCamera / SwordLockBars / SwordLockSway as read (missing = 1)
+static std::atomic<bool> g_swc_cam_live{false};   // the stage is hooked (SwcStart)
+static bool g_swc_bars_ready=false;            // [Hud] ZTargetLetterbox's units are drawn (TpHearts=1, ZTargetLetterbox=1, the HUD up)
+static bool g_swc_snap_ok=false;               // CamSmth's pins were checked (the Back Slice camera or the lift is on): the snap bit
+static bool(*g_swc_segment)(const swcz::Vec&,const swcz::Vec&,uint32_t&)=nullptr;   // EatMgr (the Back Slice / Z-target LOS probe)
+static swc::Director g_swc_cam;
+static swc::Shot g_swc_shot;
+static uint32_t g_swc_frame=0xFFFFFFFFu;       // the last game frame the director stepped
+static uint32_t g_swc_player=0;static uint16_t g_swc_room=0;
+static swcz::Vec g_swc_owner{};static bool g_swc_owner_ok=false;   // the Salvador's feet, last read (the hand-back keeps it)
+static swcz::Vec g_swc_asked{};static bool g_swc_engaged=false;   // this call's asked camera (local), for the snap
+static bool g_swc_called=false;                // a stage call in this CameraMove
+static float g_swc_probe_t=1.f;
+// candidate 6: hitCheck's own pull on the asked camera (mm, in at once, out over ~5 s of game time), the rise held so far
+static float g_swc_short=0.f,g_swc_raise=0.f,g_swc_raise_now=0.f,g_swc_h=0.f;static unsigned g_swc_raised=0;
+// candidate 7: the framing solver's pose (the target and the eased one), its re-picks, the native fovy seen at the opening
+static swc::Pose g_swc_pose=swc::kPoses[0],g_swc_pose_now=swc::kPoses[0];static swc::Repick g_swc_repick;
+// candidate 8: the framing of the camera actually used (after this DLL's probe and hitCheck), judged in SwcFinish
+static swcz::Matrix g_swc_mat_used{};static swcz::Vec g_swc_b_used{},g_swc_look_used{},g_swc_link_used{};static float g_swc_fovy_used=0.f;
+static bool g_swc_full=false,g_swc_bad=false;static float g_swc_live_share=0.f,g_swc_live_head=0.f;static unsigned g_swc_bad_frames=0;
+static float g_swc_fovy0=0.f,g_swc_share=0.f,g_swc_head=0.f;static unsigned g_swc_fallbacks=0;
+static swc::Bars g_swc_bars;
+static swc::Sway g_swc_sway;
+static uint32_t g_swc_sway_owner=0;static double g_swc_sway_now=-1,g_swc_sway_end=-1;static swcz::Vec g_swc_sway_wrote{};
+// The duel holds the world: its lock, or its release wait (the win / lose clip), the probe holding the freeze.
+static bool SwcHeld(){
+    return g_swk_on.load(std::memory_order_acquire)&&(g_swk.stage()==swk::Stage::Duel||g_swk.stage()==swk::Stage::Waiting)&&g_swl.Holding();
+}
+static bool SwcPaused(){CmbMem m;return g_swk_base&&swk::Paused(swk::ReadContext(m,g_swk_base));}
+static void SwcCamLines(){
+    swc::Summary s;char line[320];
+    while(g_swc_cam.Take(s))if(swc::Format(line,sizeof(line),s)>0){
+        SwlLog("sword_lock cinema camera end %s tick=%lu",line,GetTickCount());
+        SwlLog("sword_lock cinema camera framing pose=%u repicks=%u fallbacks=%u rejected=0x%X share=%.2f head=%.0f short=%.0f fovy=%.1f fov=%.2f "
+            "live_share=%.2f live_head=%.0f bad_frames=%u tick=%lu",g_swc_repick.pose(),g_swc_repick.picks(),g_swc_fallbacks,g_swc_repick.rejected(),
+            static_cast<double>(g_swc_share),static_cast<double>(g_swc_head),static_cast<double>(g_swc_short),static_cast<double>(g_swc_fovy0),
+            static_cast<double>(g_swc_cfg.fov),static_cast<double>(g_swc_live_share),static_cast<double>(g_swc_live_head),g_swc_bad_frames,
+            GetTickCount());   // candidate 7; candidate 8: the worst live framing at full weight, the frames it was bad
+    }
+}
+static void SwcCamAbort(swc::End why){g_swc_cam.Abort(why);g_swc_engaged=false;SwcCamLines();}
+static bool SwcBlocked(swcz::Vec a,swcz::Vec b,bool& hit){uint32_t attr=0;if(!g_swc_segment||!g_swc_segment(a,b,attr))return false;hit=attr!=0;return true;}
+// hitCheck's stage (CameraMove, depth 1, the game thread): true = hand hitCheck `out` (the framed copy of `src`).
+static bool SwcPrepare(void* self,uint32_t caller,const swcz::Matrix* matrix,const swcz::Offset* src,swcz::Offset& out){
+    g_swc_engaged=false;
+    if(!g_swc_cam_live.load(std::memory_order_acquire)||swczr::depth!=1||swczr::game_thread.load()!=GetCurrentThreadId()||
+       reinterpret_cast<uint32_t>(self)!=swczr::base+swcz::rva::qfps||caller!=swczr::base+swcz::rva::hit_return)return false;
+    g_swc_called=true;
+    swc::Facts f;
+    if(SwcHeld()){const swk::sd::Duel& d=g_swk.duel();f.on=true;f.id=g_swk_opens;f.pv=d.pv();f.hits=d.hits();f.misses=d.misses();}
+    if(!g_swc_cam.Active()&&!(f.on&&f.id!=g_swc_cam.closed()))return false;   // no duel to frame: nothing read
+    swczr::Memory m;swcz::Frame fr;swcz::Matrix mat{};swcz::Offset in{};
+    if(!swcz::ReadFrame(m,swczr::base,fr)||!m.Read(reinterpret_cast<uint32_t>(matrix),&mat,sizeof(mat))||
+       !m.Read(reinterpret_cast<uint32_t>(src),&in,sizeof(in))){
+        if(g_swc_cam.Active())SwcCamAbort(swc::End::Read);else{g_swc_cam.Step(f,0);SwcCamAbort(swc::End::Read);}   // fail closed, logged
+        return false;
+    }
+    mtg::Raw r;
+    if(SwlOwnerRaw(g_swl.owner(),r)){g_swc_owner={r.pos.x,r.pos.y,r.pos.z};g_swc_owner_ok=swc::Finite(g_swc_owner);}
+    else if(f.on)g_swc_owner_ok=false;   // held and unread: fail closed (the hand-back keeps the last read)
+    const bool fresh=fr.frame!=g_swc_frame;
+    const double h=fresh&&g_swc_cam.Active()?double(link_runtime::game_clock::ValidDt(fr.dt))/30.0:0.0;
+    g_swc_frame=fr.frame;
+    g_swc_shot=g_swc_cam.Step(f,h);
+    if(!g_swc_shot.apply){SwcCamLines();return false;}
+    if(!g_swc_owner_ok){SwcCamAbort(swc::End::Owner);return false;}
+    const swcz::Vec link=fr.pos,b{mat.v[0][3],mat.v[1][3],mat.v[2][3]};
+    const swcz::Vec ncam=swc::Add(swcz::World(mat,in.campos[0]),b),nlook=swc::Add(swcz::World(mat,in.target),b);
+    if(g_swc_shot.first){
+        g_swc_player=fr.player;g_swc_room=fr.room;g_swc_probe_t=1.f;
+        g_swc_cam.SetSide(swc::SideOf(link,g_swc_owner,ncam));
+        g_swc_short=g_swc_raise=g_swc_raise_now=0.f;g_swc_raised=0;g_swc_fallbacks=0;g_swc_fovy0=in.fovy;
+        g_swc_pose=g_swc_pose_now=swc::kPoses[0];g_swc_repick.Reset(0);
+        g_swc_bad=false;g_swc_live_share=0.f;g_swc_live_head=0.f;g_swc_bad_frames=0;
+        if(g_swc_segment){   // candidate 7: the first pose of the ladder that frames both, the native side first
+            const float native=g_swc_cam.side();
+            const swc::Choice c=swc::Choose(SwcBlocked,link,g_swc_owner,native,in.fovy);
+            g_swc_cam.SetSide(c.side);g_swc_pose=g_swc_pose_now=swc::kPoses[c.pose];g_swc_repick.Took(c.pose);
+            g_swc_share=c.share;g_swc_head=c.head;if(c.fallback)++g_swc_fallbacks;
+            SwlLog("sword_lock cinema camera side native=%.0f picked=%.0f pose=%u fallback=%u ok=%u room=%.0f share=%.2f head=%.0f fovy=%.1f "
+                "max_share=%.2f min_head=%.0f tick=%lu",static_cast<double>(native),static_cast<double>(c.side),c.pose,c.fallback?1U:0U,c.ok?1U:0U,
+                static_cast<double>(c.room),static_cast<double>(c.share),static_cast<double>(c.head),static_cast<double>(in.fovy),
+                static_cast<double>(swc::kMaxLinkShare),static_cast<double>(swc::kMinHeadMm),GetTickCount());
+        }
+    }else if(fr.player!=g_swc_player||fr.room!=g_swc_room||!fr.healthy){SwcCamAbort(swc::End::Room);return false;}
+    // candidate 7: hitCheck kept pulling the pose in use in: the next pose that fits on this side (fresh frames only)
+    // candidate 8: also the live framing (SwcFinish's last judgement): this DLL's own probe pulls before hitCheck sees it
+    // candidate 12 (cand11 log: hitCheck's pull alone walked every duel from pose 0 to the high fallback in 1.2 s, the framing
+    // often fine): only the live framing (the camera really used) drops a pose
+    if(!g_swc_shot.first&&fresh&&g_swc_segment&&g_swc_shot.weight>=swc::kFullWeight&&g_swc_repick.Step(0.f,h,g_swc_bad)){
+        const unsigned was=g_swc_repick.pose();
+        const swc::Choice c=swc::ChooseOn(SwcBlocked,link,g_swc_owner,g_swc_cam.side(),g_swc_fovy0,g_swc_repick.rejected(),was,g_swc_short);
+        g_swc_repick.Took(c.pose);g_swc_pose=swc::kPoses[c.pose];g_swc_share=c.share;g_swc_head=c.head;if(c.fallback)++g_swc_fallbacks;
+        SwlLog("sword_lock cinema camera repick from=%u to=%u fallback=%u ok=%u short=%.0f room=%.0f share=%.2f head=%.0f rejected=0x%X tick=%lu",
+            was,c.pose,c.fallback?1U:0U,c.ok?1U:0U,static_cast<double>(g_swc_short),static_cast<double>(c.room),static_cast<double>(c.share),
+            static_cast<double>(c.head),g_swc_repick.rejected(),GetTickCount());
+        g_swc_short=0.f;g_swc_bad=false;   // measured again on the new pose
+    }
+    if(fresh)g_swc_pose_now=swc::Lerp(g_swc_pose_now,g_swc_pose,swc::PoseEase(h));   // candidate 8: ~0.25 s, not ~5 s
+    const swc::View v=swc::PoseView(link,g_swc_owner,g_swc_cam.side(),g_swc_pose_now);
+    swcz::Vec cam,look;
+    if(!swc::Blend(ncam,nlook,v,g_swc_shot.weight,cam,look)){SwcCamAbort(swc::End::Matrix);return false;}
+    swc::Compose(g_swc_shot,{g_swc_owner.x,g_swc_owner.y+swc::kProbeChestMm,g_swc_owner.z},cam,look);
+    if(g_swc_shot.first){
+        g_swc_cam.Framed(g_swc_cam.side(),v.dist);
+        SwlLog("sword_lock cinema camera open id=%u side=%.0f dist=%.0f sep=%.0f snap=%u probe=%u native_mm=%.0f tick=%lu",f.id,
+            static_cast<double>(g_swc_cam.side()),static_cast<double>(v.dist),static_cast<double>(v.sep),g_swc_snap_ok?1U:0U,g_swc_segment?1U:0U,
+            static_cast<double>(swc::Len(swc::Sub(ncam,link))),GetTickCount());
+    }
+    // The Back Slice camera's wall care: EatMgr from the look point (between them) to the camera, in at once and out over
+    // bsc::kProbeOutTau, its pull scaled by the weight (none left at the hand-back's end: no jump to native).
+    if(g_swc_segment&&g_swc_shot.weight>0.f){
+        if(fresh){
+            float t=1.f;
+            if(swc::ProbeView(SwcBlocked,look,cam,t)==swcb::Probe::Fault)t=1.f;
+            g_swc_probe_t=swcb::EaseProbe(g_swc_probe_t,t,static_cast<float>(h));
+            if(g_swc_probe_t<1.f)g_swc_cam.Probed();
+        }
+        if(g_swc_probe_t<1.f)cam=swc::Add(cam,swc::Scale(swc::Sub(swc::Pull(look,cam,g_swc_probe_t),cam),g_swc_shot.weight));
+    }
+    // candidate 6: the room left (the probe's share and hitCheck's last pull) under kMinFrameMm: the camera rises over
+    // Link's shoulder; the rise only grows during a duel (no bob as it clears the wall) and eases in, scaled by the weight
+    // (cand6's rise is superseded by candidate 7's ladder: its higher poses; g_swc_h keeps hitCheck's pull decay in game time)
+    if(g_swc_shot.weight>0.f)g_swc_h=static_cast<float>(h);
+    const swce::Inverse n=swce::Invert(mat);
+    if(!n.ok){SwcCamAbort(swc::End::Matrix);return false;}
+    swcz::Offset o=in;
+    o.campos[0]=swce::Mul(n,swc::Sub(cam,b));o.target=swce::Mul(n,swc::Sub(look,b));   // campos[1] (hitCheck's ray start) untouched
+    o.fovy=swc::DuelFovy(in.fovy,g_swc_cfg.fov,g_swc_shot.weight);   // candidate 7: wider during the lock (1 = native), eased
+    if(!swc::Finite(o.campos[0])||!swc::Finite(o.target)){SwcCamAbort(swc::End::Matrix);return false;}
+    out=o;g_swc_asked=o.campos[0];g_swc_engaged=true;
+    g_swc_mat_used=mat;g_swc_b_used=b;g_swc_look_used=look;g_swc_link_used=link;g_swc_fovy_used=o.fovy;   // candidate 8
+    g_swc_full=!g_swc_shot.first&&g_swc_segment&&g_swc_shot.weight>=swc::kFullWeight;
+    return true;
+}
+// After hitCheck: a wall pulled the asked camera in by more than the Back Slice's kSnapPull, so CamSmth snaps to the
+// collided camera this CameraMove (m_flag bit 0), as FinishOrbitWith. Only with CamSmth's pins checked.
+static void SwcFinish(const void* out){
+    if(!g_swc_engaged)return;
+    g_swc_engaged=false;
+    swczr::Memory m;swcz::Vec local{};
+    if(!m.Read(reinterpret_cast<uint32_t>(out),&local,sizeof(local))||!swc::Finite(local))return;
+    {   // candidate 6: how far hitCheck pulled the asked camera in (the next frame's room), in at once, out slowly
+        const float pulled=static_cast<float>(swce::Distance(local,g_swc_asked));
+        g_swc_short=pulled>g_swc_short?pulled:g_swc_short+(pulled-g_swc_short)*swc::Clamp(g_swc_h*0.006f,0.f,1.f);
+    }
+    if(g_swc_full){   // candidate 8: the camera actually used (the probe's pull and hitCheck's), judged at full weight
+        const swc::Live l=swc::LiveFraming(swc::Add(swcz::World(g_swc_mat_used,local),g_swc_b_used),g_swc_look_used,g_swc_link_used,g_swc_fovy_used);
+        g_swc_bad=l.bad;if(l.bad)++g_swc_bad_frames;
+        if(l.share>g_swc_live_share)g_swc_live_share=l.share;
+        if(g_swc_live_head<=0.f||l.head<g_swc_live_head)g_swc_live_head=l.head;
+    }
+    if(!g_swc_snap_ok)return;
+    if(!(swce::Distance(local,g_swc_asked)>swcb::kSnapPull))return;
+    const uint32_t at=swczr::base+swce::rva::smooth_flag;uint32_t flag=0;
+    if(!m.Writable(at,sizeof(flag))||!m.Read(at,&flag,sizeof(flag)))return;
+    flag|=1U;
+    if(m.Write(at,&flag,sizeof(flag)))g_swc_cam.Snapped();
+}
+// After CameraMove: no hitCheck this time (another camera mode) ends the duel camera at once; the closed records' lines.
+static void SwcAfterFront(){
+    if(g_swc_cam.Active()&&!g_swc_called)SwcCamAbort(swc::End::Camera);
+    g_swc_called=false;
+}
+// HudFrame (the game thread, every fresh frame): the bars' owner. Without the duel this is the Z-lock's own value.
+static bool SwcBars(bool ztarget){
+    const bool duel=g_swc_bars_ready&&swc::DuelWantsBars(g_swc_cfg.bars,SwcHeld(),SwcHeld()&&SwcPaused());
+    g_swc_bars.Step(duel,ztarget);
+    swc::BarOwner from=swc::BarOwner::None,to=swc::BarOwner::None;
+    if(g_swc_bars.TakeChange(from,to)&&(from==swc::BarOwner::Duel||to==swc::BarOwner::Duel))
+        SwlLog("sword_lock cinema bars owner=%s from=%s ztarget=%u held=%u bar=%.3f changes=%u tick=%lu",swc::BarOwnerName(to),swc::BarOwnerName(from),
+            ztarget?1U:0U,SwcHeld()?1U:0U,g_hud.bar(),g_swc_bars.changes(),GetTickCount());
+    return g_swc_bars.on();
+}
+// The owner's X/Z: two reads that agree, the one we wrote last (nobody else moved him), the span writable.
+enum class SwcWrite:uint8_t{Ok,Foreign,Failed};
+static SwcWrite SwcSwayWrite(const swcz::Vec& p){
+    swczr::Memory m;float a[3]{},b[3]{};const uint32_t at=g_swc_sway_owner+mtg::layout::pos;
+    if(!g_swc_sway_owner||g_swc_sway_owner!=g_swl.owner()||!SwlOwnerAlive(g_swc_sway_owner,true))return SwcWrite::Foreign;
+    if(!m.Read(at,a,sizeof(a))||!m.Writable(at,sizeof(a))||!m.Read(at,b,sizeof(b))||std::memcmp(a,b,sizeof(a)))return SwcWrite::Failed;
+    if(std::fabs(a[0]-g_swc_sway_wrote.x)>0.5f||std::fabs(a[1]-g_swc_sway_wrote.y)>0.5f||std::fabs(a[2]-g_swc_sway_wrote.z)>0.5f)return SwcWrite::Foreign;
+    if(!m.Write(at,&p.x,4)||!m.Write(at+8,&p.z,4))return SwcWrite::Failed;
+    g_swc_sway_wrote={p.x,a[1],p.z};g_swc_sway.Wrote();
+    return SwcWrite::Ok;
+}
+static void SwcSwayLine(const char* why){
+    char line[256];
+    if(swc::FormatSway(line,sizeof(line),g_swc_sway.summary())>0)SwlLog("sword_lock cinema sway end why=%s owner=0x%08X %s tick=%lu",why,g_swc_sway_owner,line,GetTickCount());
+}
+// The Begin frame (SwkStart): his start, Link's, and the clear room behind him (EatMgr, or unknown: no move away).
+static void SwcSwayBegin(const swl::World& w){
+    g_swc_sway=swc::Sway{};g_swc_sway_owner=0;g_swc_sway_now=-1;g_swc_sway_end=-1;
+    if(!g_swc_cfg.sway)return;
+    mtg::Raw r;ImageMem m;float link[3]{};
+    if(!SwlOwnerRaw(g_swl.owner(),r)||!w.player||!m.Read(w.player+0x94,link,sizeof(link))){
+        SwlLog("sword_lock cinema sway begin=0 why=read owner=0x%08X tick=%lu",g_swl.owner(),GetTickCount());return;
+    }
+    const swcz::Vec origin{r.pos.x,r.pos.y,r.pos.z},lk{link[0],link[1],link[2]};
+    const float dx=origin.x-lk.x,dz=origin.z-lk.z,sep=std::sqrt(dx*dx+dz*dz);
+    float room=-1.f;
+    if(g_swc_segment&&sep>=swc::kMinSepXZ)room=swc::BackRoom(SwcBlocked,origin,{dx/sep,0.f,dz/sep});
+    if(!g_swc_sway.Begin(origin,lk,room,g_swk.duel().hits())){
+        SwlLog("sword_lock cinema sway begin=0 why=axis sep=%.0f tick=%lu",static_cast<double>(sep),GetTickCount());return;
+    }
+    g_swc_sway_owner=g_swl.owner();g_swc_sway_wrote=origin;g_swc_sway_now=w.now;
+    SwlLog("sword_lock cinema sway begin=1 owner=0x%08X sep=%.0f back_room=%.0f back_limit=%.0f in_limit=%.0f per_pa=%.2f recoil=%.0f probe=%s tick=%lu",
+        g_swc_sway_owner,static_cast<double>(sep),static_cast<double>(room),static_cast<double>(g_swc_sway.back_limit()),
+        static_cast<double>(g_swc_sway.in_limit()),static_cast<double>(swc::kSwayPerPa),static_cast<double>(swc::kRecoilMm),
+        g_swc_segment?(room<0.f?"fault":"eatmgr"):"none(no_move_away)",GetTickCount());
+}
+// The duel's ticks (Duel: running; Waiting: back to the start), game time from the probe's clock (frames of 60 Hz).
+static void SwcSwayTick(const swl::World& w,bool running){
+    if(!g_swc_sway.Active())return;
+    const double h=g_swc_sway_now>=0&&w.now>g_swc_sway_now?(w.now-g_swc_sway_now)/60.0:0.0;
+    g_swc_sway_now=w.now;
+    if(!running&&g_swc_sway_end<0)g_swc_sway_end=w.now;   // the duel is over: the release may wait for him (SwcHoldsRelease)
+    const swk::sd::Duel& d=g_swk.duel();
+    swc::SwayFacts f;f.on=running;f.pa=d.pa();f.hits=d.hits();
+    g_swc_sway.Step(f,h);
+    const swcz::Vec p=g_swc_sway.Position();
+    if(std::fabs(p.x-g_swc_sway_wrote.x)<0.05f&&std::fabs(p.z-g_swc_sway_wrote.z)<0.05f)return;
+    const SwcWrite r=SwcSwayWrite(p);
+    if(r==SwcWrite::Ok)return;
+    g_swc_sway.Foreign();   // someone else moved him or a write failed: we stop and leave him be
+    SwcSwayLine(r==SwcWrite::Foreign?"foreign":"write_failed");
+}
+// The probe's release waits while he is still on his way back (at most swc::kSwayHoldMaxS after the duel's end).
+static bool SwcHoldsRelease(const swl::World& w){
+    return g_swc_sway.Active()&&g_swc_sway_end>=0&&g_swc_sway.HoldsRelease(w.now>=g_swc_sway_end?(w.now-g_swc_sway_end)/60.0:0.0);
+}
+// Every exit, before the world goes on: his exact start (once).
+static void SwcSwayRestore(const char* why){
+    if(!g_swc_sway.Active())return;
+    const SwcWrite r=SwcSwayWrite(g_swc_sway.Origin());
+    if(r==SwcWrite::Ok)g_swc_sway.Restored();else g_swc_sway.Foreign();
+    SwcSwayLine(r==SwcWrite::Ok?why:r==SwcWrite::Foreign?"foreign":"write_failed");
+}
+// ---- candidate 9: the Salvador's parts (sword_lock_salvador.h) -------------------------------------------------------
+// setPos without pos: his body parts and his chainsaw's carry the sway (pos alone does not move the skinned mesh) and the
+// struggle. Two passes per model: every part read and checked (chain length = nParts, translation near the model, the
+// span writable, the first part where we left it), then the writes. Any failure ends the motion; a foreign move (the
+// world moved him) ends it without an undo (partsWorldCalc rebuilt his matrices).
+static swsv::Struggle g_swsv_motion;
+static swsv::Shift g_swsv_body_shift,g_swsv_saw_shift;
+static uint32_t g_swsv_owner=0,g_swsv_saw=0;static swsv::V3 g_swsv_origin{},g_swsv_body_first{},g_swsv_saw_first{};
+static double g_swsv_now=-1;static bool g_swsv_moving=false;
+enum class SwsvWrite:uint8_t{Ok,Foreign,Failed};
+static const char* SwsvWriteName(SwsvWrite r){return r==SwsvWrite::Ok?"ok":r==SwsvWrite::Foreign?"foreign":"failed";}
+static bool SwsvReadV3(swczr::Memory& m,uint32_t at,swsv::V3& v){float a[3]{};if(!m.Read(at,a,sizeof(a)))return false;v={a[0],a[1],a[2]};return swsv::Finite(v);}
+static bool SwsvPartT(swczr::Memory& m,uint32_t part,swsv::V3& t){
+    return m.Read(part+swsv::kMatTx,&t.x,4)&&m.Read(part+swsv::kMatTy,&t.y,4)&&m.Read(part+swsv::kMatTz,&t.z,4)&&swsv::Finite(t);
+}
+// The model's parts (at most kMaxParts, exactly nParts), each sane and writable; first = the first part's translation.
+static bool SwsvParts(swczr::Memory& m,uint32_t model,uint32_t (&parts)[swsv::kMaxParts],unsigned& n,swsv::V3& first){
+    uint8_t count=0;swsv::V3 pos;
+    if(!model||!m.Read(model+swsv::kNParts,&count,1)||!count||count>swsv::kMaxParts||!SwsvReadV3(m,model+swsv::kPos,pos))return false;
+    uint32_t p=0;if(!m.Read(model+swsv::kFirstPart,&p,4))return false;
+    for(n=0;n<count;++n){
+        swsv::V3 t;
+        if(!p||!SwsvPartT(m,p,t)||!swsv::PartSane(pos,t)||!m.Writable(p+swsv::kMatTx,swsv::kWorldOld+12-swsv::kMatTx))return false;
+        if(n==0)first=t;
+        parts[n]=p;
+        if(!m.Read(p+swsv::kNextPart,&p,4))return false;
+    }
+    return true;
+}
+// candidate 13: the saw's parts, each near HIM (its own pos is stale while it hangs on his hand); otherwise as SwsvParts.
+static bool SwsvSawParts(swczr::Memory& m,uint32_t model,const swsv::V3& his,uint32_t (&parts)[swsv::kMaxParts],unsigned& n,swsv::V3& first){
+    uint8_t count=0;
+    if(!model||!m.Read(model+swsv::kNParts,&count,1)||!count||count>swsv::kMaxParts)return false;
+    uint32_t p=0;if(!m.Read(model+swsv::kFirstPart,&p,4))return false;
+    for(n=0;n<count;++n){
+        swsv::V3 t;
+        if(!p||!SwsvPartT(m,p,t)||!swsv::PartSane(his,t)||!m.Writable(p+swsv::kMatTx,swsv::kWorldOld+12-swsv::kMatTx))return false;
+        if(n==0)first=t;
+        parts[n]=p;
+        if(!m.Read(p+swsv::kNextPart,&p,4))return false;
+    }
+    return true;
+}
+// One model shifted by d (mm, world): mat's translation, world, world_old of every part. expected: where the first
+// part's translation must be now (the last write), else the world moved him.
+static SwsvWrite SwsvShift(uint32_t model,swsv::V3 d,swsv::V3& first_now,bool saw){
+    swczr::Memory m;uint32_t parts[swsv::kMaxParts]{};unsigned n=0;swsv::V3 first;
+    if(!(saw?SwsvSawParts(m,model,g_swsv_origin,parts,n,first):SwsvParts(m,model,parts,n,first)))return SwsvWrite::Failed;
+    if(!swsv::Ours(first,first_now))return SwsvWrite::Foreign;
+    for(unsigned i=0;i<n;++i){
+        const uint32_t p=parts[i];swsv::V3 t,wv,wo;
+        if(!SwsvPartT(m,p,t)||!SwsvReadV3(m,p+swsv::kWorld,wv)||!SwsvReadV3(m,p+swsv::kWorldOld,wo))return SwsvWrite::Failed;
+        t=swsv::Add(t,d);wv=swsv::Add(wv,d);wo=swsv::Add(wo,d);
+        if(!m.Write(p+swsv::kMatTx,&t.x,4)||!m.Write(p+swsv::kMatTy,&t.y,4)||!m.Write(p+swsv::kMatTz,&t.z,4)||
+           !m.Write(p+swsv::kWorld,&wv,12)||!m.Write(p+swsv::kWorldOld,&wo,12))return SwsvWrite::Failed;
+    }
+    first_now=swsv::Add(first_now,d);
+    return SwsvWrite::Ok;
+}
+static void SwsvMotionLine(const char* why,SwsvWrite r){
+    SwlLog("sword_lock duel salvador motion end why=%s write=%s owner=0x%08X saw=0x%08X steps=%u writes=%u/%u max_body=%.0f max_mm=%.0f/%.0f "
+        "jolts=%u surges=%u tick=%lu",why,SwsvWriteName(r),g_swsv_owner,g_swsv_saw,g_swsv_motion.steps(),g_swsv_body_shift.writes(),
+        g_swsv_saw_shift.writes(),static_cast<double>(g_swsv_motion.max_body()),static_cast<double>(g_swsv_body_shift.max_mm()),
+        static_cast<double>(g_swsv_saw_shift.max_mm()),g_swsv_motion.jolts(),g_swsv_motion.surges(),GetTickCount());
+}
+// Both models to the offsets wanted (body, saw); a failure on either: both back (best effort) and the motion ends.
+static SwsvWrite SwsvApply(swsv::V3 body,swsv::V3 saw){
+    SwsvWrite r=SwsvShift(g_swsv_owner,g_swsv_body_shift.Delta(body),g_swsv_body_first,false);
+    if(r!=SwsvWrite::Ok)return r;
+    g_swsv_body_shift.Applied(body);
+    r=SwsvShift(g_swsv_saw,g_swsv_saw_shift.Delta(saw),g_swsv_saw_first,true);
+    if(r!=SwsvWrite::Ok)return r;
+    g_swsv_saw_shift.Applied(saw);
+    return SwsvWrite::Ok;
+}
+// candidate 11: his chainsaw: the live cEmWep in its Parent routine hanging on him (pEm_oya), the nearest if several
+// candidate 13 (cand12 night bot, 5-nov: no cEmWep within 3 m of him at all, only two Ganados): a parented weapon's own
+// pos is not kept up (setParentMatCalc builds its matrices from the hand part), so the saw is judged by its FIRST PART's
+// world translation, not by pos. Every live cEmWep (the parry's thrown vtable) is logged once a duel (r0, r1, pEm_oya,
+// pos and part distances, up to 8); the saw is the pEm_oya match, else the cEmWep not in flight whose first part is
+// within kSawNearMm of his body (saw_by=part).
+static uint32_t SwsvFindSaw(uint32_t owner,const swsv::V3& his,unsigned& candidates,const char*& by){
+    candidates=0;by="none";ImageMem m;mtg::Manager pool;
+    if(mtg::ReadManager(m,g_swl_base,mtg::Config{},pool)!=mtg::Reject::None)return 0;
+    uint32_t best=0,closest=0;float best_mm=1e30f,closest_mm=1e30f;unsigned listed=0;
+    for(unsigned i=0;i<pool.count;++i){
+        const uint32_t at=pool.array+i*pool.block;uint32_t vtable=0,be=0,oya=0,part=0;uint8_t rr[2]{};float pos[3]{},pt[3]{};
+        if(at==owner||!m.Read(at,&vtable,4)||vtable!=g_swl_base+link_runtime::parry::general::thrown::kVtable)continue;
+        if(!m.Read(at+mtg::layout::be_flag,&be,4)||(be&0x201)!=1||!m.Read(at+mtg::layout::routine,rr,2))continue;
+        m.Read(at+swsv::kWepOya,&oya,4);m.Read(at+mtg::layout::pos,pos,12);
+        const bool has_part=m.Read(at+swsv::kFirstPart,&part,4)&&part&&m.Read(part+swsv::kMatTx,&pt[0],4)&&m.Read(part+swsv::kMatTy,&pt[1],4)&&
+            m.Read(part+swsv::kMatTz,&pt[2],4)&&swsv::Finite({pt[0],pt[1],pt[2]});
+        const float d_pos=swsv::Len(swsv::Sub({pos[0],pos[1],pos[2]},his));
+        const float d_part=has_part?swsv::Len(swsv::Sub({pt[0],pt[1],pt[2]},his)):-1.f;
+        if(listed<8){++listed;SwlLog("sword_lock duel salvador wep em=0x%08X r0=%u r1=%u oya=0x%08X owner=%u pos_mm=%.0f part_mm=%.0f tick=%lu",at,
+            unsigned(rr[0]),unsigned(rr[1]),oya,oya==owner?1U:0U,static_cast<double>(d_pos),static_cast<double>(d_part),GetTickCount());}
+        const bool flying=rr[0]==1&&(rr[1]==5||rr[1]==6||rr[1]==0xA);
+        if(oya==owner&&!flying){++candidates;const float d=has_part?d_part:d_pos;if(d<best_mm){best=at;best_mm=d;}}
+        else if(!flying&&has_part&&d_part<=swsv::kSawNearMm&&d_part<closest_mm){closest=at;closest_mm=d_part;}
+    }
+    if(best){by="oya";return best;}
+    if(closest){by="part";return closest;}
+    return 0;
+}
+static void SwsvMotionBegin(const swl::World& w){
+    g_swsv_motion=swsv::Struggle{};g_swsv_body_shift.Reset();g_swsv_saw_shift.Reset();g_swsv_owner=g_swsv_saw=0;g_swsv_now=-1;g_swsv_moving=false;
+    if(!g_swsv_cfg.motion||g_swdl_foe!=swdl::Foe::Salvador)return;
+    swczr::Memory m;const uint32_t owner=g_swl.owner();uint32_t saw=0;unsigned saw_candidates=0;const char* saw_by="none";swsv::V3 his,link;
+    const char* why=nullptr;
+    if(!owner||!SwlOwnerAlive(owner,true)||!SwsvReadV3(m,owner+swsv::kPos,his)||!w.player||!SwsvReadV3(m,w.player+0x94,link))why="owner";
+    else if(!(saw=SwsvFindSaw(owner,his,saw_candidates,saw_by)))why="weapon";   // cand13: judged by its first part (pos is stale)
+    else{
+        uint32_t parts[swsv::kMaxParts]{};unsigned n=0;
+        if(!SwsvParts(m,owner,parts,n,g_swsv_body_first))why="body_parts";
+        else if(!SwsvSawParts(m,saw,his,parts,n,g_swsv_saw_first))why="saw_parts";
+        else if(!g_swsv_motion.Begin(swsv::Sub(his,link),static_cast<uint32_t>(w.now)^owner,g_swk.duel().hits(),g_swk.duel().misses()))why="axis";
+    }
+    if(why){SwlLog("sword_lock duel salvador motion begin=0 why=%s owner=0x%08X saw=0x%08X saw_candidates=%u tick=%lu",why,owner,saw,saw_candidates,
+        GetTickCount());return;}
+    g_swsv_owner=owner;g_swsv_saw=saw;g_swsv_origin=his;g_swsv_now=w.now;g_swsv_moving=true;
+    SwlLog("sword_lock duel salvador motion begin=1 owner=0x%08X saw=0x%08X saw_by=%s saw_candidates=%u saw_part_mm=%.0f tick=%lu",owner,saw,
+        saw_by,saw_candidates,static_cast<double>(swsv::Len(swsv::Sub(g_swsv_saw_first,his))),GetTickCount());
+}
+// The duel's ticks (and the release wait): the sway's written pos (what H2c moved him by) plus the struggle.
+static void SwsvMotionTick(const swl::World& w,bool running){
+    if(!g_swsv_moving)return;
+    const double h=g_swsv_now>=0&&w.now>g_swsv_now?(w.now-g_swsv_now)/60.0:0.0;
+    g_swsv_now=w.now;
+    if(!SwlOwnerAlive(g_swsv_owner,true)||g_swsv_owner!=g_swl.owner()){g_swsv_moving=false;SwsvMotionLine("owner",SwsvWrite::Foreign);return;}
+    const swk::sd::Duel& d=g_swk.duel();
+    swsv::Facts f;f.on=running;f.pv=d.pv();f.hits=d.hits();f.misses=d.misses();
+    g_swsv_motion.Step(f,h);
+    swsv::V3 sway{};
+    if(g_swc_sway_owner==g_swsv_owner)sway={g_swc_sway_wrote.x-g_swsv_origin.x,0.f,g_swc_sway_wrote.z-g_swsv_origin.z};
+    const SwsvWrite r=SwsvApply(swsv::Add(sway,g_swsv_motion.body()),swsv::Add(sway,g_swsv_motion.saw()));
+    if(r!=SwsvWrite::Ok){
+        if(r==SwsvWrite::Failed){SwsvApply({},{});}   // best effort back; a foreign move healed itself
+        g_swsv_moving=false;SwsvMotionLine(r==SwsvWrite::Foreign?"foreign":"write_failed",r);
+    }
+}
+// Every exit, before the world goes on: his parts and the chainsaw's back to where his motion left them (once).
+static void SwsvMotionRestore(const char* why){
+    if(!g_swsv_moving)return;
+    g_swsv_moving=false;
+    const SwsvWrite r=SwsvApply({},{});
+    SwsvMotionLine(why,r);
+}
+// Worker, after ztarget::runtime::Start (the camera hooks are up or not by now). Logs nothing with the lab duel off.
+static void SwcStart(){
+    if(!g_swk_on.load(std::memory_order_acquire))return;
+    const bool zt=swczr::live.load(std::memory_order_acquire),lift=swczr::lift_live.load(std::memory_order_acquire),
+        orbit=swczr::orbit_live.load(std::memory_order_acquire);
+    const bool hooks=swczr::base!=0&&(zt||lift||orbit);
+    g_swc_snap_ok=lift||orbit;   // ztarget::runtime::Start checked CamSmth's pins for them (smooth_pins)
+    g_swc_segment=swczr::orbit_probe_on&&swczr::orbit_segment?swczr::orbit_segment:swczr::los_ready&&swczr::los_segment?swczr::los_segment:nullptr;
+    if(g_swc_cfg.camera&&hooks){
+        swczr::duel_prepare=&SwcPrepare;swczr::duel_finish=&SwcFinish;swczr::duel_after_front=&SwcAfterFront;
+        g_swc_cam_live.store(true,std::memory_order_release);
+    }
+    Log("sword_lock cinema camera ready=%u why=%s hooks=ztarget:%u,lift:%u,orbit:%u snap=%u probe=%u in_tau_ms=%.0f out_tau_ms=%.0f low=%.1f+%.1f*|pv| "
+        "miss=%.0f push_mm=%.0f dist_mm=%.0f..%.0f",g_swc_cam_live.load()?1U:0U,!g_swc_cfg.camera?"off":!hooks?"no_camera_hooks(needs ZTarget=1, "
+        "EndingBlowCamera or BackSliceCamera)":"-",zt?1U:0U,lift?1U:0U,orbit?1U:0U,g_swc_snap_ok?1U:0U,g_swc_segment?1U:0U,
+        static_cast<double>(swc::kInTau)*1000.0,static_cast<double>(swc::kOutTau)*1000.0,static_cast<double>(swc::kLowBase),
+        static_cast<double>(swc::kLowGain),static_cast<double>(swc::kMissUnits),static_cast<double>(swc::kPushMm),
+        static_cast<double>(swc::kDistMin),static_cast<double>(swc::kDistMax));
+    g_swc_bars_ready=g_swc_cfg.bars&&g_hud_cfg.letterbox&&g_hud_ready.load(std::memory_order_acquire);
+    Log("sword_lock cinema bars ready=%u why=%s owner=duel_then_ztarget ease=hud_tp(F-09)",g_swc_bars_ready?1U:0U,!g_swc_cfg.bars?"off":
+        !g_swc_bars_ready?"no_letterbox(needs [Hud] TpHearts=1 and ZTargetLetterbox=1)":"-");
+    Log("sword_lock cinema sway ready=%u per_pa=%.2f gain=%.1f back_max_mm=%.0f lean_max_mm=%.0f recoil_mm=%.0f min_sep_mm=%.0f probe=%u",
+        g_swc_cfg.sway?1U:0U,static_cast<double>(swc::kSwayPerPa),static_cast<double>(swc::kSwayGain),static_cast<double>(swc::kBackMaxMm),
+        static_cast<double>(swc::kLeanMaxMm),static_cast<double>(swc::kRecoilMm),static_cast<double>(swc::kMinSepMm),g_swc_segment?1U:0U);
+}
+// ---- Dark Link as the owner (sword_lock_darklink.h; [Combat] SwordLockDarkLink, missing = 1) ---------------------------
+// The admission: a press block of em39's attack spheres (0x15585F, ESI = the em39) with a complete owner queues the same
+// probe request as a chainsaw block (SwordLockBlockedLab, inside the EmAtkHitCk resolver: reads and the queue only).
+// The rest of the duel is the Salvador's (the lab's freeze, lease, draw, icons, clips, sounds, camera, bars and sway);
+// the probe's liveness, the guard and the exit blow ask g_swdl_foe. His voices (Ganondorf's V_TUBAZERI) play on their
+// own waveOut devices from the poll thread, as H3's. Lines "sword_lock duel darklink " through the H0 ring.
+static swdl::Voice g_swdl_voice;               // game thread
+static std::atomic<uint32_t> g_swdl_loops{0},g_swdl_shots[swdl::kShotCount]{};
+static std::atomic<bool> g_swdl_ready{false};  // the WAVs loaded (worker)
+static SwsLoop g_swdl_loop[swdl::kLoopCount];
+static link_runtime::ztarget::voice::Voice g_swdl_shot[swdl::kShotCount];
+static unsigned g_swdl_refusals=0;
+static void SwdlPublish(){
+    const swdl::Out& o=g_swdl_voice.out();
+    g_swdl_loops.store(o.loops,std::memory_order_release);
+    for(unsigned i=0;i<swdl::kShotCount;++i)g_swdl_shots[i].store(o.shots[i],std::memory_order_release);
+}
+static void SwdlPollAudio(){   // poll thread: H3's rules (all off when RE4 is not in front, one play per counter step)
+    if(!g_swdl_ready.load(std::memory_order_acquire))return;
+    static uint32_t played[swdl::kShotCount]{};static bool first=true;
+    DWORD pid=0;GetWindowThreadProcessId(GetForegroundWindow(),&pid);
+    const bool front=pid==GetCurrentProcessId();
+    const uint32_t loops=front?g_swdl_loops.load(std::memory_order_acquire):0;
+    for(unsigned i=0;i<swdl::kLoopCount;++i){if(loops&swdl::LoopBit(i))g_swdl_loop[i].Play();else g_swdl_loop[i].Stop();}
+    for(unsigned i=0;i<swdl::kShotCount;++i){
+        const uint32_t n=g_swdl_shots[i].load(std::memory_order_acquire);
+        if(!first&&n!=played[i]&&front)g_swdl_shot[i].Play();
+        played[i]=n;
+    }
+    first=false;
+}
+// candidate 9: the Salvador's engine loop and his one-shots (clash, grunts), H3's rules on the poll thread
+static SwsLoop g_swsv_loop[swsv::kLoopCount];
+static link_runtime::ztarget::voice::Voice g_swsv_shot[swsv::kShotCount];
+static void SwsvPublish(){
+    const swsv::Out& o=g_swsv.out();
+    g_swsv_loops.store(o.loops,std::memory_order_release);
+    for(unsigned i=0;i<swsv::kShotCount;++i)g_swsv_shots[i].store(o.shots[i],std::memory_order_release);
+}
+static void SwsvPollAudio(){
+    if(!g_swsv_ready.load(std::memory_order_acquire))return;
+    static uint32_t played[swsv::kShotCount]{};static bool first=true;
+    DWORD pid=0;GetWindowThreadProcessId(GetForegroundWindow(),&pid);
+    const bool front=pid==GetCurrentProcessId();
+    const uint32_t loops=front?g_swsv_loops.load(std::memory_order_acquire):0;
+    for(unsigned i=0;i<swsv::kLoopCount;++i){if(loops&swsv::LoopBit(i))g_swsv_loop[i].Play();else g_swsv_loop[i].Stop();}
+    for(unsigned i=0;i<swsv::kShotCount;++i){
+        const uint32_t n=g_swsv_shots[i].load(std::memory_order_acquire);
+        if(!first&&n!=played[i]&&front)g_swsv_shot[i].Play();
+        played[i]=n;
+    }
+    first=false;
+}
+// Every probe tick of a Dark Link duel (and its release and after watch, for a result voice still due).
+static void SwdlVoiceTick(const swl::World& w,bool paused){
+    if(!g_sws_cfg.sound||(!g_swdl_voice.on()&&!g_swdl_voice.pending()))return;
+    const swk::sd::Duel& d=g_swk.duel();
+    swdl::Facts f;f.running=g_swk.stage()==swk::Stage::Duel&&d.Running();f.paused=paused;f.band=d.band();f.result=d.result();
+    f.now_ms=w.now/0.06;
+    g_swdl_voice.Tick(f);SwdlPublish();
+}
+// The resolver's block (game thread, inside EmAtkHitCk): the chainsaw goes to H0's SwordLockBlocked; Dark Link's blade
+// (em39 0x15585F) queues the same request with the em39 from ESI, only complete (swdl::Admit). Reads and the queue only.
+// Candidate 1 (sword_lock_gate.h): the device word and the pad column as the duel's icons read them (unread: a pad).
+static swgt::Device SwgtDevice(){
+    swgt::Device d;CmbMem m;
+    if(g_swk_base&&m.Read(g_swk_base+swi::rva::kDevice,&d.device,4)&&m.Read(g_swk_base+swg::rva::kSelector,&d.selector,4))d.read=true;
+    return d;
+}
+static unsigned g_swgt_refusals=0;
+static void SwgtRefused(swgt::Why why,const char* foe,uint32_t owner,unsigned id,uint32_t serial,const swgt::Device& d){
+    ++g_swgt_refusals;
+    SwlLog("sword_lock duel refused why=%s reason=%s foe=%s owner=0x%08X id=0x%02X serial=0x%08X device=%d sel=%d pad_key=%u refusals=%u tick=%lu",
+        swgt::WhyName(why),swgt::WhyName(why),foe,owner,id,serial,d.read?d.device:-1,d.read?d.selector:-1,g_swgt_cfg.pad?1U:0U,g_swgt_refusals,GetTickCount());
+}
+static void SwordLockBlockedLab(const link_runtime::parry::general::Applied& applied,const link_runtime::parry::Candidate& c){
+    if(!g_swk_on.load(std::memory_order_acquire)){if(applied.chainsaw)SwordLockBlocked(applied);return;}   // the H0 probe alone: as before
+    if(applied.chainsaw){   // candidate 1: Dr. Salvador only (the Bella sisters keep the 3.5.0 parry), no pad
+        mtg::Raw r;const bool read=SwlOwnerRaw(applied.owner,r);const swgt::Device d=SwgtDevice();
+        const swgt::Why why=swgt::Chainsaw(g_swgt_cfg,read,r.id,d);
+        if(why!=swgt::Why::Ok){SwgtRefused(why,"salvador",applied.owner,read?r.id:0xFFU,applied.serial,d);return;}
+        SwordLockBlocked(applied);return;
+    }
+    if(!g_swl_on.load(std::memory_order_acquire)||!g_swl_base||c.outer_caller<g_swl_base)return;
+    const uint32_t ret=c.outer_caller-g_swl_base;
+    if(ret!=swdl::kProducerRet)return;   // another producer: nothing (no line)
+    const swdl::Owner o=SwdlOwner(c.producer_esi);
+    const swdl::Why why=swdl::Admit(g_swdl_cfg,ret,applied.cancel&&applied.effects&&!applied.grace,o,g_swl_base);
+    if(why!=swdl::Why::Ok){
+        ++g_swdl_refusals;
+        if(why!=swdl::Why::Off)SwlLog("sword_lock duel darklink refused why=%s owner=0x%08X id=0x%02X r0=%u r1=0x%02X hp=%d/%d refusals=%u tick=%lu",
+            swdl::WhyName(why),c.producer_esi,unsigned(o.id),unsigned(o.r0),unsigned(o.r1),int(o.hp),int(o.hp_max),g_swdl_refusals,GetTickCount());
+        return;
+    }
+    {   // candidate 1: no pad for Dark Link either
+        const swgt::Device d=SwgtDevice();
+        if(swgt::DeviceRule(g_swgt_cfg,d)!=swgt::Why::Ok){SwgtRefused(swgt::Why::Device,"dark_link",c.producer_esi,o.id,applied.serial,d);return;}
+    }
+    if(!g_swl.Queue(c.producer_esi,applied.serial,GameNow(g_swl_global_slot)))return;   // busy, cooldown: H0's own rules
+    g_swdl_foe=swdl::Foe::DarkLink;
+    g_swk_forced=false;
+    // The block's swing for the release's re-armed Follow (the general Follow keeps owner 0 for em39): its function, the
+    // em39, the contact point and his routine at the block.
+    g_swk_swing=swk::SavedSwing{};g_swk_swing.valid=true;g_swk_swing.known=true;g_swk_swing.fn=g_swl_base+swdl::kProducerFn;
+    g_swk_swing.owner=c.producer_esi;std::memcpy(g_swk_swing.pos,applied.hit,sizeof(g_swk_swing.pos));
+    g_swk_swing.routine[0]=o.r0;g_swk_swing.routine[1]=o.r1;
+    std::memcpy(g_swk_hit,applied.hit,sizeof(g_swk_hit));
+    SwlLog("sword_lock duel darklink queued owner=0x%08X r1=0x%02X hp=%d/%d serial=0x%08X power=%u tick=%lu",c.producer_esi,unsigned(o.r1),
+        int(o.hp),int(o.hp_max),applied.serial,unsigned(applied.power),GetTickCount());
+}
+// Resolver (game thread): the request was queued. The Follow Resolve just armed is this very block's (same call).
+static void SwkQueued(const link_runtime::parry::general::Applied& a){
+    g_swk_forced=false;
+    g_swdl_foe=swdl::Foe::Salvador;   // the chainsaw's queue (Dark Link's sets its own in SwordLockBlockedLab)
+    g_swk_swing=swk::Save(g_gen.follow);
+    std::memcpy(g_swk_hit,a.hit,sizeof(g_swk_hit));
+}
+// The lab guard: only while the world is ours (the duel and its exit slide), as the frozen owner cannot swing then.
+static bool SwkGuarding(){return g_swl.Holding()||g_swk.Holding();}
+static void SwkHit(){if(g_swk.stage()==swk::Stage::After)++g_swk_hits;}
+static bool SwkNoSwing(){return !g_swk_forced&&(!g_swk_swing.valid||!g_swk_swing.known);}   // a forced request has no swing (waived)
+// Admission (the decide frame after the block): another hostile live Ganado within SwordLockCrowdMm of Link, or a
+// cEmWep in flight within 10 m (XZ). Reads only; true = crowd.
+static bool SwkCrowd(const swl::World& w){
+    g_swk_crowd=swk::Crowd{};
+    ImageMem m;float link[3]{};mtg::Manager pool;
+    // Fails closed: Link or the enemy manager unread is a crowd (refused reason=crowd blind=1).
+    if(!w.player||!m.Read(w.player+0x94,link,sizeof(link))||mtg::ReadManager(m,g_swl_base,mtg::Config{},pool)!=mtg::Reject::None){
+        g_swk_crowd3=g_swk_crowd8=swk::BlindCrowd();g_swk_crowd=swk::BlindCrowd();return true;
+    }
+    swk::Actor actors[256];unsigned n=0;
+    for(unsigned i=0;i<pool.count&&n<256;++i){
+        const uint32_t at=pool.array+i*pool.block;uint32_t vtable=0;
+        if(!m.Read(at,&vtable,4))continue;
+        swk::Actor x;x.ptr=at;
+        if(vtable==g_swl_base+mtg::layout::em10_vtable_rva){
+            mtg::Raw r;
+            if(mtg::ReadRaw(m,at,r)!=mtg::Reject::None){   // a live slot whose facts did not read: counted where it stands
+                uint32_t be=0;
+                if(m.Read(at+mtg::layout::be_flag,&be,4)&&(be&0x201)!=1)continue;   // a free slot
+                x.unread=true;
+                if(!m.Read(at+mtg::layout::pos,x.pos,12)){x.pos[0]=link[0];x.pos[1]=link[1];x.pos[2]=link[2];}   // nowhere known: here
+                actors[n++]=x;continue;
+            }
+            x.ganado=(r.be_flag&0x201)==1&&mtg::GanadoFamily(r.id)&&r.hp>0&&(r.status&0x20);
+            x.pos[0]=r.pos.x;x.pos[1]=r.pos.y;x.pos[2]=r.pos.z;
+        }else if(vtable==g_swl_base+link_runtime::parry::general::thrown::kVtable){
+            uint32_t be=0;uint8_t rr[2]{};
+            if(!m.Read(at+mtg::layout::be_flag,&be,4)||(be&0x201)!=1||!m.Read(at+mtg::layout::routine,rr,2)||!m.Read(at+mtg::layout::pos,x.pos,12))continue;
+            x.weapon=rr[0]==1&&(rr[1]==5||rr[1]==6||rr[1]==0xA);   // Throw, Shot, ThrowScythe
+        }else continue;
+        if(x.ganado||x.weapon)actors[n++]=x;
+    }
+    g_swk_crowd=swk::JudgeCrowd(actors,n,g_swl.owner(),link,g_swk_cfg.crowd_mm);
+    // Log only: the same scene against 3 m and round 5's 8 m (the openings SwordLockCrowdMm=1500 gains; the duel start line).
+    g_swk_crowd3=swk::JudgeCrowd(actors,n,g_swl.owner(),link,3000);g_swk_crowd8=swk::JudgeCrowd(actors,n,g_swl.owner(),link,swk::kDefaultCrowdMm);
+    return g_swk_crowd.refused;
+}
+static void SwkRefusedCrowd(){
+    ++g_swk_crowd_refusals;
+    const swk::Crowd& c=g_swk_crowd;
+    SwlLog("sword_lock duel refused reason=crowd near_m=%.1f others=%u between_3_8=%u wep_10m=%u unread=%u blind=%u crowd_mm=%.0f "
+        "owner=0x%08X serial=0x%08X opens=%u refusals=%u tick=%lu",c.near_mm<0?-1.0:c.near_mm/1000.0,c.ganados,c.between,c.weapons,c.unread,
+        c.blind?1U:0U,g_swk_cfg.crowd_mm,g_swl.owner(),g_swl.serial(),g_swk_opens,g_swk_crowd_refusals,GetTickCount());
+}
+// [Combat] SwordLockLabForce=1 (sword_lock_lab.h Force; lab DLL only): on the player's core frame with nothing queued,
+// held or watched, the nearest live chainsaw owner (em10 id 0x15, +0x7F0 == 4: ChainsawOwner's) within
+// SwordLockLabForceMm of Link and in front of him (general::Parryable with the owner's position as the sample) queues
+// the probe's request as SwordLockBlocked does, when the admission would take it (ocarina, gameplay, Link free, the
+// probe's cooldown, the crowd). Reads only; the queue is the normal path's (the decide's Admit, freeze, lease, duel).
+static void SwkForce(void* player){
+    if(!g_swk_force_cfg.on)return;
+    const swl::World w=SwlWorld();
+    if(!w.readable||w.player!=reinterpret_cast<uint32_t>(player))return;
+    swk::ForceFacts f;
+    f.free=g_swl.Free()&&(g_swk.stage()==swk::Stage::Off||g_swk.stage()==swk::Stage::Done);
+    f.ocarina=w.ocarina;
+    LocalMemory lm;link_runtime::HealthState health;
+    f.gameplay=link_runtime::ReadHealth(lm,g_swl_player_slot,g_swl_global_slot,health)&&health.eligible;
+    // H1d review (4-nov, play-20261103 duel 2 `abandoned reason=lease`): a forced request opened with Link aiming
+    // (routine 0x01040600, KEY_KAMAE held), so the lease (knife hold or normal idle only, SwlLease) never started in its
+    // 1000 ms. The trigger now waits for a routine the lease can start from.
+    f.link_free=(w.link_routine==swl::native::kKnifeHold||mortal::dispatch::NormalIdleRoutine(w.link_routine))&&!g_swl_lease;
+    if(g_swk_force.Gate(f,w.now)!=swk::ForceWhy::Fire)return;
+    ImageMem m;float link[3]{};mtg::Manager pool;
+    if(!m.Read(w.player+0x94,link,sizeof(link))||mtg::ReadManager(m,g_swl_base,mtg::Config{},pool)!=mtg::Reject::None)return;
+    const float yaw=CmbGet<float>(w.player+0xA4);
+    uint32_t owner=0;float pos[3]{};double best=-1,dy=0;bool front=false;
+    for(unsigned i=0;i<pool.count;++i){   // the nearest chainsaw owner in front wins; else the nearest one (logged as behind)
+        const uint32_t at=pool.array+i*pool.block;mtg::Raw r;
+        if(mtg::ReadRaw(m,at,r)!=mtg::Reject::None||r.id!=0x15||r.wep_type!=4||!SwlOwnerAlive(at,false))continue;
+        const double dx=double(r.pos.x)-link[0],dz=double(r.pos.z)-link[2],d=std::sqrt(dx*dx+dz*dz);
+        link_runtime::parry::general::Front fr;
+        fr.sample[0]=r.pos.x;fr.sample[1]=r.pos.y;fr.sample[2]=r.pos.z;std::memcpy(fr.player,link,sizeof(link));
+        fr.half=static_cast<float>(std::sin(yaw)*dx+std::cos(yaw)*dz);fr.frontal=fr.half>0;
+        const bool ahead=std::isfinite(yaw)&&link_runtime::parry::general::Parryable(fr);
+        if(!std::isfinite(d)||(owner&&((front&&!ahead)||(front==ahead&&d>=best))))continue;
+        owner=at;best=d;front=ahead;dy=double(r.pos.y)-link[1];pos[0]=r.pos.x;pos[1]=r.pos.y;pos[2]=r.pos.z;
+    }
+    f.owner=owner!=0;f.cooling=owner&&g_swl.Cooling(owner,w.now);f.dist_mm=best;f.dy_mm=dy;f.front=front;
+    swk::ForceWhy why=g_swk_force.Judge(f,w.now);
+    if(why==swk::ForceWhy::Fire){f.crowd=SwkCrowd(w);why=g_swk_force.Judge(f,w.now);}
+    if(why!=swk::ForceWhy::Fire){
+        if(why==swk::ForceWhy::Crowd)g_swk_force.Crowded(w.now);
+        const DWORD t=GetTickCount();   // one line per change of reason, at most one a second
+        if(why!=g_swk_force_why&&t-g_swk_force_log>=1000){g_swk_force_log=t;g_swk_force_why=why;}else return;
+        SwlLog("sword_lock duel force wait why=%s owner=0x%08X dist=%.0f dy=%.0f near_m=%.1f force_mm=%.0f tick=%lu",
+            swk::ForceWhyName(why),owner,best,dy,why==swk::ForceWhy::Crowd&&g_swk_crowd.near_mm>=0?g_swk_crowd.near_mm/1000.0:-1.0,
+            g_swk_force_cfg.mm,t);
+        return;
+    }
+    const uint32_t serial=0xF0000000u|((g_swk_force.fired()+1)&0xFFFFu);   // no parry serial: 0xF000nnnn marks the trigger's
+    if(!g_swl.Queue(owner,serial,w.now))return;
+    g_swk_force.Fired(w.now);g_swk_force_why=why;
+    g_swk_forced=true;g_swk_swing=swk::SavedSwing{};   // no blocked swing to arm again (the no_swing rule waived for it)
+    g_swdl_foe=swdl::Foe::Salvador;   // the force trigger picks an em10 owner (the Salvador)
+    for(unsigned i=0;i<3;++i)g_swk_hit[i]=(pos[i]+link[i])*0.5f;   // the Traba's sparks between the two
+    g_swk_hit[1]+=1000.f;
+    SwlLog("sword_lock duel force owner=0x%08X dist=%.0f dy=%.0f serial=0x%08X force_mm=%.0f cooldown_ms=%.0f n=%u tick=%lu",owner,best,dy,serial,
+        g_swk_force_cfg.mm,g_swk_force.cooldown_ms(),g_swk_force.fired(),GetTickCount());
+}
+// The Begin frame (the freeze held, the lease tried): the difficulty (pG+0x4F98, with pG+0x847C logged for H1d), the
+// parry's own press as the duel's dirty keys, the mask from the next PadRead, the parry cut, the Traba's sparks and clash.
+// ---- candidate 5: the Master Sword in the hand (sword_lock_hand.h; Donald 4-nov: "aparece en el duelo con la pistola") --
+// From the duel's opening to its release, sword-hand-01's swap: the knife slot's model shown, the equipped weapon hidden at
+// level 0, whatever it is; every exit hands back exactly what it wrote. Never the equipped weapon id, the ammo or the hands.
+namespace swh=link_runtime::sword_lock::hand;
+static swh::DuelHand g_swh;
+static uint32_t g_swh_epoch=0;
+static bool SwhKnifeRoutine(){
+    const uint32_t player=CmbGet<uint32_t>(g_cmb_player_slot);
+    return link_runtime::IsPointer(player)&&shand::KnifeRoutine(CmbGet<uint32_t>(player+shand::layout::kRoutine));
+}
+static void SwhLine(const char* why,const swh::Step& s){
+    SwlLog("sword_lock duel sword restore why=%s result=%s ended=%u from_weapon=0x%02X weapon_now=0x%02X reasserts=%u late=%u tick=%lu",
+        why?why:"-",shand::Name(s.result),s.ended?1U:0U,g_swh.weapon()&0xFF,SwordWeapon()&0xFF,g_swh.reasserts(),g_swh.late(),GetTickCount());
+}
+static void SwhBegin(){
+    const uint32_t weapon=SwordWeapon();
+    const auto g=CmbGet<uint32_t>(g_cmb_global_slot);
+    const uint32_t character=link_runtime::IsPointer(g)?CmbGet<uint32_t>(g+0x4FC8):0xFFU;
+    const char* skip=!g_sword_hand_ok?"sword_in_hand_off":(character&0xFF)!=0?"character":nullptr;
+    if(skip){SwlLog("sword_lock duel sword shown=0 from_weapon=0x%02X why=%s tick=%lu",weapon&0xFF,skip,GetTickCount());return;}
+    if(g_swh.Active()){LocalMemory lm;SwhLine("restart",g_swh.End(lm,g_cmb_player_slot,"restart",SwhKnifeRoutine()));}
+    g_swh_epoch=SwlEpoch();
+    LocalMemory lm;
+    const auto r=g_swh.Begin(lm,g_cmb_player_slot,g_swk_opens,weapon,g_oca_mounted_bin.load(std::memory_order_acquire));
+    const bool shown=r==shand::Result::Shown||r==shand::Result::Native;
+    SwlLog("sword_lock duel sword shown=%u from_weapon=0x%02X by=%s result=%s knife_info=0x%08X guns_hidden=%u tick=%lu",shown?1U:0U,
+        weapon&0xFF,r==shand::Result::Shown?"duel":r==shand::Result::Native?"native_knife":"-",shand::Name(r),g_swh.knife_info(),
+        r==shand::Result::Shown?g_swh.guns_hidden():0U,GetTickCount());
+}
+static void SwhEnd(const char* why){
+    if(!g_swh.Active())return;
+    LocalMemory lm;SwhLine(why,g_swh.End(lm,g_cmb_player_slot,why,SwhKnifeRoutine()));
+}
+static void SwhHandOver(){SwhEnd("winspin");}
+static void SwhTick(){
+    if(!g_swh.Active())return;
+    const swl::World w=SwlWorld();
+    swh::Facts f;
+    f.locked=(g_swl.Holding()&&(g_swk.stage()==swk::Stage::Duel||g_swk.stage()==swk::Stage::Waiting))||g_swkw.Holding();
+    f.link_alive=!w.readable||(w.link_hp>0&&!(w.status0&swl::native::kStaDiedemo));   // unreadable: the swap's own wait
+    f.gameplay=!w.readable||!(w.status0&(swl::native::kStaEvent|swl::native::kStaCut|swl::native::kStaMovie));
+    f.same_epoch=SwlEpoch()==g_swh_epoch;
+    LocalMemory lm;
+    const swh::Step s=g_swh.Tick(lm,g_cmb_player_slot,f,SwhKnifeRoutine());
+    if(s.late)SwlLog("sword_lock duel sword shown=1 from_weapon=0x%02X by=duel result=shown late=1 (a native knife-down mid-duel) tick=%lu",
+        g_swh.weapon()&0xFF,GetTickCount());
+    else if(s.ended||s.result==shand::Result::Foreign||s.result==shand::Result::Lost)SwhLine(s.why?s.why:"native",s);
+}
+static void SwkStart(const swl::World& w){
+    if(!g_swl.Holding())return;
+    ImageMem m;uint8_t level=0,mode=0;
+    g_swk_level=w.global&&m.Read(w.global+0x4F98,&level,1)?level:-1;
+    g_swk_mode=w.global&&m.Read(w.global+0x847C,&mode,1)?mode:-1;
+    const uint32_t on=CmbGet<uint32_t>(g_swk_base+link_runtime::case_key_debounce::rva::kKeyOn);
+    // H1d: the bound keys' faces (read only; SwiStart logs them after the start line), the bag and the draw. A pad or a bag
+    // under 3 physical keys keeps H1c's fixed sequence (why=device / keys / no_sequence).
+    const int32_t dev=g_swk_base?CmbGet<int32_t>(g_swk_base+swi::rva::kDevice):-1,sel=SwkSelector();
+    const swi::Faces faces=SwiQueryFaces(dev,sel);
+    const swk::sd::Difficulty diff=swgt::DifficultyFromMode(g_swk_mode);   // candidate 1: the mode pG+0x847C, never the rank
+    g_swd_plan=g_swd.Next(g_swd_cfg,diff,g_swi_ready&&swi::KeyboardGlyphs(dev,sel),faces,w.frame,g_swl.owner());
+    g_swk.Start(g_swk_cfg,g_swd_plan.setup,g_swd_plan.all,on,w.now);
+    g_swd_offers.Reset();
+    for(unsigned& n:g_sws_sparks)n=0;
+    if(g_sws_cfg.sound){g_sws.Start();SwsPublish();}   // H3: HIT_SWORD at the clash, the screech and TUBA_A from the Traba
+    if(g_sws_cfg.sound&&g_swdl_foe==swdl::Foe::DarkLink){g_swdl_voice.Start();SwdlPublish();}   // Dark Link: his strain from the Traba
+    else{g_swdl_voice.Stop();SwdlPublish();}   // cand12: the Salvador's Ganondorf strain is his own director's one-shots
+    if(g_sws_cfg.sound&&g_swsv_cfg.sound&&g_swsv_ready.load(std::memory_order_acquire)&&g_swdl_foe==swdl::Foe::Salvador){
+        g_swsv.Start(swsv::Voice::Ganondorf);SwsvPublish();   // cand9 engine + clash; cand12: Ganondorf's strain as varied one-shots
+    }
+    g_swa_carried=false;   // H2b: only this duel's lose clip skips the slide
+    g_swk_draw_stun="-";   // candidate 3: set at a draw's release
+    g_swk_follow=g_swk_push_pending=g_swk_readers_mid=g_swk_readers_after=g_swk_actbtn_logged=g_swk_actbtn_own=false;g_swk_hits=0;
+    g_swk_entries=g_swk_own_entry=0;
+    g_swk_offer=swk::Offer{};g_swk_offer_shown=false;
+    g_swk_offer_frames=g_swk_offers=g_swk_shown=g_swk_native=g_swk_md=g_swk_unread=g_swk_set_failed=g_swk_qte_raised=g_swk_actbtn=0;
+    ++g_swk_opens;
+    link_runtime::parry::input::SetSwordLockBlocks(true);
+    // The Traba: one ParrySpark burst on the block's contact point and the parry's clash, the pieces that exist.
+    float link[3]{},rot[3]{};unsigned sparks=0;
+    if(m.Read(w.player+0x94,link,sizeof(link))){
+        const float dx=g_swk_hit[0]-link[0],dy=g_swk_hit[1]-link[1],dz=g_swk_hit[2]-link[2];
+        rot[0]=-std::atan2(dy,std::sqrt(dx*dx+dz*dz));rot[1]=std::atan2(dx,dz);
+        sparks=link_runtime::parry::spark::EmitFree(g_gen.sparks,&g_swk_hit,&rot,1);
+        g_sws_sparks[static_cast<unsigned>(sws::Spark::Lock)]+=sparks;
+    }
+    g_parry_audio.Publish(true,GetTickCount64());
+    const char* seq=g_swd_plan.seq;   // H1d: the drawn signature (H1c's m20-t45-m20 for a fallback)
+    const swk::sd::Tuning& t=g_swk.duel().setup().tuning;
+    const swk::Crowd& c=g_swk_crowd;
+    SwlLog("sword_lock duel start " SWL_LAB_TAG " owner=0x%08X serial=0x%08X seq=%s difficulty=%s level=%d mode=%d tuning=lab breaks=%u min_hits=%u "
+        "ceiling0=%.2f gain=%.2f window_ms=%.0f cap_ms=%.0f decay=%.2f bonus=%.2f fail=%.2f lock_ms=%.0f near_m=%.1f between_3_8=%u held=0x%08X "
+        "sparks=%u follow=%u stop=0x%08X sel=%d opens=%u force=%u owner_mm=%.0f tick=%lu",g_swl.owner(),g_swl.serial(),seq,swk::sd::DifficultyName(g_swk.difficulty()),
+        g_swk_level,g_swk_mode,t.breaks,t.min_hits,t.ceiling0,g_swk.duel().setup().mash_gain,g_swk.duel().window_ms(),g_swk.duel().cap_ms(),
+        t.decay_per_s,t.bonus,t.fail,t.lock_ms,c.near_mm<0?-1.0:c.near_mm/1000.0,c.between,on,sparks,g_swk_swing.valid&&g_swk_swing.known?1U:0U,
+        w.stop,SwkSelector(),g_swk_opens,g_swk_forced?1U:0U,SwaOwnerMm(w.player),GetTickCount());   // owner_mm: H2b's win cut evidence
+    {   // H1d: the draw (the bots read seq=; level/repeated: how much of the anti-repetition rule the pick kept)
+        const swd::Plan& pl=g_swd_plan;const swk::sd::Sequence& q=g_swk.duel().setup().sequence;const swk::sd::Config& dc=g_swk.duel().setup().config;
+        const swk::sd::Pool& bp=pl.bag.pool;
+        SwlLog("sword_lock seq=%s drawn=%u why=%s level=%s repeated=%u easy_fallback=%u difficulty=%s breaks=%u min_hits=%u push2=%s "
+            "q=%s,%s,%s side=%s alt_first=%s valid=%u fresh=%u seed=0x%08X counter=%u fixed=%u frame=%u history=%u tick=%lu",
+            pl.seq,pl.drawn?1U:0U,swd::WhyName(pl.why),pl.drawn?swk::sd::FreshnessName(pl.pick.level):"-",pl.drawn&&pl.pick.repeated?1U:0U,
+            pl.drawn&&pl.pick.easy_fallback?1U:0U,swk::sd::DifficultyName(g_swk.difficulty()),unsigned(q.breaks),t.min_hits,
+            q.breaks>1?swk::sd::MashName(q.push2):"-",swd::BreakName(q,0),swd::BreakName(q,1),swd::BreakName(q,2),swd::SideName(q.side),
+            q.breaks>1&&q.push2==swk::sd::Mash::Alternate?swk::sd::CtlName(q.alt_first):"-",pl.drawn?pl.pick.valid:0U,pl.drawn?pl.pick.fresh:0U,
+            pl.drawn?pl.pick.seed:0U,g_swd.sorter().counter(),g_swd_cfg.duel.seed,w.frame,g_swd.sorter().history(),GetTickCount());
+        SwlLog("sword_lock duel bag keys=%u guard=%u user_fell_back=%u key=%02X,%02X,%02X,%02X,%02X breaks=0x%02X user_pool=0x%02X "
+            "window_ms=%.0f hold=%u hold_pps=%.0f gain=%.2f all=%u tick=%lu",pl.bag.keys,pl.bag.guard?1U:0U,pl.bag.user_fell_back?1U:0U,
+            unsigned(bp.key[swk::sd::kKnife]),unsigned(bp.key[swk::sd::kAction]),unsigned(bp.key[swk::sd::kRight]),unsigned(bp.key[swk::sd::kLeft]),
+            unsigned(bp.key[swk::sd::kAim]),unsigned(bp.breaks),unsigned(g_swd_cfg.duel.pool),g_swk.duel().window_ms(),dc.hold?1U:0U,
+            g_swk.duel().setup().hold_pps,g_swk.duel().setup().mash_gain,pl.all?1U:0U,GetTickCount());
+    }
+    SwlLog("sword_lock duel mask on held=0x%08X keep=0x%08X tick=%lu",on&swk::bits::kMask,swk::bits::kKeep,GetTickCount());
+    SwkWinSpinReset();
+    // The admission's scene (log only): who stood within SwordLockCrowdMm, 3 m and round 5's 8 m, against the win spin's reach.
+    SwlLog("sword_lock duel crowd near_m=%.1f crowd_mm=%.0f within_crowd=%u within_3m=%u within_8m=%u wep_10m=%u spin_radius=%u winspin=%s tick=%lu",
+        c.near_mm<0?-1.0:c.near_mm/1000.0,g_swk_cfg.crowd_mm,c.ganados,g_swk_crowd3.ganados,g_swk_crowd8.ganados,c.weapons,g_cmb.great.radius,
+        swk::WinSpinReadyName(g_swkw_ready),GetTickCount());
+    SwiStart();   // the duel's icons: the bound keys' faces (sword_lock_icons.h), logged after the start line
+    if(g_swa_start_due){g_swa_start_due=false;SwaLogStart();}   // H2b: the lease started on clip a in this Begin frame
+    SwcSwayBegin(w);   // H2c: the owner's start and the room behind him (the camera and the bars follow the duel by themselves)
+    SwsvMotionBegin(w);   // candidate 9: his body and chainsaw parts, after the sway's origin
+    SwhBegin();        // candidate 5: the Master Sword in the hand, the equipped weapon hidden, for the whole lock
+    if(g_swdl_foe==swdl::Foe::DarkLink)SwlLog("sword_lock duel darklink start owner=0x%08X voices=%u win_cut_mm=%.0f exit=flash_then_kick tick=%lu",
+        g_swl.owner(),g_swdl_ready.load(std::memory_order_acquire)&&g_swdl_voice.on()?1U:0U,swdl::WinCutMm(g_swdl_foe,g_swa_cfg.win_cut_mm),GetTickCount());
+}
+// What every later reader of Key_btn sees now (they all read 0x862F08/0x862F10 after PadRead), and the parry input's view.
+// bits: what must not reach them (the whole gameplay mask during the duel; the keys still held after the release).
+static void SwkReaders(const char* at,double t_ms,uint32_t bits=swk::bits::kMask){
+    namespace ck=link_runtime::case_key_debounce;
+    const uint32_t on=CmbGet<uint32_t>(g_swk_base+ck::rva::kKeyOn),trg=CmbGet<uint32_t>(g_swk_base+ck::rva::kKeyTrg);
+    const auto& ps=link_runtime::parry::input::state;
+    SwlLog("sword_lock duel readers at=%s bits=0x%08X mem_on=0x%08X mem_trg=0x%08X real_on=0x%08X masked=%u parry_on=0x%08X parry_down=%u "
+        "parry_armed=%u blocks=%u t_ms=%.1f tick=%lu",at,bits,on,trg,g_swk.pad_on(),(on|trg)&bits?0U:1U,static_cast<uint32_t>(ps.sample.on),
+        ps.window.down?1U:0U,ps.window.armed?1U:0U,link_runtime::parry::input::Blocks()?1U:0U,t_ms,GetTickCount());
+}
+static void SwkRearm(){
+    g_swk_follow=swk::Rearm<link_runtime::parry::general::Grace,link_runtime::parry::general::Swing>(g_gen.grace,g_swk_swing,GetTickCount64());
+}
+// The world runs again (after the flash, the slide or an abandon): the parry cut dropped (the rearmed Follow must reach
+// tier 2), the held bits stay masked until released, the after watch starts; the end lines.
+static void SwkEnded(const swl::World& w,const char* release){
+    link_runtime::parry::input::SetSwordLockBlocks(false);
+    SwiReset(g_swk.abandoned()||std::strcmp(release,"abandon")==0?"abandon":"end");   // no-op when the duel's last tick already took the units back
+    SwsvMotionRestore(g_swk.abandoned()||std::strcmp(release,"abandon")==0?"abandon":"end");   // candidate 9: no-op once restored
+    SwcSwayRestore(g_swk.abandoned()||std::strcmp(release,"abandon")==0?"abandon":"end");   // H2c: no-op once restored (the release did)
+    SwhEnd("ended");   // candidate 5: a no-op unless something above missed it (a win spin's hold closed without a spin)
+    if(g_sws.on()){g_sws.Stop();SwsPublish();}   // H3: an abandon (or a release before the last tick) ends in silence
+    if(g_swsv.on()){g_swsv.Stop();SwsvPublish();}   // candidate 9: his engine too
+    if(g_swk.abandoned()||g_swk.duel().result()==swk::sd::Result::None||g_swk.duel().result()==swk::sd::Result::Abandoned){
+        g_swdl_voice.Stop();SwdlPublish();   // Dark Link: silence (a result's voice still due plays from the after watch)
+    }
+    SwaEnd(release,w.now);   // H2b: the clip's end line when no release frame wrote it (an abandon)
+    // A win spin's hold never outlives the duel (its own release has already ended it): one still running is closed
+    // the same way (its request dropped, its start ok=0 and release lines, the world given back), why=stopped.
+    if(g_swkw.Holding()){g_swkw.Stop(w.now);SwkWinSpinClose(w,swk::SpinWhy::Stopped);}
+    g_swk_actbtn_own=false;
+    if(g_swk.stage()==swk::Stage::Off||g_swk.stage()==swk::Stage::After||g_swk.stage()==swk::Stage::Done)return;
+    const double t_ms=g_swk.ElapsedMs(w.now);
+    g_swk.Ended(w.now,g_swk.pad_on());
+    SwkReaders("release",t_ms,g_swk.mask().held());   // the keys held through the release: masked until seen released
+    const swk::sd::Duel& d=g_swk.duel();
+    const bool push=std::strcmp(release,"push")==0;
+    double travel=-1;   // Link's real XZ travel from the push release to the End (collision included)
+    float here[3]{};ImageMem im;
+    if(push&&g_swk_push_from_ok&&w.player&&im.Read(w.player+0x94,here,sizeof(here))){
+        const double dx=double(here[0])-g_swk_push_from[0],dz=double(here[2])-g_swk_push_from[2];travel=std::sqrt(dx*dx+dz*dz);
+    }
+    SwlLog("sword_lock duel end result=%s reason=%s stop=%s t_ms=%.1f duel_ms=%.1f game_ms=%.1f pa=%.2f pv=%.3f ceil=%.2f hits=%u misses=%u "
+        "flanks=%u break_ok=%u release=%s push_stop=%s moved=%.0f travel=%.0f follow=%s freeze=%s stop_before=0x%08X stop_after=0x%08X "
+        "stop_restored=%u arm=%s draw_stun=%s tick=%lu",SwkResult(),g_swk.reason(),swk::sd::StopName(d.stop()),t_ms,
+        d.duel_ms(),d.game_ms(),d.pa(),d.pv(),d.ceiling(),d.hits(),d.misses(),d.flanks(),d.last_break().valid&&d.last_break().ok?1U:0U,release,
+        !push?"-":g_swa_carried?"carry":!g_swk_slide_hook?"no_hook":!g_swk_push_started?"not_started":g_push.stop()==ppb::Stop::Finished?"done":ppb::StopName(g_push.stop()),
+        push&&g_swa_carried?static_cast<double>(g_swa_carry.summary().travelled):push&&g_swk_push_started?static_cast<double>(g_push.moved()):0.0,travel,g_swk_follow?"rearmed":"none",SwlFreezeName(g_swl_freeze_result),
+        g_swl_stop_before,g_swl_stop_after,SwkRestored()?1U:0U,SwkArm(w),g_swk_draw_stun,GetTickCount());
+    SwlLog("sword_lock duel stats offers=%u shown=%u gaps=%u pulses=%u native=%u md=%u unread=%u set_failed=%u qte_raised=%u own_actbtn=%u "
+        "masked_frames=%u held=0x%08X difficulty=%s level=%d mode=%d opens=%u crowd_refusals=%u tick=%lu",g_swk_offers,g_swk_shown,
+        g_swd_offers.gaps(),g_swd_offers.pulses(),g_swk_native,g_swk_md,g_swk_unread,g_swk_set_failed,g_swk_qte_raised,g_swk_actbtn,
+        g_swk.mask().frames(),g_swk.mask().held(),swk::sd::DifficultyName(g_swk.difficulty()),g_swk_level,g_swk_mode,g_swk_opens,
+        g_swk_crowd_refusals,GetTickCount());
+    if(!g_swk.MaskActive())SwlLog("sword_lock duel mask off held=0x00000000 at=end tick=%lu",GetTickCount());
+    ArmTraceArm(CmbFrame());   // arm-trace: every frame for 48 frames after Link is handed back
+}
+// ---- a win's Great Spin (sword_lock_winspin.h; [Combat] SwordLockWinSpin, missing = 1) --------------------------------
+// The release frame of a win: the flash on the owner and the hold lease back, the world still held. On the first decide
+// where SwordDecide would start a clip (CombinedDecide runs it right after this probe tick), the existing Great Spin
+// request (great = 1, lab_win); its strike leaves the owner out (SwkWinSpinStrike); the world goes on once every Ganado
+// within GreatSpinRadius has its native knife record, or at a cap, or at once on a safety reason; then H1c's end lines.
+// After the release the spin's targets are watched for the after watch's 1000 ms (pushed=), and `winspin end` closes it.
+static void SwkWinSpinReset(){
+    g_swkw=swk::WinSpinHold{};g_swkw_push.Reset();g_swkw_due=g_swkw_struck=g_swkw_lease_over=false;g_swkw_lease=0;
+    g_swkw_targets=g_swkw_close=g_swkw_need=g_swkw_dropped=g_swkw_published=g_swkw_applied=g_swkw_skipped=0;
+    g_swkw_why=g_swkw_wait=g_swkw_lease_end="-";g_swkw_player=g_swkw_global=g_swkw_room=0;
+    g_swkw_deadline=0;g_swkw_expired=g_swkw_owner_due=false;g_swkw_world_frame=0;
+}
+static bool SwkWinSpinHoldsOwner(){return g_swkw.Holding();}
+static void SwkWinSpinDeferOwnerMove(){g_swkw_owner_due=true;}
+// SwordDecide, the win spin's strike: the hit list's deadline (sword_lock_winspin.h WinSpinDeadline: past the hold's cap,
+// so a frozen Ganado's 3-frame TTL never costs a record to the normal window). Not held any more: the normal one.
+static double SwkWinSpinDeadline(double now,double span){
+    g_swkw_deadline=g_swkw.Holding()?swk::WinSpinDeadline(now,span,g_swkw.t0()):now+span;
+    return g_swkw_deadline;
+}
+static void SwkWinSpinStartLine(bool ok){
+    int hp=0,hp_max=0;GreatHealth(hp,hp_max);
+    SwlLog("sword_lock duel winspin start ok=%u why=%s wait=%s lease=%llu wait_ms=%.1f requests=%u drops=%u great=1 hp=%d/%d radius=%u "
+        "permille=%u sparkles=%u sound=%u hits=0 pushed=0 excluded_owner=%u tick=%lu",ok?1U:0U,ok?"-":g_swkw_why,g_swkw_wait,
+        ok?g_swkw_lease:0ULL,g_swkw.start_ms(),g_swkw.requests(),g_swkw.drops(),hp,hp_max,g_cmb.great.radius,g_cmb.great.permille,
+        g_cmb.great.sparkles,g_great_spin_sound.Loaded()?1U:0U,swk::kExcludeOwner?1U:0U,GetTickCount());
+}
+// True: the hold began (the flash fired, the lease cancelled). False: H1c's flash release as before (another result, the key
+// off, or the spin not ready at startup: its start ok=0 line out).
+static bool SwkWinSpinBegin(mortal::dispatch::Runtime* run,const swl::World& w){
+    if(!g_swkw_cfg.on||g_swk.abandoned()||g_swk.duel().result()!=swk::sd::Result::Win)return false;
+    g_swkw_due=true;
+    if(g_swkw_ready!=swk::WinSpinReady::Ready||!w.readable){
+        g_swkw_why=w.readable?swk::WinSpinReadyName(g_swkw_ready):"unreadable";
+        SwkWinSpinStartLine(false);
+        return false;
+    }
+    SwlSample(2000,w);
+    SwlFire(w);                            // the flash 0x17 pending on the owner (stunned on its first move: the E KICK)
+    const bool cancelled=SwlCancel(run);   // the hold lease back: Link free for the spin, the world still frozen
+    g_swkw_player=w.player;g_swkw_global=w.global;g_swkw_room=w.room;
+    g_swkw.Begin(w.now);
+    SwiReset("end");
+    SwlLog("sword_lock duel release=winspin shot=%s lease_cancel=%u great_spin=%u radius=%u permille=%u sparkles=%u bullets=%u start_max_ms=%.0f "
+        "hold_max_ms=%.0f t_ms=%.1f tick=%lu",g_swl_shot,cancelled?1U:0U,g_cmb.GreatSpin()?1U:0U,g_cmb.great.radius,g_cmb.great.permille,
+        g_cmb.great.sparkles,g_cmb.bullets.on?1U:0U,swk::kWinSpinStartMs,swk::kWinSpinHoldMs,g_swk.ElapsedMs(w.now),GetTickCount());
+    return true;
+}
+// SwordDecide's own start gate for a queued spin, read before queueing (nullptr: it starts the spin in this decide).
+static const char* SwkWinSpinBlocker(const mortal::dispatch::Runtime* run,const CmbPlayer& p,bool player){
+    if(!run)return "core_frame";
+    if(run->active)return "dispatch_busy";
+    if(!player)return "no_player";
+    if(!p.facts.gameplay)return "gameplay";
+    if(p.damaged)return "damaged";
+    if(SwordBusy())return "sword_busy";
+    if(!g_sword_sample_player||g_sword_sample.frame!=CmbFrame())return "sample";
+    if(SwordLabPriority(g_sword_sample))return "native_priority";   // offer-fix-01: the win spin's own rule
+    if(!SwordForeground())return "background";
+    if(g_rx&&g_rx->Active())return "reaction";
+    if(g_oca_session.state()!=oca::State::Idle||OcaOwnsLease())return "ocarina";
+    if(!SwordKnifeHold(p.routine)&&!CmbStartRoutine(p.routine))return "routine";
+    return nullptr;
+}
+// The normal Great Spin's request, as SwordArbiter queues it at a charge's release, with great = 1 and lab_win.
+static void SwkWinSpinRequest(const CmbPlayer& p){
+    SwordRequest r;r.kind=SwordKind::Spin;r.time=GameNow(g_cmb_global_slot);r.scene=g_cmb_epoch;r.player=p.player;r.weapon=SwordWeapon();
+    r.frame=CmbFrame();r.great=true;GreatHealth(r.hp,r.hp_max);r.lab_win=true;
+    g_sword_charge.Cancel();g_sword_request=r;
+    CmbLog("spin_request frame=%u charge_ms=0 release=0 great=1 hp=%d/%d lab=winspin",r.frame,r.hp,r.hp_max);
+}
+// The hold is over (g_swkw already ended): a request never started dropped, the world given back, the release line.
+// SwkWinSpinRelease then ends the duel; SwkEnded calls this alone for a hold it finds still running (why=stopped).
+static void SwkWinSpinClose(const swl::World& w,swk::SpinWhy why){
+    g_swkw_why=swk::SpinWhyName(why);
+    if(g_sword_request.lab_win)g_sword_request={};   // a request never started goes with the hold
+    if(!g_swkw.started())SwkWinSpinStartLine(false);
+    const auto fr=SwlFreezeEnd(w);
+    g_swkw_world_frame=w.frame;
+    SwkRearm();   // the same swing's Follow from the moment the world goes on, as the push exit
+    const auto& a=g_sword_action;const bool ours=a.lease&&a.request.lab_win;
+    const unsigned published=ours?a.hits.Published():g_swkw_published,skipped=ours?a.hits.Skipped():g_swkw_skipped;
+    // published + skipped = resolved; skipped are revalidation or final refusals (none by the deadline unless expired=1).
+    SwlLog("sword_lock duel winspin release why=%s hold_ms=%.1f start_ms=%.1f strike_ms=%.1f struck=%u targets=%u close=%u need=%u resolved=%u "
+        "published=%u skipped=%u deferred=%u expired=%u deadline_ms=%.1f lease=%u freeze=%s stop_after=0x%08X tick=%lu",g_swkw_why,
+        g_swkw.release_ms(),g_swkw.start_ms(),g_swkw.strike_ms(),g_swkw_struck?1U:0U,g_swkw_targets,g_swkw_close,g_swkw.need(),
+        published+skipped,published,skipped,ours?a.hits.Deferred():0U,g_swkw_expired?1U:0U,
+        g_swkw_struck?swk::Ms(g_swkw_deadline-g_swkw.t0()):-1.0,ours?1U:0U,SwlFreezeName(fr),g_swl_stop_after,GetTickCount());
+}
+static void SwkWinSpinRelease(const swl::World& w,swk::SpinWhy why){
+    SwkWinSpinClose(w,why);
+    SwkEnded(w,"flash");
+}
+// H0's owner_move for a win spin: the owner's first move after the world went on (the probe's own one fell inside the
+// hold, with the owner still frozen, and was deferred). Its r0=2 is the Dm_Flash evidence H0 used.
+static void SwkWinSpinOwnerMove(const swl::World& w){
+    if(!g_swkw_owner_due||g_swkw.Holding()||!w.readable||w.frame==g_swkw_world_frame)return;
+    g_swkw_owner_due=false;
+    mtg::Raw r;g_swl_first=SwlOwnerRaw(g_swl.owner(),r);g_swl_first_r0=g_swl_first?r.r0:0;g_swl_first_r1=g_swl_first?r.r1:0;
+    SwlLog("sword_lock duel winspin owner_move r0=%u r1=%u owner_hp=%d dmg_flag=%u frozen_ms=%.1f t_ms=%.1f since_release_ms=%.1f tick=%lu",
+        unsigned(g_swl_first_r0),unsigned(g_swl_first_r1),g_swl_first?int(r.hp):0,g_swl_first?unsigned(r.dmg_flag):0U,g_swkw.release_ms(),
+        g_swl.ElapsedMs(w.now),g_swl.SinceReleaseMs(w.now),GetTickCount());
+}
+// Every probe tick while the hold lasts (decide and core frames; SwkFrame's first call).
+static void SwkWinSpinFrame(mortal::dispatch::Runtime* run,const swl::World& w){
+    SwdlVoiceTick(w,false);   // Dark Link: his lose voice may fall due during the win's Great Spin
+    swk::SpinFacts f;f.readable=w.readable;f.now=w.now;
+    f.same_world=w.player==g_swkw_player&&w.global==g_swkw_global&&(w.room&0xFFFF)==(g_swkw_room&0xFFFF);
+    f.link_alive=w.link_hp>0&&!(w.status0&swl::native::kStaDiedemo);
+    f.qte=(w.stop&swl::native::kSpfActBtn)!=0;
+    f.cutscene=(w.status0&(swl::native::kStaEvent|swl::native::kStaCut|swl::native::kStaMovie))!=0;
+    f.freeze_ok=w.freeze_owned==g_swl.owned();
+    CmbPlayer p;const bool player=w.readable&&CmbReadPlayer(p)&&p.player==w.player;
+    if(player)CmbScene(p.player);
+    const uint8_t r0=static_cast<uint8_t>((player?p.routine:w.link_routine)&0xFF);
+    f.link_taken=r0!=0&&r0!=swl::native::kLeaseR0;
+    const auto& rt=mortal::dispatch_hooks::runtime;const auto& a=g_sword_action;
+    f.lease=a.lease&&a.request.lab_win&&rt.active&&rt.lease.token==a.lease;
+    f.requested=g_sword_request.kind==SwordKind::Spin&&g_sword_request.lab_win;
+    if(f.lease){
+        g_swkw_lease=a.lease;f.struck=a.struck;
+        if(a.struck){
+            f.resolved=a.hits.Published()+a.hits.Skipped();f.deferred=a.hits.Deferred();f.hits_done=a.hits.Done();
+            g_swkw_published=a.hits.Published();g_swkw_applied=a.hits.Applied();g_swkw_skipped=a.hits.Skipped();
+            // Pump skips everything left once now passes the deadline (this tick runs before this frame's Pump).
+            f.expired=g_swkw_expired=link_runtime::game_clock::Exceeded(w.now-g_swkw_deadline,0);
+        }
+    }
+    f.need=g_swkw_need;
+    if(!f.lease&&!f.requested){
+        const char* b=SwkWinSpinBlocker(run,p,player);
+        f.can_request=b==nullptr;
+        if(b&&run)g_swkw_wait=b;
+    }
+    const swk::SpinStep s=g_swkw.Tick(f);
+    if(s.request)SwkWinSpinRequest(p);
+    if(s.started)SwkWinSpinStartLine(true);
+    if(s.release)SwkWinSpinRelease(w,s.why);
+}
+// SwordDecide, the spin's strike (lab_win only): the owner out of the hit list, the targets kept for pushed=.
+static void SwkWinSpinStrike(uint64_t lease,const CmbPlayer& p,sword::target::List& targets){
+    const unsigned scanned=targets.count;
+    g_swkw_dropped=swk::kExcludeOwner?swk::ExcludeActor(targets,g_swl.owner()):0U;
+    const float radius=static_cast<float>(g_cmb.great.radius);
+    g_swkw_need=swk::NeedFor(targets,radius);g_swkw_close=swk::CountWithin(targets,radius);g_swkw_targets=targets.count;
+    g_swkw_struck=true;g_swkw_lease=lease;
+    g_swkw_push.Reset();CmbMem m;
+    for(unsigned i=0;i<targets.count;++i){
+        mtg::Raw r;swk::Seen s;s.read=mtg::ReadRaw(m,targets.items[i].pointer,r)==mtg::Reject::None;
+        if(s.read){s.id=r.id;s.type=r.type;s.r0=r.r0;s.hp=r.hp;s.pos[0]=r.pos.x;s.pos[1]=r.pos.y;s.pos[2]=r.pos.z;}
+        g_swkw_push.Add(targets.items[i].pointer,s);
+    }
+    SwlLog("sword_lock duel winspin strike lease=%llu targets=%u close=%u need=%u owner_dropped=%u excluded_owner=%u scanned=%u radius=%u "
+        "held=%u tracked=%u link=%.0f,%.0f,%.0f tick=%lu",lease,targets.count,g_swkw_close,g_swkw_need,g_swkw_dropped,swk::kExcludeOwner?1U:0U,
+        scanned,g_cmb.great.radius,g_swkw.Holding()?1U:0U,g_swkw_push.count(),static_cast<double>(p.pos.x),static_cast<double>(p.pos.y),
+        static_cast<double>(p.pos.z),GetTickCount());
+}
+// SwordLifecycle, the spin's lease ended (lab_win only): its final counts.
+static void SwkWinSpinLeaseEnd(uint64_t token,const char* why,bool struck,unsigned published,unsigned applied,unsigned skipped){
+    g_swkw_lease=token;g_swkw_lease_over=true;g_swkw_lease_end=why;g_swkw_struck=g_swkw_struck||struck;
+    g_swkw_published=published;g_swkw_applied=applied;g_swkw_skipped=skipped;
+}
+// The after watch's ticks: the spin's live counts and each target as it stands (the world runs).
+static void SwkWinSpinWatch(){
+    const auto& a=g_sword_action;
+    if(a.lease&&a.request.lab_win&&a.struck){g_swkw_published=a.hits.Published();g_swkw_applied=a.hits.Applied();g_swkw_skipped=a.hits.Skipped();}
+    CmbMem m;
+    for(unsigned i=0;i<g_swkw_push.count();++i){
+        mtg::Raw r;swk::Seen s;s.read=mtg::ReadRaw(m,g_swkw_push.actor(i),r)==mtg::Reject::None&&(r.be_flag&0x201)==1;
+        if(s.read){s.id=r.id;s.type=r.type;s.r0=r.r0;s.hp=r.hp;s.pos[0]=r.pos.x;s.pos[1]=r.pos.y;s.pos[2]=r.pos.z;}
+        g_swkw_push.Observe(i,s);
+    }
+}
+// The after watch is over (right before the after line): hits = Ganados the spin published, pushed = those that reacted.
+static void SwkWinSpinEnd(){
+    if(!g_swkw_due)return;
+    g_swkw_due=false;
+    const bool running=g_sword_action.lease&&g_sword_action.request.lab_win;
+    SwlLog("sword_lock duel winspin end hits=%u pushed=%u excluded_owner=%u ok=%u why=%s targets=%u close=%u need=%u owner_dropped=%u applied=%u "
+        "skipped=%u gone=%u moved_max=%.0f lease_end=%s tick=%lu",g_swkw_published,g_swkw_push.pushed(),swk::kExcludeOwner?1U:0U,
+        g_swkw.started()?1U:0U,g_swkw_why,g_swkw_targets,g_swkw_close,g_swkw_need,g_swkw_dropped,g_swkw_applied,g_swkw_skipped,
+        g_swkw_push.gone(),g_swkw_push.moved_max(),g_swkw_lease_over?g_swkw_lease_end:running?"running":"-",GetTickCount());
+}
+// The probe's release frame (the decide). Flash (win, or the duel's own abandon): the Follow first, then H0's release as
+// it was (sample, exit blow 0x17 through 0x1AEEF0, freeze End, lease back); a win with SwordLockWinSpin keeps the world
+// held for its Great Spin instead (SwkWinSpinBegin). Push (lose, draw): the lease back now, the slide from the next free
+// frame with the world still frozen, the End once it is over.
+static void SwkDrawStun(const swl::World& w);   // candidate 3 (below)
+static void SwkRelease(mortal::dispatch::Runtime* run,const swl::World& w){
+    SwaEnd("release",w.now);   // H2b: the clip's last frame (its lease is handed back below)
+    SwsvMotionRestore("release");   // candidate 9: his parts and the chainsaw's back before the flash
+    SwcSwayRestore("release");   // H2c: the owner at his exact start before the flash and the freeze End
+    const swk::ExitPlan p=g_swk.Release(w.now);
+    if(const unsigned n=SwsSpark(sws::SparkOnRelease(g_swk.duel().result())))   // H3: the win's flash throws sparks too
+        SwlLog("sword_lock duel spark kind=win submitted=%u tick=%lu",n,GetTickCount());
+    if(p.kind!=swk::Release::Push){
+        if(SwkWinSpinBegin(run,w))return;   // a win: the flash fired, the world held for the Great Spin (the sword kept)
+        SwhEnd("release");   // candidate 5: the hand back before the lease is cancelled
+        SwkRearm();
+        SwlRelease(run,w);
+        SwkEnded(w,"flash");
+        return;
+    }
+    SwlSample(2000,w);
+    SwhEnd("release");   // candidate 5: the hand back before the lease is cancelled
+    SwkDrawStun(w);   // candidate 3: a draw knocks the owner down (SwordLockDrawStun)
+    const bool cancelled=SwlCancel(run);
+    // H2b: a lose whose clip carried Link through (sword_lock_anim.h CarryReplacesSlide) has no slide on top; travel= is
+    // measured from the carry's start. A carry cut short (no scenery check, a ledge, a failed write) keeps H1c's slide from
+    // where Link stands now (push_stop= the slide's, travel= from here).
+    if(g_swa_carried&&!swa::CarryReplacesSlide(g_swa_carry.summary())){
+        const swa::Summary& c=g_swa_carry.summary();
+        SwlLog("sword_lock anim slide_fallback stop=%s travelled=%.0f tick=%lu",swa::StopName(c.stop),
+            static_cast<double>(c.travelled),GetTickCount());
+        g_swa_carried=false;
+    }
+    g_swk_push=p;if(g_swa_carried)g_swk_push.distance=0;
+    g_swk_push_pending=g_swk_slide_hook&&!g_swa_carried;g_swk_push_started=false;
+    ImageMem im;if(!g_swa_carried)g_swk_push_from_ok=w.player&&im.Read(w.player+0x94,g_swk_push_from,sizeof(g_swk_push_from));
+    SwlLog("sword_lock duel release=push distance=%.0f frames=%.0f lease_cancel=%u slide_hook=%u carry=%u t_ms=%.1f tick=%lu",
+        static_cast<double>(g_swk_push.distance),static_cast<double>(p.frames),cancelled?1U:0U,g_swk_slide_hook?1U:0U,g_swa_carried?1U:0U,
+        g_swk.ElapsedMs(w.now),GetTickCount());
+}
+// Candidate 3 ([Combat] SwordLockDrawStun, missing = 1): a draw used to leave the Salvador's swing to resume on Link (3
+// instakills 1.4-10 s after his draws, life_down damage=9999 ret=0x1BDE62). At the push release of a draw, the native kick
+// record 0x14 on the owner (ocarina_song_effects.h Blow::Charge, his own knock-down: shorter than the win's flash stun),
+// for Dark Link too; re-identified first. g_swk_draw_stun names the shot for the end line ("-" when none).
+static void SwkDrawStun(const swl::World& w){
+    g_swk_draw_stun="-";
+    if(!g_swd_cfg.draw_stun||g_swk.duel().result()!=swk::sd::Result::Draw)return;
+    if(!SwlOwnerAlive(g_swl.owner(),true)){g_swk_draw_stun="owner_gone";return;}
+    ImageMem m;float pos[3]{};
+    if(!w.player||!m.Read(w.player+0x94,pos,sizeof(pos))){g_swk_draw_stun="no_link";return;}
+    g_swk_draw_stun=ose::ShotName(ose::Fire(m,g_swl_base,g_swl.owner(),ose::Blow::Charge,pos,[](const ose::dmg::PublishArgs& a){return SwlPublish(a);}));
+    SwlLog("sword_lock duel draw_stun blow=kick_0x14 shot=%s owner=0x%08X foe=%s tick=%lu",g_swk_draw_stun,g_swl.owner(),swdl::FoeName(g_swdl_foe),GetTickCount());
+}
+// The slide away from the owner (parry_pushback.h's Slide, advanced by the player's own MotionMove), started on the
+// first frame Link's routine is free again (a busy routine would stop it as damaged).
+static bool SwkSlideStart(const swl::World& w){
+    mtg::Raw r;ImageMem m;float link[3]{},ux=0,uz=0;
+    if(!SwlOwnerRaw(g_swl.owner(),r)||!m.Read(w.player+0x94,link,sizeof(link)))return false;
+    const float from[3]={r.pos.x,r.pos.y,r.pos.z};
+    if(!ppb::Direction(from,link,CmbGet<float>(w.player+0xA4),ux,uz))return false;
+    ppb::Config c;c.distance=g_swk_push.distance;c.frames=g_swk_push.frames;
+    return g_push.Start(c,w.player,ux,uz,CmbFrame());
+}
+static void SwkAfterLine(const swl::World& w){
+    const swk::AfterRecord& a=g_swk.after();
+    char kinds[64]="-";size_t at=0;   // kind:btn of each distinct native offer
+    for(unsigned i=0;i<a.kinds_n&&at+10<sizeof(kinds);++i)
+        at+=static_cast<size_t>(std::snprintf(kinds+at,sizeof(kinds)-at,"%s0x%02X:%u",i?",":"",unsigned(a.kinds[i]),unsigned(a.btns[i])));
+    SwlLog("sword_lock duel after ms=%.0f hits=%u life_down=%u hp_drop=%d grab=%u shake=%u offers=%u kick=%u action=%u kinds=%s keys_held=0x%08X "
+        "mask_off=%u stop_restored=%u freeze=%s arm=%s result=%s tick=%lu",a.ms,a.hits,a.life_down,a.hp_drop,a.grab,a.shake,a.offers,a.kick,a.action,
+        kinds,g_swk.mask().held(),g_swk.MaskActive()?0U:1U,SwkRestored()?1U:0U,SwlFreezeName(g_swl_freeze_result),SwkArm(w),SwkResult(),GetTickCount());
+}
+// Every probe tick (and, once the probe's watch is over, every tick of the slide or of the after watch).
+static void SwkFrame(mortal::dispatch::Runtime* run,const swl::World& w){
+    if(g_swkw.Holding()){SwkWinSpinFrame(run,w);return;}   // a win's Great Spin, the world still ours (the probe has released)
+    SwkWinSpinOwnerMove(w);   // the owner's first move once the world went on after a win spin (nothing otherwise)
+    if(g_swk.stage()!=swk::Stage::Duel)SwdlVoiceTick(w,false);   // Dark Link: a result voice still due (nothing otherwise)
+    if((g_swk.stage()==swk::Stage::Duel||g_swk.stage()==swk::Stage::Waiting)&&!g_swl.Holding()){
+        SwkRearm();g_swk.Abandon("probe");SwkEnded(w,"abandon");return;   // the world is no longer held: never a mask without a duel
+    }
+    switch(g_swk.stage()){
+    case swk::Stage::Off:
+        if(g_swl.Holding())g_swl.RequestRelease();   // a hold the duel never opened: H0's release on the next decide
+        return;
+    case swk::Stage::Duel:{
+        CmbMem m;   // read only, never written: 0x806F39, the MENUS set, a sub-screen request
+        const bool paused=swk::Paused(swk::ReadContext(m,g_swk_base));
+        const uint32_t ev=g_swk.Tick(w.now,paused);
+        const swk::sd::Duel& d=g_swk.duel();
+        g_swd_offers.Events(ev,d.last_break(),d.game_ms());   // H1d: the per-press gap and the break's feedback
+        if(g_sws_cfg.sound&&g_sws.on()){   // H3: the loops by the band, HIT_SWORD on a miss, WIN/LOSE once
+            sws::Facts sf;sf.running=d.Running();sf.paused=paused;sf.band=d.band();sf.ev=ev;sf.result=d.result();sf.game_ms=d.game_ms();
+            g_sws.Tick(sf);SwsPublish();
+        }
+        SwcSwayTick(w,d.Running());   // H2c: the owner's sway by PA (back to his start once the duel is over)
+        SwsvMotionTick(w,d.Running());   // candidate 9: his parts carry the sway and the struggle; the chainsaw buzzes
+        if(g_swsv.on()){   // candidate 9: the engine, the loud clash, his grunts (against the Salvador only)
+            swsv::SoundFacts vf;vf.running=d.Running();vf.paused=paused;vf.band=d.band();vf.ev=ev;vf.result=d.result();vf.game_ms=d.game_ms();
+            g_swsv.Tick(vf);SwsvPublish();
+        }
+        SwdlVoiceTick(w,paused);      // Dark Link: his strain by the band, his win / lose voice once (nothing against the Salvador)
+        if(const unsigned n=SwsSpark(sws::SparkOnTick(ev)))   // H3: a hit break's sparks on the blades
+            SwlLog("sword_lock duel spark kind=hit submitted=%u game_ms=%.1f tick=%lu",n,d.game_ms(),GetTickCount());
+        const double t_ms=g_swk.ElapsedMs(w.now);
+        const swk::sd::Input& in=g_swk.last_input();
+        if(ev&&g_swk_cfg.log&&in.pressed)SwlLog("sword_lock duel input press=0x%X held=0x%X ev=0x%X flanks=%u phase=%s paused=%u t_ms=%.1f duel_ms=%.1f tick=%lu",
+            unsigned(in.pressed),unsigned(in.held),ev,d.flanks(),swk::sd::PhaseName(d.phase()),in.paused?1U:0U,t_ms,d.duel_ms(),GetTickCount());
+        if(ev&swk::sd::kEvRound)   // candidate 10: the Finish did not win in time, another round (the last ones sudden death)
+            SwlLog("sword_lock duel overtime round=%u sudden_death=%u pv=%.3f pa=%.2f hits=%u misses=%u decay_x=%.2f game_ms=%.1f tick=%lu",d.rounds(),
+                d.rounds()>=swk::sd::kSuddenDeathRound?1U:0U,d.pv(),d.pa(),d.hits(),d.misses(),1.0+swk::sd::kOvertimeFatigue*d.rounds(),d.game_ms(),
+                GetTickCount());
+        if(ev&(swk::sd::kEvHit|swk::sd::kEvMiss)){
+            const swk::sd::BreakRecord& b=d.last_break();
+            SwlLog("sword_lock duel break ok=%u why=%s got=0x%X ms=%.1f hits=%u misses=%u pv=%.3f pa=%.2f ceil=%.2f t_ms=%.1f tick=%lu",b.ok?1U:0U,
+                swk::sd::MissName(b.why),unsigned(b.got),b.ms,d.hits(),d.misses(),d.pv(),d.pa(),d.ceiling(),t_ms,GetTickCount());
+            if(b.from_warning)SwlLog("sword_lock duel hold from_warning=1 ok=%u got=0x%X (pressed in the warning, held into the window: cand6) tick=%lu",
+                b.ok?1U:0U,unsigned(b.got),GetTickCount());
+            const swk::sd::Tuning& tu=d.setup().tuning;   // cand2: the timing check and the leftover keys of that break
+            if(b.needle>=0||b.ignored)SwlLog("sword_lock duel timing needle=%.3f zone=%.2f..%.2f great_to=%.2f great=%u ignored=0x%X window_ms=%.0f warn_ms=%.0f tick=%lu",
+                b.needle,tu.zone0,tu.zone1,tu.zone0+tu.great,b.great?1U:0U,unsigned(b.ignored),d.window_ms(),tu.warn_ms,GetTickCount());
+        }
+        if(g_swk.StepChanged()){
+            const swk::sd::Prompt p=d.prompt();const uint16_t held=in.held;
+            const swk::Offer h=swd::OfferFor(p,held),o=swi::NativeOffer(h,SwiIcon(h));   // btn 0 with our icon (H1d: every step)
+            SwlLog("sword_lock duel step phase=%s want=%s warning=%u glyph=%s btn=%u kind=0x%02X t_ms=%.1f duel_ms=%.1f pv=%.3f pa=%.2f ceil=%.2f "
+                "remaining_ms=%.0f sel=%d qte=%u stop=0x%08X tick=%lu",swk::sd::PhaseName(p.phase),swd::Want(p,held),p.warning?1U:0U,swk::sd::GlyphName(p.glyph),
+                unsigned(o.btn),unsigned(o.kind),t_ms,d.duel_ms(),d.pv(),d.pa(),d.ceiling(),p.remaining_ms,SwkSelector(),
+                unsigned(CmbGet<uint8_t>(g_swk_base+swg::rva::kQteFlag)),w.stop,GetTickCount());
+        }
+        if(g_swk.BarDue())SwlLog("sword_lock duel bar pv=%.3f pa=%.2f ceil=%.2f phase=%s duel_ms=%.1f t_ms=%.1f tick=%lu",d.pv(),d.pa(),d.ceiling(),
+            swk::sd::PhaseName(d.phase()),d.duel_ms(),t_ms,GetTickCount());
+        if(ev&swk::sd::kEvWindow)SwkReaders("window",t_ms);
+        if(!g_swk_readers_mid&&d.duel_ms()>=500){g_swk_readers_mid=true;SwkReaders("mid",t_ms);}
+        SwaDuelTick(run,w);   // H2b: the band clip on the decide (1000 ms lock)
+        if(g_swk.WantsRelease()){
+            SwaOver(run,w);   // H2b: a win or lose clip on our lease holds the release until its ask tick
+            if(!SwaHoldsRelease(w)&&!SwcHoldsRelease(w))g_swl.RequestRelease();   // H2c: the sway back first (0.2 s at most)
+            SwlLog("sword_lock duel over result=%s stop=%s reason=%s duel_ms=%.1f pa=%.2f hits=%u release=%s t_ms=%.1f rounds=%u game_ms=%.1f "
+                "shout=%s tick=%lu",SwkResult(),swk::sd::StopName(d.stop()),g_swk.reason(),d.duel_ms(),d.pa(),d.hits(),
+                swk::ReleaseName(g_swk.plan().kind),t_ms,d.rounds(),d.game_ms(),
+                d.result()==swk::sd::Result::Win?(d.game_ms()>=sws::kLongDuelMs?"big":"normal"):"-",GetTickCount());   // candidate 10
+        }
+        SwiFrame(paused,ev,t_ms);   // the duel's icons after its tick (hidden in a pause, gone once it is over)
+        return;
+    }
+    case swk::Stage::Waiting:
+        SwiReset(g_swk.abandoned()?"abandon":"end");   // Abort (the lease never started) ends the duel with no tick: the units back now
+        SwaWaiting(run,w);   // H2b: the win or lose clip on this decide when the duel ended on a core frame
+        SwcSwayTick(w,false);   // H2c: the sway eases back during the release wait
+        SwsvMotionTick(w,false);   // candidate 9: the struggle eases out with it
+        // the lease-never path (Abort set the stage here) and a win/lose clip whose ask tick came
+        if(g_swl.Holding()&&!g_swl.release_requested()&&!SwaHoldsRelease(w)&&!SwcHoldsRelease(w))g_swl.RequestRelease();
+        return;
+    case swk::Stage::Sliding:
+        if(g_swk_push_pending&&(w.link_routine&0xFF)==0){
+            g_swk_push_pending=false;
+            const bool started=SwkSlideStart(w);g_swk_push_started=started;
+            SwlLog("sword_lock duel push start=%u routine=0x%08X t_ms=%.1f tick=%lu",started?1U:0U,w.link_routine,g_swk.ElapsedMs(w.now),GetTickCount());
+        }
+        if(g_swk.SlideTick(g_swk_push_pending||(g_swk_push_started&&g_push.Active()),w.now)){
+            SwkRearm();
+            SwlFreezeEnd(w);
+            SwkEnded(w,"push");
+        }
+        return;
+    case swk::Stage::After:{
+        if(!g_swk_readers_after&&(g_swk.mask().held()&swk::bits::kKnife)){   // the knife still held after the End: never a parry
+            g_swk_readers_after=true;SwkReaders("after",g_swk.ElapsedMs(w.now),g_swk.mask().held());
+        }
+        swk::AfterFacts f;f.readable=w.readable;f.link_hp=w.link_hp;f.link_r0=static_cast<uint8_t>(w.link_routine&0xFF);f.hits=g_swk_hits;g_swk_hits=0;
+        if(g_swkw_due)SwkWinSpinWatch();   // a win's Great Spin: its targets as they react (nothing without one)
+        if(g_swk.AfterTick(w.now,f)){SwkWinSpinEnd();SwkAfterLine(w);}
+        return;
+    }
+    default:return;
+    }
+}
+// A same-frame abandon of the probe (H0's SwlAbandon already fired when the world goes on, ended the freeze and handed
+// Link back): the same swing's Follow armed again whenever the world goes on (with or without the exit blow: a QTE, a
+// cutscene or a lost freeze has none), then the end lines.
+static void SwkAbandoned(const swl::World& w,swl::Abandon why){
+    SwhEnd(swl::AbandonName(why));   // candidate 5: the hand back on every abandon (death, cutscene, load, owner gone...)
+    if(swk::RearmOnAbandon(why))SwkRearm();
+    g_swk.Abandon(swl::AbandonName(why));
+    SwkEnded(w,"abandon");
+}
+// After every PadRead (case_key_debounce's first slot): the real words to the duel, then what the game must see. Nothing
+// read or written outside a duel and its release wait.
+static void SwordLockPad(){
+    if(!g_swk_on.load(std::memory_order_acquire)||!g_swk.MaskActive())return;
+    namespace ck=link_runtime::case_key_debounce;
+    CmbMem m;uint32_t on=0,trg=0;
+    if(!m.Read(g_swk_base+ck::rva::kKeyOn,&on,4)||!m.Read(g_swk_base+ck::rva::kKeyTrg,&trg,4))return;
+    // The MENUS binding set (a pause or a menu opened mid-duel): its Enter/Esc/arrows pass and feed nothing to the duel.
+    const swk::PadOut o=g_swk.Pad(on,trg,swk::ReadContext(m,g_swk_base));
+    if(o.write){m.Write(g_swk_base+ck::rva::kKeyOn,&o.on,4);m.Write(g_swk_base+ck::rva::kKeyTrg,&o.trg,4);}
+    if(g_swi_painter.visible()&&swk::Paused(swk::ReadContext(m,g_swk_base)))SwiPause();   // the icon hides in a pause (no player frame there)
+    if(o.released)SwlLog("sword_lock duel mask off held=0x00000000 at=release real_on=0x%08X frame=%u tick=%lu",on,CmbFrame(),GetTickCount());
+}
+// The arbiter entry (after the Mortal Draw prompt and the H1a census, which keep priority): the duel's one native offer
+// (func NULL, slot 0, ENFORCE_EXEC), only with the native queue empty; in the after watch, the native offers queued.
+static void SwordLockDuelEntry(void* self,bool md_offered){
+    g_swk_own=false;
+    if(!g_swk_on.load(std::memory_order_acquire))return;
+    CmbMem m;
+    const uint32_t manager=g_swk_base+mctx::layout::action_manager_rva;
+    if(g_swk.stage()==swk::Stage::After){   // the E KICK after a win, a grab's SHAKE OFF
+        uint8_t count=0,kinds[8]{},btns[8]{};unsigned n=0;
+        if(!m.Read(manager+mctx::layout::offers,&count,1)||!count)return;
+        for(unsigned i=0;i<count&&i<8;++i){
+            const uint32_t work=manager+mdp::layout::works+i*mdp::layout::work_size;
+            if(m.Read(work+mdp::layout::w_kind,&kinds[n],1)&&m.Read(work+mdp::layout::w_btn,&btns[n],1))++n;
+        }
+        g_swk.SeenOffers(kinds,btns,n);
+        return;
+    }
+    // SPF_ACTBTN counts as ours only while our offer keeps being queued (a one-frame gap allowed) and no native offer,
+    // lock or disabled actions are there: otherwise it is a native QTE again, and the probe abandons on it.
+    ++g_swk_entries;
+    if(g_swk_actbtn_own){
+        mdp::EntryFacts f;
+        if(g_swk_entries-g_swk_own_entry>2||!mdp::ReadEntry(m,g_swk_base,f)||f.offers||f.lock||f.actions_disabled)g_swk_actbtn_own=false;
+    }
+    if(g_swk.stage()!=swk::Stage::Duel)return;
+    const uint32_t stop=SwkStop();
+    if(!(stop&swl::native::kSpfActBtn))g_swk_actbtn_own=false;
+    // H1d: one offer per step (sword_lock_draw.h Offers); our icon: btn 0 and no gap; the native btn without it.
+    const swk::sd::Duel& duel=g_swk.duel();
+    const swk::Offer o=SwiOffer(g_swd_offers.Next(duel.prompt(),g_swk.last_input().held,duel.Running(),duel.game_ms()));
+    if(o.gap)return;   // one frame without the offer after a counted press: the next one rebuilds the native icon
+    if(!swk::SameOffer(o,g_swk_offer)){g_swk_offer=o;g_swk_offer_shown=false;g_swk_offer_frames=0;}
+    if(!o.show)return;
+    if(!g_swk_offer_hook){++g_swk_unread;return;}
+    if(g_swg_injected||md_offered){++g_swk_md;return;}   // the census and the Mortal Draw prompt keep priority
+    mdp::EntryFacts e;
+    if(!mdp::ReadEntry(m,g_swk_base,e)){++g_swk_unread;return;}
+    if(e.offers||e.lock||e.actions_disabled){++g_swk_native;return;}   // native offers always win
+    if(reinterpret_cast<uint32_t>(self)!=manager){++g_swk_set_failed;return;}
+    g_swk_entry_stop=stop;g_swk_entry_qte=CmbGet<uint8_t>(g_swk_base+swg::rva::kQteFlag);
+    mdp::OfferArgs a;a.kind=o.kind;a.btn=o.btn;a.flags=o.flags;
+    if(!CmbPromptSet(self,a)){++g_swk_set_failed;return;}
+    g_swk_own=true;++g_swk_offers;++g_swk_offer_frames;g_swk_own_entry=g_swk_entries;
+}
+// After the arbiter: was ours drawn (+0x42 and the cockpit btn/kind disp wrote), and did it raise the QTE byte or SPF_ACTBTN.
+static void SwordLockDuelExit(){
+    if(!g_swk_own)return;
+    const uint8_t active=CmbGet<uint8_t>(g_swk_base+swg::rva::kManager+swg::rva::kManagerActive);
+    const uint8_t btn=CmbGet<uint8_t>(g_swk_base+swg::rva::kCockpit),kind=CmbGet<uint8_t>(g_swk_base+swg::rva::kCockpitKind);
+    const uint8_t qte=CmbGet<uint8_t>(g_swk_base+swg::rva::kQteFlag);
+    const uint32_t stop=SwkStop();const int32_t sel=SwkSelector();
+    const bool shown=active==1&&kind==g_swk_offer.kind&&btn==swg::Remap(g_swk_offer.btn,sel);
+    if(shown)++g_swk_shown;
+    if(qte&&!g_swk_entry_qte)++g_swk_qte_raised;
+    if((stop&swl::native::kSpfActBtn)&&!(g_swk_entry_stop&swl::native::kSpfActBtn)){
+        g_swk_actbtn_own=true;++g_swk_actbtn;
+        if(!g_swk_actbtn_logged){g_swk_actbtn_logged=true;SwlLog("sword_lock duel actbtn origin=own kind=0x%02X stop=0x%08X tick=%lu",unsigned(g_swk_offer.kind),stop,GetTickCount());}
+    }
+    const swk::sd::Duel& d=g_swk.duel();
+    if((shown&&!g_swk_offer_shown)||(!shown&&!g_swk_offer_shown&&g_swk_offer_frames==30)){
+        g_swk_offer_shown=shown;
+        SwlLog("sword_lock duel offer shown=%u kind=0x%02X btn=%u flags=0x%X glyph=%s feedback=%u phase=%s frames=%u active=%u cockpit_btn=0x%02X "
+            "cockpit_kind=0x%02X qte=%u stop=0x%08X sel=%d duel_ms=%.1f tick=%lu",shown?1U:0U,unsigned(g_swk_offer.kind),unsigned(g_swk_offer.btn),
+            g_swk_offer.flags,swk::sd::GlyphName(g_swk_offer.glyph),g_swk_offer.feedback?1U:0U,swk::sd::PhaseName(d.phase()),g_swk_offer_frames,
+            unsigned(active),unsigned(btn),unsigned(kind),unsigned(qte),stop,sel,d.duel_ms(),GetTickCount());
+    }
+}
+// Worker, after StartSwordLock and the census. Logs nothing with the keys 0 (the 3.5.0 log).
+static void StartSwordLockDuel(unsigned char* base,const wchar_t* directory){
+    if(!g_swk_cfg.On())return;
+    namespace ck=link_runtime::case_key_debounce;
+    const uint32_t b=reinterpret_cast<uint32_t>(base);
+    const char* why=!g_swl_on.load(std::memory_order_acquire)?"probe":!ck::g_original||ck::g_base!=b?"pad_hook":nullptr;
+    if(why){
+        Log("sword_lock duel ready=0 reason=%s (probe: needs ParryGeneralBlock=1 and the player dispatch; pad_hook: the PadRead pins); "
+            "the parry stays as in 3.5.0",why);
+        // Never leave the H0 machine waiting for a release nobody asks for.
+        if(g_swl_on.load(std::memory_order_acquire)){
+            if(g_swl_probe_key.enabled)g_swl.Configure(g_swl_probe_key);else g_swl_on.store(false,std::memory_order_release);
+        }
+        return;
+    }
+    g_swk_base=b;
+    g_swk_offer_hook=g_cmb_arbiter_original&&PinsAt(b,link_runtime::native_pins::kMortalDrawPrompt);
+    g_swk_slide_hook=g_cmb_move_original!=nullptr;
+    SwaLoad(directory);   // H2b: the five clips (Bin32\sword_lock_lab or Bin32) before the duel goes live, or H1c's hold
+    {   // H3: TP's lock sounds from Bin32\sword_lock_lab\ (SHA-pinned); a missing or changed file mutes that sound only
+        unsigned loops=0,shots=0;
+        if(g_sws_cfg.sound&&directory){
+            wchar_t path[MAX_PATH]{};
+            for(unsigned i=0;i<sws::kLoopCount;++i)
+                if(link_runtime::paths::Format(path,L"%ls" SWL_DIR L"%ls",directory,sws::LoopPath(i))>0&&g_sws_loop[i].Load(path,100,sws::LoopSha(i)))++loops;
+            for(unsigned i=0;i<sws::kShotCount;++i)
+                if(link_runtime::paths::Format(path,L"%ls" SWL_DIR L"%ls",directory,sws::ShotPath(i))>0&&g_sws_shot[i].Load(path,100,sws::ShotSha(i)))++shots;
+            g_sws_ready.store(loops+shots>0,std::memory_order_release);
+        }
+        unsigned dl_loops=0,dl_shots=0;   // Dark Link's voices (Ganondorf's V_TUBAZERI), the same folder and rules
+        if(g_sws_cfg.sound&&(g_swdl_cfg.on||g_swsv_cfg.sound)&&directory){   // cand11: the Salvador uses these voices too
+            wchar_t path[MAX_PATH]{};
+            for(unsigned i=0;i<swdl::kLoopCount;++i)
+                if(link_runtime::paths::Format(path,L"%ls" SWL_DIR L"%ls",directory,swdl::LoopPath(i))>0&&g_swdl_loop[i].Load(path,100,swdl::LoopSha(i)))++dl_loops;
+            for(unsigned i=0;i<swdl::kShotCount;++i)
+                if(link_runtime::paths::Format(path,L"%ls" SWL_DIR L"%ls",directory,swdl::ShotPath(i))>0&&g_swdl_shot[i].Load(path,100,swdl::ShotSha(i)))++dl_shots;
+            g_swdl_ready.store(dl_loops+dl_shots>0,std::memory_order_release);
+        }
+        unsigned sv_loops=0,sv_shots=0;   // candidate 9: the Salvador's engine, clash and grunts, the same folder and rules
+        if(g_sws_cfg.sound&&g_swsv_cfg.sound&&directory){
+            wchar_t path[MAX_PATH]{};
+            for(unsigned i=0;i<swsv::kLoopCount;++i)
+                if(link_runtime::paths::Format(path,L"%ls" SWL_DIR L"%ls",directory,swsv::LoopPath(i))>0&&g_swsv_loop[i].Load(path,100,swsv::LoopSha(i)))++sv_loops;
+            for(unsigned i=0;i<swsv::kShotCount;++i)
+                if(link_runtime::paths::Format(path,L"%ls" SWL_DIR L"%ls",directory,swsv::ShotPath(i))>0&&g_swsv_shot[i].Load(path,100,swsv::ShotSha(i)))++sv_shots;
+            g_swsv_ready.store(sv_loops+sv_shots>0,std::memory_order_release);
+        }
+        Log("sword_lock duel salvador ready=1 motion=%u sound=%u loops=%u/%u shots=%u/%u weapon=+0x%X parts<=%u shudder=%.0f/%.0f jolt=%.0f surge=%.0f buzz=%.0f",
+            g_swsv_cfg.motion?1U:0U,g_swsv_ready.load()?1U:0U,sv_loops,unsigned(swsv::kLoopCount),sv_shots,unsigned(swsv::kShotCount),swsv::kWeaponPtr,
+            swsv::kMaxParts,static_cast<double>(swsv::kShudderSideMm),static_cast<double>(swsv::kShudderUpMm),static_cast<double>(swsv::kJoltBackMm),
+            static_cast<double>(swsv::kSurgeMm),static_cast<double>(swsv::kBuzzMm));
+        Log("sword_lock duel gate ready=1 difficulty=mode(pG+0x%X: 1/3 easy, 5 normal, 6 pro, else normal) rank=logged_only owners=salvador(0x%02X)%s "
+            "pad=%s",swgt::kModeOffset,unsigned(swgt::kSalvadorId),g_swdl_cfg.on?",dark_link":"",g_swgt_cfg.pad?"open(SwordLockPad=1)":"closed(why=device)");
+        Log("sword_lock duel darklink ready=%u producer=0x%X owner=em39(vtable 0x%X id 0x%02X) kicks=refused voices=%u loops=%u/%u shots=%u/%u "
+            "exit=flash_then_kick win_cut_mm=%.0f",g_swdl_cfg.on?1U:0U,swdl::kProducerRet,swdl::kVtableRva,unsigned(swdl::kId),
+            g_swdl_ready.load()?1U:0U,dl_loops,unsigned(swdl::kLoopCount),dl_shots,unsigned(swdl::kShotCount),swdl::WinCutMm(swdl::Foe::DarkLink,g_swa_cfg.win_cut_mm));
+        Log("sword_lock sound ready=%u sound=%u sparks=%u loops=%u/%u shots=%u/%u dir=" SWL_DIR_NAME " push=none(TP's TUBAZERI_PUSH has no note) "
+            "contact_gap_ms=%.0f spark=native_parry(0x1F/0x20)",g_sws_ready.load()?1U:0U,g_sws_cfg.sound?1U:0U,g_sws_cfg.sparks?1U:0U,loops,
+            unsigned(sws::kLoopCount),shots,unsigned(sws::kShotCount),sws::kContactGapMs);
+    }
+    // The duel's icons (sword_lock_icons.h): the IdSys calls of the staff and the key chain, all pinned, or H1c's offers.
+    const bool staff_pins=PinsAt(b,link_runtime::native_pins::kOcarinaStaff),icon_pins=PinsAt(b,swi::kPins);
+    g_swi_ready=staff_pins&&icon_pins;
+    g_swk_on.store(true,std::memory_order_release);
+    ck::g_after[ck::kAfterDuel]=&SwordLockPad;
+    Log("sword_lock icon ready=%u class=0x%02X units=%d tex=0x%02X/0x%02X/0x%02X/0x%02X pos=%.0f,%.0f scale=%.1fx%.1f keys=0x%X/0x%X break=icon "
+        "fallback=h1c pins=%u staff_pins=%u",g_swi_ready?1U:0U,unsigned(swi::layout::id_class),swi::kUnits,unsigned(swi::kTexKeys),unsigned(swi::kTexGlow),
+        unsigned(swi::kTexDisc),unsigned(swi::kTexArrow),static_cast<double>(swi::Geometry{}.x),static_cast<double>(swi::Geometry{}.y),swi::kScaleW,
+        swi::kScaleH,static_cast<uint32_t>(swi::kLogicalKnife),static_cast<uint32_t>(swi::kLogicalAction),icon_pins?1U:0U,staff_pins?1U:0U);
+    Log("sword_lock duel ready=1 " SWL_LAB_TAG " tuning=lab breaks=1 min_hits=1 ceiling0=0.70 gain=%.2f seq=m20-t45-m20 cap_ms=%.0f cooldown_ms=%.0f crowd_mm=%.0f "
+        "weapon_mm=%.0f log=%u ignored=%u debounce=%u offers=%s census=%u slide=%s kinds=0x%02X/0x%02X btns=%u/%u flags=0x%X keep=0x%08X "
+        "menus=pass difficulty=pG+0x4F98 mode=pG+0x847C",g_swk_gain,g_swk_cfg.duel.cap_ms>0?g_swk_cfg.duel.cap_ms:swk::sd::kCapMs,g_swk_cfg.cooldown_ms,g_swk_cfg.crowd_mm,
+        swk::kWeaponMm,g_swk_cfg.log?1U:0U,g_swk_cfg.ignored,ck::g_debounce?1U:0U,g_swk_offer_hook?"arbiter":"none(no_arbiter_hook_or_pins)",
+        g_swg_on.load(std::memory_order_acquire)?1U:0U,g_swk_slide_hook?"motion_move":"none(no_motion_move_hook)",unsigned(swk::kKindPush),
+        unsigned(swk::kKindBreak),unsigned(swk::kBtnPush),unsigned(swk::kBtnBreak),swk::kOfferFlags,swk::bits::kKeep);
+    // H1d: SwordLockPool/WindowScale/Hold/Seed apply to the drawn duel (the H1c fallback above ignores them; SwordLockMix
+    // stays unread). The ready line above keeps H1c's numbers: they are the fallback's (a pad, a bag under 3 keys).
+    Log("sword_lock duel draw ready=1 " SWL_LAB_TAG " bag=keyboard breaks_bag=0x%02X mashes_bag=0x%02X user_pool=0x%02X window_scale=%.2f hold=%u "
+        "hold_pps=%.0f seed=%u gain=%.2f min_keys=%u tuning=real pad=h1c icons=%u set_h1d_keys=%u",unsigned(swd::kKeyboardBreaks),
+        unsigned(swd::kKeyboardMashes),unsigned(g_swd_cfg.duel.pool),g_swd_cfg.duel.window_scale,g_swd_cfg.duel.hold?1U:0U,g_swd_cfg.hold_pps,
+        g_swd_cfg.duel.seed,g_swd_cfg.mash_gain,swk::sd::kMinPhysicalKeys,g_swi_ready?1U:0U,g_swk_cfg.ignored);
+    {   // candidate 2: the readable rhythm and the timing check (sword_lock_draw.h Cand2Tuning)
+        const swd::Zone z=swd::ZoneFor(swk::sd::Difficulty::Normal);
+        Log("sword_lock duel cand3 ready=1 held_over=released_once lateral=chord guard_dirs=ignored guard_bag=%u draw_stun=%s "
+            "texts=sword-lock-texts-03(HOLD AIM 0x4C, WAIT 0x4D)",g_swd_cfg.guard?1U:0U,g_swd_cfg.draw_stun?"kick_0x14":"off");
+        Log("sword_lock duel cand4 ready=1 lateral_bag=%u (SwordLockLateral, missing = 0) track=red_bar+bright_zone+great_glow+needle "
+            "texts=sword-lock-texts-04(MASH! ALTERNATE, no SIDE+TAP)",g_swd_cfg.lateral?1U:0U);
+        Log("sword_lock duel cand5 ready=%u sword_in_hand=duel(knife=Body+0x2C bit8 gun=cObjWep level0, lock..release) %s prompt_scale=%.2f "
+            "lift=%.1f track_h=%.0f zone_h=%.0f needle=%.0f (SwordLockPromptScale)",g_sword_hand_ok?1U:0U,
+            g_sword_hand_ok?"":"(off: SwordInHand=0 or its native pins)",static_cast<double>(g_swd_cfg.prompt_scale),
+            static_cast<double>(swi::PromptLift(g_swd_cfg.prompt_scale)),static_cast<double>(swi::kTrackH),static_cast<double>(swi::kZoneH),
+            static_cast<double>(swi::kNeedleSize));
+        Log("sword_lock duel cand5 swing ends=%u gain=%.2f (SwordLockSwingEnds, SwordLockSwingGain) icon=pair(A+D) texts=sword-lock-texts-05(A+D MASH!)",
+            g_swd_cfg.swing_ends?1U:0U,g_swd_cfg.swing_gain);
+        Log("sword_lock duel cand2 ready=1 rhythm=%u warn_ms=%.0f push_ms=%.0f/%.0f(pro %.0f) cap_ms=%.0f leftovers=free timing=%u "
+            "normal_zone=%.2f..%.2f great=%.2f great_bonus=%.2f texts=sword-lock-texts-02(kinds 0x46..0x4B)",g_swd_cfg.rhythm?1U:0U,swd::kCand2WarnMs,
+            swd::kCand2Push1Ms,swd::kCand2Push2Ms,swd::kCand2ProPush2Ms,swd::kCand2CapMs,g_swd_cfg.timing?1U:0U,z.z0,z.z1,z.great,swd::kGreatBonus);
+    }
+    g_swk_force.Configure(g_swk_force_cfg,g_swk_cfg.cooldown_ms);
+#if LINK_SWORD_LOCK_LAB
+    if(g_swk_force_cfg.on)Log("sword_lock duel force ready=1 lab=1 force_mm=%.0f max_dy_mm=%.0f cooldown_ms=%.0f retry_ms=%.0f owner=em10:0x15:wep4 "
+        "front=parryable frame=player_core no_swing=waived",g_swk_force_cfg.mm,swk::kForceMaxDyMm,g_swk_force.cooldown_ms(),swk::kForceRetryMs);
+#endif
+    // A win's Great Spin (sword_lock_winspin.h): the normal spin's route, so SpinAttack=1 (clip, lease, adapter) and
+    // MortalDrawLineWaiver=1 (its target scan) are required, never turned on for the lab alone; GreatSpin=0 is fine.
+    swk::WinSpinPrereq q;q.spin_attack=g_cmb.spin_attack;q.clip=g_sword_spin_clip.ready;q.line_waiver=g_cmb.line_waiver;q.adapter=g_cmb_adapter_on;
+    g_swkw_ready=swk::Readiness(g_swkw_cfg,q);
+    Log("sword_lock duel winspin ready=%u why=%s spin_attack=%u clip=%u line_waiver=%u adapter=%u great_spin=%u sound=%u radius=%u permille=%u "
+        "sparkles=%u bullets=%u excluded_owner=%u crowd_mm=%.0f start_max_ms=%.0f hold_max_ms=%.0f%s",g_swkw_ready==swk::WinSpinReady::Ready?1U:0U,
+        swk::WinSpinReadyName(g_swkw_ready),q.spin_attack?1U:0U,q.clip?1U:0U,q.line_waiver?1U:0U,q.adapter?1U:0U,g_cmb.GreatSpin()?1U:0U,
+        g_great_spin_sound.Loaded()?1U:0U,g_cmb.great.radius,g_cmb.great.permille,g_cmb.great.sparkles,g_cmb.bullets.on?1U:0U,
+        swk::kExcludeOwner?1U:0U,g_swk_cfg.crowd_mm,swk::kWinSpinStartMs,swk::kWinSpinHoldMs,
+        g_swkw_ready==swk::WinSpinReady::Ready||g_swkw_ready==swk::WinSpinReady::Off?"":
+        " (needs [LinkRuntime] SpinAttack=1 and MortalDrawLineWaiver=1 with the spin clip and the adapter: a win exits with the flash alone)");
+}
+#else
+// The public build: no lab duel. g_swk_on stays false, so none of these is reached beyond its first line.
+static void SwkQueued(const link_runtime::parry::general::Applied&){}
+static bool SwkGuarding(){return false;}
+static void SwkHit(){}
+static bool SwkNoSwing(){return true;}
+static bool SwkCrowd(const swl::World&){return true;}
+static void SwkRefusedCrowd(){}
+static void SwkStart(const swl::World&){}
+static void SwkFrame(mortal::dispatch::Runtime*,const swl::World&){}
+static void SwkRelease(mortal::dispatch::Runtime*,const swl::World&){}
+static void SwkAbandoned(const swl::World&,swl::Abandon){}
+static void SwordLockDuelEntry(void*,bool){g_swk_own=false;}
+static void SwordLockDuelExit(){}
+static void StartSwordLockDuel(unsigned char*){}
+#endif
 // Worker, after StartCombat (the meter reads ShieldGuard). player_frame was published before Observe; HudFrame stays
 // inert until g_hud_ready.
 static void StartHud(unsigned char* base,uint32_t player_slot,uint32_t global_slot,bool dispatch_up,const wchar_t* directory){
@@ -3785,7 +6460,7 @@ static void StartHud(unsigned char* base,uint32_t player_slot,uint32_t global_sl
     if(!block){Log("Hud disabled: link_hud_tp.eff missing or changed");return;}
     g_hud_painter.SetBlock(block);g_hud.Configure(g_hud_cfg);
     g_hud_on=true;g_hud_ready.store(true,std::memory_order_release);
-    link_runtime::case_key_debounce::g_after=&HudMenuFrame;   // inert without CaseKeyDebounce (no PadRead hook)
+    link_runtime::case_key_debounce::g_after[link_runtime::case_key_debounce::kAfterHud]=&HudMenuFrame;   // inert without the PadRead hook
     Log("Hud ready: hearts=%u meter=%u hide_native=%u disc=%u heart_life=%u class=0x%02X tex=0x%02X owner=0x%X core_frame=%u shield_guard=%u",
         g_hud_cfg.hearts?1U:0U,g_hud_cfg.meter?1U:0U,g_hud_cfg.hide_native?1U:0U,g_hud_cfg.hide_disc?1U:0U,g_hud_cfg.heart_life,
         htp::layout::id_class,htp::layout::tex_id,htp::layout::tex_owner,mortal::dispatch_hooks::player_frame?1U:0U,g_sg_on?1U:0U);
@@ -3817,6 +6492,7 @@ static void __cdecl CombinedDecide(mortal::dispatch::Runtime& run,void* player){
     zlr::Frame();   // Zelda's light ray: shares the freshly applied particle switch and gain
     link_runtime::sword_trail::probe::runtime::Frame();   // Task 3b probe: no-op unless SwordTrailProbe=1 started it
     if(g_oca_on.load(std::memory_order_acquire))OcarinaDecide(run,player);
+    if(g_swl_on.load(std::memory_order_acquire))SwordLockDecide(run,player);   // H0 probe ([Combat] SwordLockProbe=1 only)
     if(g_oca_session.state()==oca::State::Idle&&!OcaOwnsLease()){
         SwordDecide(run,player);CombatDecide(run,player);
     }
@@ -4153,6 +6829,9 @@ static bool StartMortalTrial(unsigned char* base,unsigned size,const wchar_t* di
         run.decide=CombinedDecide;run.cleanup=MortalCleanup;run.restore=MortalRestore;
         run.lifecycle=ocarina_wanted?CombinedLifecycle:MortalLifecycle;run.lifecycle_context=nullptr;
         run.proceed=ocarina_wanted?OcaProceed:nullptr;run.observe=ocarina_wanted||ztarget_face?CombinedObserve:nullptr;run.enabled=true;
+        if(g_swl_wanted){   // H0 probe only: its lease's events and hold loop first, every other lease unchanged
+            g_swl_next_lifecycle=run.lifecycle;run.lifecycle=SwlLifecycle;g_swl_next_proceed=run.proceed;run.proceed=SwlProceed;
+        }
         if(ztarget_strafe&&link_runtime::ztarget::runtime::PrepareStrafe(reinterpret_cast<uint32_t>(base),[](uint32_t actor){
             auto& dispatch=mortal::dispatch_hooks::runtime;
             return mortal::dispatch_hooks::OwnedThread()&&dispatch.enabled&&!dispatch.busy&&!dispatch.current&&
@@ -4635,6 +7314,73 @@ static DWORD WINAPI Worker(LPVOID) {
         g_parry_window_ms=link_runtime::defense::ParryWindowMs(window_raw);
         if(g_parry_window_ms!=window_raw)Log("ParryWindowMs=%u invalid (100..1000); using %u",window_raw,g_parry_window_ms);
     }
+#if !LINK_SWORD_LOCK_GRADUATED   // the 3.6.0 DLL has no probe key: its engine runs only for the duel
+    {   // Master Sword Blade Lock H0 probe (sword_lock_probe.h): [Combat] SwordLockProbe / SwordLockProbeExit. Lab DLL only.
+        unsigned swl_problems=0;
+        g_swl_cfg=swl::ReadConfig([&](const wchar_t* key,wchar_t* out,size_t count){
+            GetPrivateProfileStringW(L"Combat",key,L"",out,static_cast<DWORD>(count),path);},swl_problems);
+        if(swl_problems)Log("sword_lock probe: invalid SwordLockProbe (0/1) or SwordLockProbeExit (flash/kick); probe off");
+        g_swl_wanted=g_swl_cfg.enabled&&g_gen.settings.mode==link_runtime::parry::general::Mode::Active;
+    }
+#endif
+#if LINK_SWORD_LOCK
+    {   // Master Sword Blade Lock H1c lab duel (sword_lock_lab.h): [Combat] SwordLock / SwordLockLab / SwordLockLog /
+        // SwordLockCapMs / SwordLockCooldownMs / SwordLockCrowdMm. Lab DLL only; with SwordLock=0 nothing is logged here.
+        unsigned swk_problems=0;
+        g_swk_cfg=swk::ReadConfig([&](const wchar_t* key,wchar_t* out,size_t count){
+            GetPrivateProfileStringW(L"Combat",key,L"",out,static_cast<DWORD>(count),path);},swk_problems);
+#if LINK_SWORD_LOCK_LAB
+        g_swk_force_cfg=swk::ReadForceConfig([&](const wchar_t* key,wchar_t* out,size_t count){   // SwordLockLabForce / ...Mm
+            GetPrivateProfileStringW(L"Combat",key,L"",out,static_cast<DWORD>(count),path);},swk_problems);
+#endif
+        // The lab's crowd default 1500 (sword_lock_winspin.h LabCrowdMm: missing or invalid; ReadConfig counted an invalid one).
+        g_swk_cfg.crowd_mm=swk::LabCrowdMm([&](const wchar_t* key,wchar_t* out,size_t count){
+            GetPrivateProfileStringW(L"Combat",key,L"",out,static_cast<DWORD>(count),path);});
+        g_swkw_cfg=swk::ReadWinSpinConfig([&](const wchar_t* key,wchar_t* out,size_t count){   // SwordLockWinSpin, missing = 1
+            GetPrivateProfileStringW(L"Combat",key,L"",out,static_cast<DWORD>(count),path);},swk_problems);
+        g_swk_gain=swk::ReadMashGain([&](const wchar_t* key,wchar_t* out,size_t count){   // SwordLockMashGain, missing = 0.15
+            GetPrivateProfileStringW(L"Combat",key,L"",out,static_cast<DWORD>(count),path);},swk_problems);
+        g_sws_cfg=sws::ReadConfig([&](const wchar_t* key,wchar_t* out,size_t count){   // H3: SwordLockSound / SwordLockSparks, missing = 1
+            GetPrivateProfileStringW(L"Combat",key,L"",out,static_cast<DWORD>(count),path);},swk_problems);
+        g_swc_cfg=swc::ReadConfig([&](const wchar_t* key,wchar_t* out,size_t count){   // H2c: SwordLockCamera / Bars / Sway, missing = 1
+            GetPrivateProfileStringW(L"Combat",key,L"",out,static_cast<DWORD>(count),path);},swk_problems);
+        g_swdl_cfg=swdl::ReadConfig([&](const wchar_t* key,wchar_t* out,size_t count){   // SwordLockDarkLink, missing = 1
+            GetPrivateProfileStringW(L"Combat",key,L"",out,static_cast<DWORD>(count),path);},swk_problems);
+        g_swsv_cfg=swsv::ReadConfig([&](const wchar_t* key,wchar_t* out,size_t count){   // candidate 9: SwordLockSalvadorMotion/Sound, missing = 1
+            GetPrivateProfileStringW(L"Combat",key,L"",out,static_cast<DWORD>(count),path);},swk_problems);
+        g_swgt_cfg=swgt::ReadConfig([&](const wchar_t* key,wchar_t* out,size_t count){   // candidate 1: SwordLockPad, missing = 0
+            GetPrivateProfileStringW(L"Combat",key,L"",out,static_cast<DWORD>(count),path);},swk_problems);
+        {   // H1d: the drawn duel's keys with their own parsers (their problems were counted above: not twice)
+            unsigned again=0;
+            g_swd_cfg=swd::ReadConfig([&](const wchar_t* key,wchar_t* out,size_t count){
+                GetPrivateProfileStringW(L"Combat",key,L"",out,static_cast<DWORD>(count),path);},again);
+        }
+        g_swa_cfg=swa::ReadClipsConfig([&](const wchar_t* key,wchar_t* out,size_t count){   // H2b: SwordLockClips / ClipHokan / WinCutMm
+            GetPrivateProfileStringW(L"Combat",key,L"",out,static_cast<DWORD>(count),path);},swk_problems);
+        if(swk_problems)Log("sword_lock duel: %u invalid [Combat] SwordLock* values (switches 0/1, SwordLockCooldownMs 0..120000, "
+                            "SwordLockCrowdMm 1000..20000 (default 1500), SwordLockCapMs 0 or 1000..20000, SwordLockLabForceMm 500..10000, "
+                            "SwordLockWinSpin 0/1, SwordLockMashGain 0.05..0.30 (default 0.15), SwordLockClips 0/1 (default 1), "
+                            "SwordLockClipHokan 0..30 (default 0), SwordLockWinCutMm 0 or 500..5000 (default 1740), SwordLockSound/Sparks/Camera/Bars/Sway "
+                            "0/1 (default 1), SwordLockDarkLink 0/1 (default 1), SwordLockPad 0/1 (default 0)); those stay off or at their "
+                            "defaults",swk_problems);
+        if(g_swk_cfg.On()){   // the H0 machine with the duel deciding the release (the probe's own keys give way)
+            if(g_swl_cfg.enabled)Log("sword_lock duel: SwordLockProbe=1 gives way to SwordLockLab=1 (the duel decides the release)");
+            g_swl_probe_key=g_swl_cfg;
+            g_swl_cfg.enabled=true;g_swl_cfg.exit=swl::Exit::Flash;g_swl_cfg.external_release=true;g_swl_cfg.cooldown_ms=g_swk_cfg.cooldown_ms;
+            g_swl_cfg.menu_abandons=false;   // a sub-screen request pauses the duel (1 s, then Abandoned), "Cableado" 9
+            g_swl_wanted=g_gen.settings.mode==link_runtime::parry::general::Mode::Active;
+        }
+    }
+#endif
+#if !LINK_SWORD_LOCK_GRADUATED   // no glyph census in the 3.6.0 DLL
+    {   // Master Sword Blade Lock H1a glyph census (sword_lock_glyphs.h): [Combat] SwordLockGlyphCensus / Pad / Ms. Lab DLL only.
+        unsigned swg_problems=0;
+        g_swg_cfg=swg::ReadCensusConfig([&](const wchar_t* key,wchar_t* out,size_t count){
+            GetPrivateProfileStringW(L"Combat",key,L"",out,static_cast<DWORD>(count),path);},swg_problems);
+        if(swg_problems)Log("sword_lock glyph census: invalid SwordLockGlyphCensus (0/1), SwordLockGlyphCensusPad (0/1) or "
+                            "SwordLockGlyphCensusMs (500..5000); census=%u pad=%u offer_ms=%u",g_swg_cfg.enabled?1U:0U,g_swg_cfg.pad?1U:0U,g_swg_cfg.offer_ms);
+    }
+#endif
     const unsigned fairy_switch=GetPrivateProfileIntW(L"FairyRevive",L"Enabled",0,path);
     const bool fairy_requested=fairy_switch==1;
     const bool fairy_sound_requested=fairy_requested&&GetPrivateProfileIntW(L"FairyRevive",L"Sound",1,path)==1;
@@ -4829,10 +7575,17 @@ static DWORD WINAPI Worker(LPVOID) {
     wchar_t* mortal_name=directory_ok?std::wcsrchr(mortal_directory,L'\\'):nullptr;if(mortal_name)mortal_name[1]=0;
     // Published before Observe; inert until StartHud / zlr::Prepare. Null when neither the HUD nor the companion is asked for.
     const bool companion_frame=g_cmb.AnyOn()&&zlr::CompanionRequested(path);
-    if(g_hud_cfg.Any()||companion_frame)mortal::dispatch_hooks::player_frame=&PlayerFrame;
+    if(g_hud_cfg.Any()||companion_frame||g_swl_wanted)mortal::dispatch_hooks::player_frame=&PlayerFrame;   // g_swl_wanted: H0 probe only
     const bool dispatch_up=mortal_native&&mortal_name&&StartMortalTrial(base,nt->OptionalHeader.SizeOfImage,mortal_directory,mortal_audio,g_oca_cfg.enabled,g_cmb.md_contextual,g_cmb.SwordActions(),ztarget_face_requested,ztarget_strafe_requested);
     const bool combat=g_cmb.AnyOn()&&mortal_name&&StartCombat(mortal_directory,dispatch_up);
     StartHud(base,slot,global_slot,dispatch_up,mortal_name?mortal_directory:nullptr);   // after StartCombat: the meter reads ShieldGuard
+    StartSwordLock(base,slot,global_slot,dispatch_up);   // H0 probe: returns at once (no log) with [Combat] SwordLockProbe off
+    StartSwordLockCensus(base,slot,global_slot);   // H1a census: returns at once (no log) with [Combat] SwordLockGlyphCensus off
+#if LINK_SWORD_LOCK
+    StartSwordLockDuel(base,mortal_name?mortal_directory:nullptr);   // H1c lab duel (+ H2b's clips from Bin32): returns at once with the keys off
+#else
+    StartSwordLockDuel(base);   // H1c lab duel: returns at once (no log) with [Combat] SwordLock or SwordLockLab off
+#endif
     if(sword_trail_probe_requested)StartSwordTrailProbe(base,slot,global_slot,dispatch_up,sword_trail_probe_ot22,sword_trail_probe_restore);
     StartSwordTrail(base,slot,global_slot,dispatch_up);
     StartSwordCharge(base,slot,global_slot,dispatch_up,mortal_name?mortal_directory:nullptr);
@@ -4849,6 +7602,9 @@ static DWORD WINAPI Worker(LPVOID) {
         return g_oca_session.state()!=oca::State::Idle||mortal::dispatch_hooks::runtime.active||SwordBusy()||
             (g_rx&&g_rx->Active());},&Log,dispatch_up);
     ZTargetArrowReady();
+#if LINK_SWORD_LOCK
+    SwcStart();   // H2c lab: the duel camera's stage on these hooks, the bars and the sway (nothing with the duel off)
+#endif
     const bool mortal_voice=dispatch_up&&g_cmb_md&&g_cmb.md_contextual;
     const bool ocarina=dispatch_up&&g_oca_on.load(std::memory_order_acquire);
     if(!g_oca_cfg.enabled)Log("Ocarina=0; no ocarina hooks, files or devices");
@@ -4912,6 +7668,7 @@ static DWORD WINAPI Worker(LPVOID) {
         }
         if(mortal_voice)PollMortalTrial(mortal_consumer,mortal_audio);
         if(g_cmb.AnyOn()||g_hud_on)PollCombat();
+        if(g_swl_on.load(std::memory_order_acquire)||g_swg_on.load(std::memory_order_acquire))PollSwordLock();   // H0 probe / H1a census lines (off: never called)
         if(g_hud_on){PollHudRefill();PollHudLetterbox();}   // heart-refill-01 / ztarget-letterbox-01: no-op unless on
         if(g_cmb.SwordActions())SwordPollAudio();
         zlr::PollAudio();

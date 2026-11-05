@@ -171,6 +171,9 @@ template <class Mem> bool MaskTrigger(Mem& m, uint32_t base) {
 inline void (*g_line)(int level, const char* text) = nullptr;
 inline uint64_t (*g_now)() = nullptr;           // real-time ms clock (GetTickCount64 in the DLL)
 inline uint32_t g_base = 0, g_debounce_ms = kDefaultMs;
+// H1c (docs/idea-ambiciosa-2026-11-03.md, "Cableado" 1): the PadRead hook is installed for CaseKeyDebounce=1 OR for
+// [Combat] SwordLock=1; the TAB debounce (Tick) runs only with CaseKeyDebounce=1. Set by the DLL before Install.
+inline bool g_debounce = true;
 inline Debounce g_state;
 inline uint32_t g_passed = 0, g_masked = 0, g_unread = 0, g_write_fail = 0;
 
@@ -204,9 +207,11 @@ inline const char* Name(Verdict v) { return v == Verdict::Installed ? "installed
 
 #if defined(_MSC_VER) && defined(_M_IX86)
 inline void(__cdecl* g_original)() = nullptr;   // MinHook trampoline of PadRead
-// Run after each PadRead, menus included (2-nov: the TP hearts drop their units in the case, where the player frame
-// that pauses them does not run). Set by the DLL; must not throw.
-inline void(*g_after)() = nullptr;
+// Run after each PadRead, menus included, in this order (H1c "Cableado" 1: the Blade Lock lab duel reads and masks
+// Key_btn_on/Key_btn_trg before anything else sees them, then HudMenuFrame; 2-nov: the TP hearts drop their units in
+// the case, where the player frame that pauses them does not run). A null slot is skipped. Set by the DLL; must not throw.
+enum After : unsigned { kAfterDuel = 0, kAfterHud = 1, kAfterCount = 2 };
+inline void(*g_after[kAfterCount])() = {nullptr, nullptr};
 struct LiveMemory {
     bool Read(uint32_t at, void* out, size_t n) {
         __try { std::memcpy(out, reinterpret_cast<const void*>(static_cast<uintptr_t>(at)), n); return true; }
@@ -222,8 +227,8 @@ __declspec(noinline) inline void __cdecl Detour() {
     g_original();
     const DWORD error = GetLastError();
     LiveMemory m;
-    Tick(m);
-    if (g_after) g_after();
+    if (g_debounce) Tick(m);
+    for (unsigned i = 0; i < kAfterCount; ++i) if (g_after[i]) g_after[i]();
     SetLastError(error);
 }
 // All pins or nothing, then `hook(target, detour, original_slot)` creates and enables the hook

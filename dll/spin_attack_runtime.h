@@ -1,4 +1,5 @@
 #pragma once
+#include "sword_lock_build.h"   // LINK_SWORD_LOCK (the feature) / LINK_SWORD_LOCK_LAB (the lab tools) / _GRADUATED
 #include "runtime_paths.h"
 // Included inside link_runtime.cpp's combat block, after its target/adapter/
 // prompt declarations. All native access stays on the game thread; worker
@@ -22,6 +23,7 @@
 #include "sword_trail_draw_ot.h"
 #include "sword_charge_draw.h"
 #include "sword_particles_draw.h"
+#include "sword_offer_policy.h"
 
 namespace sword=link_runtime::sword_actions;
 namespace spin=link_runtime::spin_attack;
@@ -56,6 +58,9 @@ struct SwordRequest {
     bool great=false;int hp=0,hp_max=0;   // Spin: the Great Spin (great_spin.h), decided at the release with full HP
     link_runtime::back_slice::Plan back;  // Back: the arc decided at the tap
     link_runtime::backflip::Plan flip;    // Flip: the travel decided at the tap
+#if LINK_SWORD_LOCK
+    bool lab_win=false;   // Spin: the Blade Lock lab's win spin (sword_lock_winspin.h), queued by link_runtime.cpp SwkWinSpinFrame
+#endif
 };
 struct SwordAction {
     SwordRequest request;uint64_t lease=0;double start=0;bool struck=false;unsigned strike_tick=0;
@@ -69,7 +74,21 @@ static SwordAction g_sword_action;
 static SwordKind g_sword_starting=SwordKind::None;
 static mctx::Sample g_sword_sample;
 static bool g_sword_sample_player=false;
+// offer-fix-01 (sword_offer_policy.h): the native works queued at the arbiter's entry (CmbArbiterDetour, before the
+// mod's own prompts), and those of g_sword_sample's frame (SwordArbiter copies them with the sample).
+namespace soffer=link_runtime::sword_offer;
+static soffer::Facts g_sword_offer_entry,g_sword_offers;
+static bool g_sword_offer_logged=false;   // one "sword_offer pass" line per prompt episode
 static bool SwordBusy(){return g_sword_action.lease||g_sword_request.kind!=SwordKind::None||g_sword_starting!=SwordKind::None;}
+#if LINK_SWORD_LOCK
+// Blade Lock lab, the win's Great Spin (link_runtime.cpp, sword_lock_winspin.h): its strike leaves the stunned owner out
+// of the hit list and keeps the targets for the after watch; its end hands over the hit counts. Called only for a
+// request with lab_win; the normal spin never reaches them.
+static void SwkWinSpinStrike(uint64_t lease,const CmbPlayer& p,sword::target::List& targets);
+static void SwkWinSpinLeaseEnd(uint64_t token,const char* why,bool struck,unsigned published,unsigned applied,unsigned skipped);
+static double SwkWinSpinDeadline(double now,double span);   // the hit list's deadline at the win spin's strike
+static void SwhHandOver();   // candidate 5: the duel's sword handed to the win spin's own sword_hand (same event)
+#endif
 // shield-guard-02 (GuardTick): the Shield Bash and the Back Slice are TP clips with the shield on the left arm; the
 // hand-shield body is shown from the start request to the end of the clip.
 static bool SwordShieldInHand(){
@@ -393,16 +412,54 @@ static void SwordEndingBodies(uint32_t frame,const CmbPlayer& p,const sword::tar
 }
 static uint32_t SwordWeapon(){const auto g=CmbGet<uint32_t>(g_cmb_global_slot);return g?CmbGet<uint8_t>(g+0x4FC0):0xFFFFFFFF;}
 static bool SwordForeground(){DWORD pid=0;GetWindowThreadProcessId(GetForegroundWindow(),&pid);return pid==GetCurrentProcessId();}
-static bool SwordPriority(const mctx::Sample& s){return !s.readable||!s.after_arbiter||s.offers||s.active||s.lock||s.actions_disabled;}
+// The sword actions' native priority (offer-fix-01, sword_offer_policy.h). Through 3.5.0 it was every queued offer
+// (+0x40) and every prompt up (+0x42, set whenever a prompt shows, not when it fires): with "E TAKE" or "E KICK" on
+// screen the spin charge broke, the Shield Bash / Back Slice / backflip tap never armed (shield_bash.h Tap, ready),
+// a queued request was dropped and a running clip was cut (spin_interrupt reason=4). SwordOverNativeOffer=1
+// (missing = 1): a plain action-button prompt no longer counts; QTE / mash / forced prompts, the lock and the
+// early-outs do, and SwordArbiter's keys (E or aim held) still give way. 0 = 3.5.0. g_sword_offers must be the works
+// of the sample's frame (SwordArbiter sets both).
+static bool SwordPriority(const mctx::Sample& s){return soffer::Priority(s,g_sword_offers,g_cmb.sword_over_offer);}
+#if LINK_SWORD_LOCK
+// Blade Lock lab, the win's Great Spin (play-20261103: 4 of 5 wins ended lease_end=cancelled, spin_interrupt reason=4
+// on the frame the stunned owner's native kick prompt was queued): it never gives way to an action-button prompt,
+// whatever SwordOverNativeOffer says, nor to a held E (the duel's mash key, often still down after the flash). The kick
+// prompt shows once the clip ends (no plain prompt shows or fires while the lease's Event routine runs); E kicks then.
+// Aiming (SwordArbiter), QTE / mash prompts, the lock and the early-outs still win.
+static bool SwordLabPriority(const mctx::Sample& s){return soffer::Priority(s,g_sword_offers,true);}
+#endif
+// The priority a queued or running request answers to (its start gate, KeepRequest, the interrupt).
+static bool SwordOverOffer(const SwordRequest& r){
+#if LINK_SWORD_LOCK
+    if(r.lab_win)return true;
+#endif
+    (void)r;return g_cmb.sword_over_offer;
+}
 // The Ending Blow's native priority (24-oct, bug 5): the same without a merely queued offer. A pickup prompt (kind 0x28,
 // the items a dead Ganado drops) or a kick prompt near Link only offers the action button; the knife press is fire, and
 // the native knife slash plays through them, so the Ending Blow that replaces it may too. Logged: a leap interrupted
 // 4 game frames in (ending_interrupt reason=4) the frame a pickup prompt appeared, and native slashes pressed with a
-// prompt up. An offer that fires (active), the lock, the early-outs and a held action or aim key still win.
+// prompt up. A prompt shown (active), the lock, the early-outs and a held action or aim key still win. offer-fix-01
+// (3-nov): +0x42 means shown, not fired. With the knife up only a WEP_SET_IGNORE work shows (checkPLStatus 0x18A974,
+// 0x282420 & 0x10), e.g. KICK, and under one (+0x501C 0x200000 set) the knife's fire checks (0x354512 -> 0x2819D0,
+// 0x35451B -> 0x2818A0) may raise STA_PL_ACTION instead of the slash (0x2818E0, 0x281A0E; control byte [0xC06F40]+0xB
+// = 0) and so fire the prompt: that is why this rule, unlike SwordPriority's, still gives way to a shown prompt.
 static bool SwordEndingPriority(const mctx::Sample& s){return !s.readable||!s.after_arbiter||s.active||s.lock||s.actions_disabled;}
-static void SwordInterruptActive(const sword::Input& now,bool priority,bool ending_priority){
+// A queued request's start gate (SwordDecide): the Ending Blow's rule, the lab win spin's, else SwordPriority.
+static bool SwordRequestPriority(const SwordRequest& r,const mctx::Sample& s){
+#if LINK_SWORD_LOCK
+    if(r.lab_win)return SwordLabPriority(s);
+#endif
+    return r.kind==SwordKind::Ending?SwordEndingPriority(s):SwordPriority(s);
+}
+// lab_priority: the lab win spin's (SwordLabPriority plus aiming); the normal DLL passes the same as priority.
+static void SwordInterruptActive(const sword::Input& now,bool priority,bool ending_priority,bool lab_priority){
     auto& a=g_sword_action;if(!a.lease||a.interruption!=sword::Interrupt::None)return;
     if(a.request.kind==SwordKind::Ending)priority=ending_priority;
+#if LINK_SWORD_LOCK
+    else if(a.request.lab_win)priority=lab_priority;
+#endif
+    (void)lab_priority;
     sword::Input origin;origin.time=a.start;origin.scene=a.request.scene;origin.player=a.request.player;origin.weapon=a.request.weapon;
     auto& run=mortal::dispatch_hooks::runtime;
     const bool owns=run.active&&run.lease.token==a.lease&&run.Owns(reinterpret_cast<unsigned char*>(now.player));
@@ -420,7 +477,7 @@ static void SwordBeforeResolve(){
     sword::Input input;input.time=GameNow(g_cmb_global_slot);input.scene=g_cmb_epoch;
     input.player=valid?p.player:0;input.weapon=SwordWeapon();
     input.valid=valid&&p.facts.gameplay&&!p.damaged&&SwordForeground()&&g_oca_session.state()==oca::State::Idle;
-    SwordInterruptActive(input,false,false);
+    SwordInterruptActive(input,false,false,false);
 }
 static bool SwordKnifeHold(uint32_t routine){return routine==0x01010B00U;}
 static bool SwordChargeRoutine(uint32_t routine,bool knife){
@@ -436,13 +493,50 @@ static void SwordDropRequest(const char* why){
     if(g_sword_request.kind!=SwordKind::None)CmbLog("%s_request cancelled=%s",SwordName(g_sword_request.kind),why);
     g_sword_request={};
 }
+// offer-fix-01: the arbiter's entry (link_runtime.cpp CmbArbiterDetour, right after the native sample and before the
+// mod queues its own NULL-func prompts): this frame's native works, classified (sword_offer_policy.h). Nothing is read
+// with the sword actions off; with none queued the facts are readable and empty. The public DLL with
+// SwordOverNativeOffer=0 reads nothing either (the rule never looks at the works then: 3.5.0's per-frame work); the
+// lab DLL still reads them, its win spin plays the rule whatever the key says (SwordLabPriority).
+static void SwordOfferEntry(bool pre,const mctx::Sample& s){
+    g_sword_offer_entry={};
+    if(!g_cmb.SwordActions()||!pre)return;
+#if !LINK_SWORD_LOCK
+    if(!g_cmb.sword_over_offer)return;
+#endif
+    if(!s.offers){g_sword_offer_entry.readable=true;return;}
+    CmbMem m;soffer::Read(m,g_cmb_base,s.offers,g_sword_offer_entry);
+}
+// offer-fix-01: a frame 3.5.0 would have given way to a native prompt and this rule did not, while a sword action was
+// pressing, charging, queued or running: one feature line per prompt episode (reset once nothing is queued or shown).
+// priority / lab_priority: what SwordArbiter used this frame, keys included. The Ending Blow's rule did not change.
+// The test is the rule's own (soffer::PlayedThrough; the lab win spin plays it over=1), then a held key filters it.
+static void SwordOfferPass(const mctx::Sample& s,bool priority,bool lab_priority){
+    if(!s.offers&&!s.active){g_sword_offer_logged=false;return;}
+    if(g_sword_offer_logged)return;
+    const SwordKind kind=g_sword_action.lease?g_sword_action.request.kind:g_sword_request.kind;
+    if(kind==SwordKind::Ending)return;
+    bool lab=false;
+#if LINK_SWORD_LOCK
+    lab=g_sword_action.lease?g_sword_action.request.lab_win:g_sword_request.kind!=SwordKind::None&&g_sword_request.lab_win;
+#endif
+    if(!soffer::PlayedThrough(s,g_sword_offers,lab||g_cmb.sword_over_offer))return;
+    if(lab?lab_priority:priority)return;   // E or aiming held: it gave way anyway
+    const char* what=kind!=SwordKind::None?SwordName(kind):g_bash_tap.Pressing()?"tap":g_sword_charge.Active()?"charge":nullptr;
+    if(!what)return;
+    g_sword_offer_logged=true;
+    const auto& f=g_sword_offers;
+    CmbLog("sword_offer pass frame=%u what=%s running=%u lab=%u offers=%u shown=%u yielding=%u binding=%u kind=0x%02X lease=%llu over=%u",
+        static_cast<unsigned>(s.frame),what,g_sword_action.lease?1U:0U,lab?1U:0U,unsigned(s.offers),unsigned(s.active),unsigned(f.yielding),
+        unsigned(f.binding),unsigned(f.first_kind),g_sword_action.lease,g_cmb.sword_over_offer?1U:0U);
+}
 // The arbiter sees only native offers; subtract our own NULL-function prompt
 // from the post sample, just as contextual Mortal Draw does. Do not replace
 // logical knife/fire with MortalDrawKey's physical E mapping.
 static void SwordArbiter(mctx::Sample sample,bool player,const CmbPlayer& p){
     if(!g_cmb.SwordActions())return;
     if(g_cmb_prompt_cfg.on)mdp::ClaimOwnOffer(sample,g_cmb_prompt.Injected());
-    g_sword_sample=sample;g_sword_sample_player=player;
+    g_sword_sample=sample;g_sword_offers=g_sword_offer_entry;g_sword_sample_player=player;
     sword::Input input;
     input.frame=sample.frame;input.time=GameNow(g_cmb_global_slot);input.scene=g_cmb_epoch;
     input.player=player?p.player:0;input.weapon=SwordWeapon();
@@ -454,13 +548,22 @@ static void SwordArbiter(mctx::Sample sample,bool player,const CmbPlayer& p){
     const bool keys=(sample.on&(mctx::layout::key_action|mctx::layout::key_ready))!=0;
     const bool priority=SwordPriority(sample)||keys;
     const bool ending_priority=SwordEndingPriority(sample)||keys;   // without a merely queued offer (above)
-    SwordInterruptActive(input,priority||g_oca_session.state()!=oca::State::Idle,ending_priority||g_oca_session.state()!=oca::State::Idle);
+#if LINK_SWORD_LOCK
+    const bool lab_priority=soffer::LabWinPriority(sample,g_sword_offers);   // aiming counts, a held E does not
+#else
+    const bool lab_priority=priority;
+#endif
+    const bool ocarina=g_oca_session.state()!=oca::State::Idle;
+    SwordInterruptActive(input,priority||ocarina,ending_priority||ocarina,lab_priority||ocarina);
     input.safe=input.valid&&!priority&&!occupied&&SwordChargeRoutine(p.routine,input.knife);
     BashArbiter(input,priority,occupied,p);   // Shield Bash (shield_bash.h): Z key held + knife tap; inert when off
     // spin-fix-01: a queued request is kept through the knife's own draw/put-away (sword::PendingRoutine) and dropped
     // with the reason named (was one context_or_native for all; every Back Slice died on its own release frame).
     if(g_sword_request.kind!=SwordKind::None){
         sword::Pending pn;pn.valid=input.valid;pn.priority=g_sword_request.kind==SwordKind::Ending?ending_priority:priority;
+#if LINK_SWORD_LOCK
+        if(g_sword_request.lab_win)pn.priority=lab_priority;
+#endif
         pn.occupied=occupied;pn.time=input.time;
         pn.scene=input.scene;pn.player=input.player;pn.weapon=input.weapon;
         pn.routine_ok=sword::PendingRoutine(p.routine,input.knife,CmbStartRoutine(p.routine));
@@ -535,6 +638,7 @@ static void SwordArbiter(mctx::Sample sample,bool player,const CmbPlayer& p){
             !g_cmb.ending_leap?"":targets.items[0].locked?" prefer=lock":" prefer=near");
         // No mask yet: a failed admission leaves the native knife attack intact.
     }
+    SwordOfferPass(sample,priority,lab_priority);
 }
 // Spin bullets' state (SpinBullets, below): the volley's tracers (TrailFrame) and the Ganados its shots took.
 namespace spb=link_runtime::spin_bullets;
@@ -1098,6 +1202,9 @@ static bool SwordLifecycle(mortal::dispatch::Event event,uint64_t token){
         else if(g_sword_starting==SwordKind::Flip)g_sword_flip_voice.Start(token);   // TP's BACKTEN shout
         else if(g_sword_starting!=SwordKind::Bash)voice.Start(token);   // the bash's sound plays at its impact (BashFire)
         SwordPartsBegin(token,g_sword_action.request.player);
+#if LINK_SWORD_LOCK
+        if(g_sword_action.request.lab_win)SwhHandOver();   // the duel's swap ends right before the spin's own begins
+#endif
         SwordHandBegin(token,g_sword_starting);
         SwordTrailBegin(token,g_sword_starting,g_sword_action.request.great);
         TrailBegin(token,g_sword_starting,g_sword_action.request.great,g_sword_action.request.player);
@@ -1130,6 +1237,9 @@ static bool SwordLifecycle(mortal::dispatch::Event event,uint64_t token){
     SwordTrailEnd(token,why);
     TrailEnd(token);
     SwordPartsEnd(token,a.request.player);
+#if LINK_SWORD_LOCK
+    if(a.request.lab_win)SwkWinSpinLeaseEnd(token,why,a.struck,a.hits.Published(),a.hits.Applied(),a.hits.Skipped());
+#endif
     CmbLog("%s_end lease=%llu event=%u struck=%u published=%u applied=%u skipped=%u",SwordName(a.request.kind),token,
         static_cast<unsigned>(event),a.struck?1U:0U,a.hits.Published(),a.hits.Applied(),a.hits.Skipped());
     a={};g_sword_charge.Cancel();link_runtime::parry::input::SetMortalBlocks(false);return true;
@@ -1263,7 +1373,15 @@ static void SwordDecide(mortal::dispatch::Runtime& run,void* player){
             // full Great Spin still reaches them at 30 FPS (review 22-oct); never under 2 frames per target, so a full
             // 16-target list lands at 30 FPS too (review 27-oct; 60/165 FPS publish them inside the 24).
             const unsigned shot=a.request.kind==SwordKind::Spin?SpinBullets(a.lease,now,p,a.request.great,targets):0U;
+#if LINK_SWORD_LOCK
+            if(a.request.lab_win)SwkWinSpinStrike(a.lease,p,targets);   // Blade Lock lab: the stunned owner left out
+            // Blade Lock lab: frozen Ganados hold each record for the adapter's TTL, so the win spin's deadline runs past
+            // the hold's cap (sword_lock_winspin.h WinSpinDeadline); the normal spin keeps its own.
+            const double window=24.0+2.0*shot,need=2.0*targets.count,span=window>need?window:need;
+            a.hits.Begin(targets,a.request.lab_win?SwkWinSpinDeadline(now,span):now+span);
+#else
             const double window=24.0+2.0*shot,need=2.0*targets.count;a.hits.Begin(targets,now+(window>need?window:need));
+#endif
             if(a.request.kind==SwordKind::Spin&&a.request.great){
                 const unsigned sparks=GreatSparkle(p);
                 CmbLog("spin_strike lease=%llu frame=%u targets=%u strike_tick=%u great=1 radius=%u permille=%u sparks=%u spark_code=%u",a.lease,frame,
@@ -1283,7 +1401,7 @@ static void SwordDecide(mortal::dispatch::Runtime& run,void* player){
     const auto request=g_sword_request;
     if(!valid||!p.facts.gameplay||p.damaged||request.scene!=g_cmb_epoch||request.player!=p.player||request.weapon!=SwordWeapon()||
        !g_sword_sample_player||g_sword_sample.frame!=frame||
-       (request.kind==SwordKind::Ending?SwordEndingPriority(g_sword_sample):SwordPriority(g_sword_sample))||!SwordForeground()||run.active||
+       SwordRequestPriority(request,g_sword_sample)||!SwordForeground()||run.active||
        (g_rx&&g_rx->Active())||g_oca_session.state()!=oca::State::Idle||now<request.time||
        link_runtime::game_clock::Exceeded(now-request.time,SwordRequestFrames(request.kind))){SwordDropRequest("start_context");return;}
     // Ending replaces this frame's knife press only. Never steal a later fire edge.
@@ -1298,10 +1416,17 @@ static void SwordDecide(mortal::dispatch::Runtime& run,void* player){
         if(!v.reachable||!sword::target::Finishable(v.raw,SwordTargets())){
             SwordDropRequest(!v.same?"target_lost":!v.reachable?"target_out_of_reach":"target_left_floor");return;}
     }
-    // Check offers queued since the arbiter too. A late native action always wins.
+    // Check offers queued since the arbiter too. A late native action always wins: the lock and the early-outs, and a
+    // late offer as SwordPriority judges one (offer-fix-01: with SwordOverNativeOffer=1 a plain action-button prompt
+    // no longer drops the request; a QTE / mash / forced one still does). The Ending Blow lets a queued offer be.
     CmbMem m;mctx::Sample late;
-    if(!mctx::ReadPreArbiter(m,g_cmb_base,late)||(late.offers&&request.kind!=SwordKind::Ending)||late.lock||late.actions_disabled){
-        SwordDropRequest("late_native_offer");return;}   // the Ending Blow lets a queued offer be (SwordEndingPriority)
+    bool late_ok=mctx::ReadPreArbiter(m,g_cmb_base,late)&&!late.lock&&!late.actions_disabled;
+    if(late_ok&&late.offers&&request.kind!=SwordKind::Ending){
+        soffer::Facts works;const bool over=SwordOverOffer(request);
+        if(over)soffer::Read(m,g_cmb_base,late.offers,works);
+        late_ok=!soffer::LateBlocks(late.offers,works,over);
+    }
+    if(!late_ok){SwordDropRequest("late_native_offer");return;}
     if(request.kind==SwordKind::Back){
         CmbMem bm;const auto v=sword::target::Revalidate(bm,g_cmb_base,g_cmb_tracker,request.target,p.pos,BackTargets(),false,sword::target::Mode::Select);
         if(!v.reachable){BackAbort(frame,!v.same?"target_lost":"target_out_of_reach");SwordDropRequest("back_target");return;}
@@ -1394,6 +1519,9 @@ static void SwordPrepare(const wchar_t* directory,bool dispatch_up,bool move_up)
         g_cmb.bullets.great,double(g_cmb.bullets.range),g_bullet_los_ok?1U:0U,g_bullet_sound_ok?1U:0U,g_cmb.bullets.problems);
     Log("Sword actions ready SpinAttack=%u EndingBlow=%u charge_ms=1000 spin_radius=%.0f ending_range=%u line_waiver=%u native_qa=0",
         g_cmb.spin_attack?1U:0U,g_cmb.ending_blow?1U:0U,double(sword::target::Config{}.spin_radius),g_cmb.ending_strike_range,g_cmb.line_waiver?1U:0U);
+    Log("%s",g_cmb.sword_over_offer?"SwordOverNativeOffer=1: action-button prompts (E TAKE, E KICK, OPEN...) no longer stop the sword actions; "
+        "E or aiming, QTE/mash/forced prompts, the prompt lock and the arbiter early-outs still win (Ending Blow unchanged)":
+        "SwordOverNativeOffer=0: any queued offer or prompt up stops the sword actions (3.5.0)");
     // sword-hand-01: the knife draw's setKnife / setDisp bytes and the weapon display levels (kOcarinaWeapon) must match.
     {
         const bool pins=PinsAt(g_cmb_base,link_runtime::native_pins::kSwordHand)&&PinsAt(g_cmb_base,link_runtime::native_pins::kOcarinaWeapon);

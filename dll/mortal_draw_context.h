@@ -6,8 +6,10 @@
 // Sample point (enforced): the cActionButton arbiter 0x18AB40 (thiscall, ECX =
 // manager 0x8502C0). Its entry sees this frame's queued offers (+0x40) and the
 // lock (+0x41) before they are cleared; its exit (tail 0x18A0A0 clears the
-// list and +0x40, re-latches +0x41) sees +0x42 = an offer fired with this
-// frame's press. Read both halves (ReadPreArbiter / ReadPostArbiter) and decide
+// list and +0x40, re-latches +0x41) sees +0x42 = a prompt was up this frame
+// (offer-fix-01, 3-nov: set at 0x18ABC3 on the first work checkPLStatus accepts,
+// before checkButton 0x18ABE6 tests the key, so it does not mean the press fired
+// it). Read both halves (ReadPreArbiter / ReadPostArbiter) and decide
 // after the arbiter. On the activation frame the caller masks KEY_A out of
 // Key_btn_trg (MaskPress), so a reader later in the frame (player routine, a
 // late offer) cannot consume the same edge. Readers that run before the
@@ -33,7 +35,8 @@ constexpr uint64_t button1_second_mask = 0x0001000000000000ULL;
 // ON 0x800 in knife set 0x354410). Donald's Space is the knife hold, not this.
 constexpr uint64_t key_ready = 0x10ULL, key_fire = 0x80ULL, key_knife_ready = 0x800ULL;
 // cActionButton manager: offers queued +0x40 (set 0x18AA10), lock +0x41,
-// fired-this-frame +0x42 (cleared at arbiter entry 0x18AB51, set 0x18ABC3).
+// prompt-up-this-frame +0x42 (cleared at arbiter entry 0x18AB51, set 0x18ABC3
+// before checkButton: shown, not necessarily fired).
 constexpr uint32_t action_manager_rva = 0x8502C0, offers = 0x40, lock = 0x41, active = 0x42;
 constexpr uint32_t arbiter_rva = 0x18AB40, arbiter_tail_rva = 0x18A0A0;
 // Arbiter early-outs (no offer can fire): GLOBAL [0x806F3C] +0x170 & 0x100 and
@@ -128,7 +131,7 @@ template <class Reader> bool ReadPreArbiter(Reader& reader, uint32_t image_base,
     s.pre_ok = true;
     return true;
 }
-// Arbiter exit: input and whether a native offer fired with this frame's press.
+// Arbiter exit: input and whether a native prompt was up this frame (+0x42).
 // Only valid after ReadPreArbiter succeeded for the same frame: without the
 // entry facts (offers, lock, early-outs) native priority would fail open (N-3).
 template <class Reader> bool ReadPostArbiter(Reader& reader, uint32_t image_base, Sample& s) {

@@ -73,6 +73,12 @@
 //                       Backflip=1)
 //   BackflipLandFrames  game frames (60 Hz) of the landing before control returns, 0..30 (default 2 = TP's land cancel
 //                       point; 30 = the whole landing clip as backflip-01; read only with Backflip=1)
+// Native prompts (offer-fix-01, 3-nov; sword_offer_policy.h; read with SpinAttack=1 or EndingBlow=1), in gs_sb_problems:
+//   SwordOverNativeOffer missing or 1 = a queued action-button prompt ("E TAKE", "E KICK", OPEN, CLIMB...) no longer
+//                       stops the spin / Great Spin charge, the Shield Bash, Back Slice and backflip tap, a queued
+//                       request or a running clip; E (or aiming) still gives way to the prompt, and QTE / mash /
+//                       forced prompts, the prompt lock and the arbiter's early-outs still win. 0 = 3.5.0: any queued
+//                       offer or prompt up gives way (the Ending Blow keeps its own rule, 24-oct, either way)
 // Sword in hand (sword-hand-01, 19-oct; sword_hand.h; read with SpinAttack=1 or EndingBlow=1), counted in gs_sb_problems:
 //   SwordInHand         missing or 1 = during a sword action started outside the knife routine (Back Slice, Shield
 //                       Bash, spin / Great Spin, Ending Blow and its leap) the right hand shows the Master Sword (the
@@ -115,6 +121,7 @@ struct Config {
     unsigned back_camera_ms = 40, back_camera_lift = 100;   // BackSliceCameraMs, BackSliceCameraLift
     backflip::Config flip;          // Backflip / BackflipDistance (read with SpinAttack=1; flip.on default off)
     bool sword_hand = true;         // SwordInHand (read with SpinAttack=1 or EndingBlow=1)
+    bool sword_over_offer = true;   // SwordOverNativeOffer (read with SpinAttack=1 or EndingBlow=1; sword_offer_policy.h)
     bool spin_breakables = true;    // SpinBreakables (read with SpinAttack=1): spins break boxes and boards (sword_breakables.h)
     spin_bullets::Config bullets;   // SpinBullets* (read with SpinAttack=1): spins fire free shots all around (spin_bullets.h)
     unsigned gs_sb_problems = 0;    // invalid Great Spin / Shield Bash values (logged; their defaults kept)
@@ -230,6 +237,7 @@ template <class Get> Config ReadConfig(Get&& get, bool parry_active) {
         c.bash.deflect_ms = number(L"ShieldBashDeflectMs", 500, 0, 1000);
         c.bash.deflect_reach = number(L"ShieldBashDeflectReach", 3000, 1000, 5000);
         c.sword_hand = flag(L"SwordInHand");
+        c.sword_over_offer = flag(L"SwordOverNativeOffer");
         c.gs_sb_problems = c.problems - before; c.problems = before;
     }
     {

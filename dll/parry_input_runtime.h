@@ -29,7 +29,13 @@ inline bool OcarinaBlocks() {return ocarina_blocks.load(std::memory_order_acquir
 // same effect as the ocarina gate. The F8 pilot never sets it.
 inline std::atomic<bool> mortal_blocks{false};
 inline void SetMortalBlocks(bool blocks) {mortal_blocks.store(blocks,std::memory_order_release);}
-inline bool Blocks() {return OcarinaBlocks()||mortal_blocks.load(std::memory_order_acquire);}
+// Published by the Blade Lock lab duel (H1c, [Combat] SwordLockLab=1 only, sword_lock_lab.h) while it holds the world
+// (the duel and its exit slide): same effect as the gates above. Dropped at the release, so the Follow rearmed there
+// still cancels the same swing (tier 2 refuses every hit while Blocks()); the knife held through the release reaches
+// no reader until it is seen released, through the duel's Key_btn mask.
+inline std::atomic<bool> sword_lock_blocks{false};
+inline void SetSwordLockBlocks(bool blocks) {sword_lock_blocks.store(blocks,std::memory_order_release);}
+inline bool Blocks() {return OcarinaBlocks()||mortal_blocks.load(std::memory_order_acquire)||sword_lock_blocks.load(std::memory_order_acquire);}
 struct State {
     defense::ParryWindow window;
     Sample sample;

@@ -38,8 +38,8 @@ to the shipped DLL.
 
 ## Version
 
-This source corresponds to Hyrule Evil 4 **3.5.0** (shipped `dinput8.dll` SHA-256
-`8c63bcd07af69a61f89815dc442d969e8b64a2a7852b6236214cf66e2ed10e2e`). Every released version has a tag: [v3.2.0](../../tree/v3.2.0), [v3.2.1](../../tree/v3.2.1), [v3.3.0](../../tree/v3.3.0), [v3.4.0](../../tree/v3.4.0), [v3.4.1](../../tree/v3.4.1), [v3.4.2](../../tree/v3.4.2), [v3.4.3](../../tree/v3.4.3), [v3.5.0](../../tree/v3.5.0).
+This source corresponds to Hyrule Evil 4 **3.6.0** (shipped `dinput8.dll` SHA-256
+`6696c8c4a3850c941f552ef72d652b30a8585b8c782d5ba5ebc8cf09af2415bd`). Every released version has a tag: [v3.2.0](../../tree/v3.2.0), [v3.2.1](../../tree/v3.2.1), [v3.3.0](../../tree/v3.3.0), [v3.4.0](../../tree/v3.4.0), [v3.4.1](../../tree/v3.4.1), [v3.4.2](../../tree/v3.4.2), [v3.4.3](../../tree/v3.4.3), [v3.5.0](../../tree/v3.5.0), [v3.6.0](../../tree/v3.6.0).
 Download mirror for the mod releases: https://github.com/Donixar/HyruleEvil4/releases
 
 ## Disclaimer

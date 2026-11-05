@@ -110,7 +110,8 @@ template <class Sink> void Drain(Sink&& sink) {
 // What the runtime did after a true decision, for the caller's own effects (voice, reaction).
 // grace: blocked by the post-parry grace window, part of the parry that opened it (sparks only).
 struct Applied {bool cancel = false, effects = false, grace = false; uint32_t serial = 0, owner_id = 0;
-    uint16_t power = 0; float hit[3]{}, player[3]{};};   // power and positions of a block (parry_pushback.h)
+    uint16_t power = 0; float hit[3]{}, player[3]{};    // power and positions of a block (parry_pushback.h)
+    uint32_t owner = 0; bool chainsaw = false;};         // Owner() of the block and Chainsaw() (sword_lock_probe.h, H0)
 inline bool GraceOn(const Runtime& r) {return r.game_now && r.grace.window > 0 && r.settings.mode == Mode::Active;}
 // A committed tier-1 parry opens the window (never renews an open one).
 inline void OpenGraceAfterCommit(Runtime& r, uint32_t serial) {
@@ -178,6 +179,7 @@ inline Applied Resolve(Runtime& r, const Candidate& c, bool handoff) {
     if (handoff) InterlockedIncrement(&r.counters.handoffs);
     a.effects = !o.grace; a.grace = o.grace; a.owner_id = owner_id;
     a.power = o.descriptor.power; std::memcpy(a.hit, o.front.sample, sizeof(a.hit)); std::memcpy(a.player, o.front.player, sizeof(a.player));
+    a.owner = o.owner; a.chainsaw = Chainsaw(o.function, o.descriptor);
     a.serial = o.grace ? r.grace.serial : 0x40000000U | static_cast<uint32_t>(n);
     if (o.grace) InterlockedIncrement(&r.counters.grace_blocked);
     if (o.grace_opened) {

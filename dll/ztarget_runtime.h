@@ -1,4 +1,5 @@
 #pragma once
+#include "sword_lock_build.h"   // LINK_SWORD_LOCK (the feature) / LINK_SWORD_LOCK_LAB (the lab tools) / _GRADUATED
 #include "runtime_paths.h"
 #include "ztarget_native.h"
 #include "ztarget_input.h"
@@ -939,6 +940,14 @@ __declspec(naked) inline void FallDetour(){__asm{
     popfd
     jmp dword ptr [fall_original]
 }}
+#if LINK_SWORD_LOCK
+// Blade Lock H2c (lab DLL only, sword_lock_cinema.h; wired by link_runtime.cpp's lab block, null otherwise): the duel
+// camera, a last stage on whatever the orbit passes (prepare: true = hand hitCheck `out`; finish: after hitCheck, its
+// output camera; after_front: after CameraMove, so a frame with no hitCheck ends it). The public build has none of it.
+inline bool(*duel_prepare)(void* self,uint32_t caller,const Matrix* matrix,const Offset* src,Offset& out)=nullptr;
+inline void(*duel_finish)(const void* out)=nullptr;
+inline void(*duel_after_front)()=nullptr;
+#endif
 // Lift or orbit only (Z-targeting not admitted): game_thread and depth, then their after-move steps; no Begin, view or HUD.
 inline void __cdecl FrontDetour(){
     const bool zt=live.load(std::memory_order_acquire),lift=lift_live.load(std::memory_order_acquire),
@@ -961,6 +970,9 @@ inline void __cdecl FrontDetour(){
     }
     if(lift)LiftAfterFront();
     if(orb)OrbitAfterFront();
+#if LINK_SWORD_LOCK
+    if(duel_after_front)duel_after_front();   // Blade Lock H2c (lab DLL only)
+#endif
     std::fesetenv(&env);SetLastError(after);--depth;
 }
 // Kept separate from the ABI entry so tests can inject a caller without forging a return address.
@@ -1046,6 +1058,20 @@ inline void __fastcall HitDetour(void* self,void*,const Matrix* matrix,Offset* o
     const bool up=PrepareLift(self,caller,matrix,changed?&local:offsets,lifted);
     Offset* const now=up?&lifted:changed?&local:offsets;
     const bool orbited=PrepareOrbit(self,caller,matrix,now,turned);
+#if LINK_SWORD_LOCK
+    Offset framed;
+    const bool dueled=duel_prepare&&duel_prepare(self,caller,matrix,orbited?&turned:now,framed);
+    std::fesetenv(&env);SetLastError(error);
+    if(changed)writes.fetch_add(1);
+    original_hit(self,matrix,dueled?&framed:orbited?&turned:now,out);
+    if(lift_call.engaged||orbit_call.engaged||dueled){
+        const DWORD after=GetLastError();fenv_t native;std::fegetenv(&native);
+        if(lift_call.engaged)FinishLift(out);
+        if(orbit_call.engaged)FinishOrbit(out);
+        if(dueled&&duel_finish)duel_finish(out);
+        std::fesetenv(&native);SetLastError(after);
+    }
+#else
     std::fesetenv(&env);SetLastError(error);
     if(changed)writes.fetch_add(1);
     original_hit(self,matrix,orbited?&turned:now,out);
@@ -1055,6 +1081,7 @@ inline void __fastcall HitDetour(void* self,void*,const Matrix* matrix,Offset* o
         if(orbit_call.engaged)FinishOrbit(out);
         std::fesetenv(&native);SetLastError(after);
     }
+#endif
 }
 inline bool Switch(const wchar_t* ini,const wchar_t* section,const wchar_t* name){
     wchar_t value[32]{};GetPrivateProfileStringW(section,name,L"",value,32,ini);return ExactOne(value);
