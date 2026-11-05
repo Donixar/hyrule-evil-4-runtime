@@ -403,11 +403,13 @@ struct Choice {
     View view;
 };
 // One pose judged: its view pulled in to the probe's room (less hitCheck's last pull when it is the pose in use).
-template <class Blocked> Choice Judge(Blocked&& blocked, Vec link, Vec owner, float side, unsigned pose, float fovy, float pull) {
+// Candidate 15: `ray` is hitCheck's real ray start (M * campos[1]); without a readable one, Link's shoulder over his feet.
+template <class Blocked> Choice Judge(Blocked&& blocked, Vec link, Vec owner, float side, unsigned pose, float fovy, float pull,
+                                      const Vec* ray = nullptr) {
     Choice c; c.pose = pose < kPoseCount ? pose : kFallbackPose; c.side = side; c.fallback = c.pose == kFallbackPose;
     c.view = PoseView(link, owner, side, kPoses[c.pose]);
     if (!c.view.ok) return c;
-    const Vec shoulder{link.x, link.y + kShoulderY, link.z};
+    const Vec shoulder = ray && Finite(*ray) ? *ray : Vec{link.x, link.y + kShoulderY, link.z};
     const float len = Len(Sub(c.view.cam, c.view.look));
     const float a = Room(blocked, c.view.look, c.view.cam);
     const float b = Room(blocked, shoulder, c.view.cam) + Len(Sub(c.view.look, shoulder));
@@ -421,22 +423,42 @@ template <class Blocked> Choice Judge(Blocked&& blocked, Vec link, Vec owner, fl
 // The first pose that fits on `side`, skipping the `rejected` ones (a bit per pose); none: the fallback (ok may be
 // false: the best there is). `current` / `pull`: hitCheck's last pull counts against the pose in use only.
 template <class Blocked> Choice ChooseOn(Blocked&& blocked, Vec link, Vec owner, float side, float fovy, uint32_t rejected,
-                                         unsigned current = kPoseCount, float pull = 0.f) {
+                                         unsigned current = kPoseCount, float pull = 0.f, const Vec* ray = nullptr) {
     for (unsigned i = 0; i < kFallbackPose; ++i) {
         if (rejected & (1u << i)) continue;
-        const Choice c = Judge(blocked, link, owner, side, i, fovy, i == current ? pull : 0.f);
+        const Choice c = Judge(blocked, link, owner, side, i, fovy, i == current ? pull : 0.f, ray);
         if (c.ok) return c;
     }
-    return Judge(blocked, link, owner, side, kFallbackPose, fovy, kFallbackPose == current ? pull : 0.f);
+    return Judge(blocked, link, owner, side, kFallbackPose, fovy, kFallbackPose == current ? pull : 0.f, ray);
 }
-// The opening: the native side unless only the other one has a pose that fits before the fallback.
-template <class Blocked> Choice Choose(Blocked&& blocked, Vec link, Vec owner, float native_side, float fovy) {
-    const Choice a = ChooseOn(blocked, link, owner, native_side, fovy, 0);
-    if (a.ok && !a.fallback) return a;
-    const Choice b = ChooseOn(blocked, link, owner, -native_side, fovy, 0);
+// Candidate 15 (Donald's 3.6.0 play, 5-nov, duel 3: poses 0 and 1 did not fit on the native side, a wall there, and pose 2
+// was taken without looking across): both low poses gone on the native side and a lower one free on the other.
+constexpr unsigned kSwingFromPose = 2;
+// The opening: the native side unless it has no pose that fits before the fallback, or only a high one against a lower
+// one across (the blend in swings there; a tie, or pose 1 on the native side, is not worth the swing).
+template <class Blocked> Choice Choose(Blocked&& blocked, Vec link, Vec owner, float native_side, float fovy, const Vec* ray = nullptr) {
+    const Choice a = ChooseOn(blocked, link, owner, native_side, fovy, 0, kPoseCount, 0.f, ray);
+    if (a.ok && !a.fallback && a.pose < kSwingFromPose) return a;
+    const Choice b = ChooseOn(blocked, link, owner, -native_side, fovy, 0, kPoseCount, 0.f, ray);
+    if (a.ok && !a.fallback) return b.ok && !b.fallback && b.pose < a.pose ? b : a;
     if (b.ok && !b.fallback) return b;
     if (a.ok) return a;
     return b.ok ? b : a;
+}
+// During the duel, a pose dropped (Repick): the ladder on this side, then the other side's (one cut at most: the caller
+// says if it may still cut), the fallback last. Same duel 3: every pose left on the side in use was pulled to Link's back
+// and the other side was never tried. `swapped`: the choice is on the other side, the camera cuts to it.
+template <class Blocked> Choice ChooseNext(Blocked&& blocked, Vec link, Vec owner, float side, float fovy, uint32_t rejected,
+                                           uint32_t other_rejected, bool may_swap, unsigned current, float pull, const Vec* ray,
+                                           bool& swapped) {
+    swapped = false;
+    const Choice a = ChooseOn(blocked, link, owner, side, fovy, rejected, current, pull, ray);
+    if (a.ok && !a.fallback) return a;
+    if (may_swap) {
+        const Choice b = ChooseOn(blocked, link, owner, -side, fovy, other_rejected, kPoseCount, 0.f, ray);
+        if (b.ok && !b.fallback) {swapped = true; return b;}
+    }
+    return a;
 }
 // Candidate 8 (Donald's cand7 play, 4-nov 19:16: in 5 of 11 duels the camera sat on Link's back, the Salvador hidden,
 // and repicks=0 in all 11). This DLL's own wall probe pulled the camera in (probe_pulls ~1200 a duel) before hitCheck
@@ -463,7 +485,7 @@ inline float PoseEase(double h) {h = ValidH(h); return h > 0.0 ? float(1.0 - std
 // pose in use.
 class Repick {
 public:
-    void Reset(unsigned pose) {pose_ = pose; rejected_ = 0; over_ = 0; picks_ = 0;}
+    void Reset(unsigned pose) {pose_ = pose; rejected_ = 0; other_ = 0; over_ = 0; picks_ = 0; swapped_ = false;}
     // true: drop the pose in use now (the caller chooses again with rejected()).
     bool Step(float pull, double h, bool bad_frame = false) {
         h = ValidH(h);
@@ -474,11 +496,15 @@ public:
         return true;
     }
     void Took(unsigned pose) {pose_ = pose;}
+    // Candidate 15: the camera cut to the other side: that side's list, the time starts over.
+    void Swap() {const uint32_t r = rejected_; rejected_ = other_; other_ = r; over_ = 0; swapped_ = true;}
     unsigned pose() const {return pose_;}
     uint32_t rejected() const {return rejected_;}
+    uint32_t other_rejected() const {return other_;}
+    bool swapped() const {return swapped_;}
     unsigned picks() const {return picks_;}
 private:
-    unsigned pose_ = 0, picks_ = 0; uint32_t rejected_ = 0; double over_ = 0;
+    unsigned pose_ = 0, picks_ = 0; uint32_t rejected_ = 0, other_ = 0; double over_ = 0; bool swapped_ = false;
 };
 
 inline int Format(char* out, size_t n, const Summary& s) {

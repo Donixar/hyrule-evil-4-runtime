@@ -19,7 +19,7 @@
 //    engine's vibration, a few mm a frame). Every write is undone at the end (the release, an abandon, a fault); the
 //    world's next partsWorldCalc rebuilds every matrix from his motion anyway, so a missed undo heals on the next frame.
 //  * Sounds (scripts/sword_lock_salvador_sounds.py, SHA-pinned below; a missing or changed file mutes that sound only):
-//    his running engine as a loop for the whole lock; a LOUD metal clash at the Traba, on each hit break and each miss;
+//    (candidate 16: no engine loop, kEngineLoop) a LOUD metal clash at the Traba, on each hit break and each miss;
 //    his own struggle grunts (em15 waves 79, 75, 76, 81: Donald's picks), one on each hit break and one every 1.1..1.6 s
 //    of game time, and the long one when Link wins. Against Dark Link none of this plays (he has his own voices).
 // Every time is the duel's game time (60 and 165 FPS alike). Tests: tests/native/test_sword_lock_salvador.cpp.
@@ -227,6 +227,10 @@ inline const char* ShotName(unsigned i) {
     return i < kShotCount ? n[i] : "none";
 }
 constexpr uint8_t LoopBit(unsigned i) {return static_cast<uint8_t>(1u << i);}
+// Candidate 16 (Donald's 3.6.0 play, 5-nov: "solamente grita"; alone, salvador_lock_engine.wav: "solo escuche el grito"):
+// em15 wave 38 is a scream, not the chainsaw, and it looped for the whole lock since candidate 9. Off until a real motor
+// is picked by ear; the file stays pinned and loaded, nothing plays it.
+constexpr bool kEngineLoop = false;
 constexpr double kFirstGruntMs = 650;          // after the Traba
 constexpr double kGruntGapMs[] = {1150, 1500, 1300, 1600};
 constexpr double kGruntMinMs = 380;            // never two grunts closer than this (a hit right after the timed one)
@@ -252,7 +256,7 @@ public:
         const Out keep = out_;
         *this = Director();
         for (unsigned i = 0; i < kShotCount; ++i) out_.shots[i] = keep.shots[i];   // counters run for the whole session
-        on_ = true; voice_ = v; Play(kClash); out_.loops = LoopBit(kEngine); next_grunt_ = kFirstGruntMs;
+        on_ = true; voice_ = v; Play(kClash); out_.loops = kEngineLoop ? LoopBit(kEngine) : 0; next_grunt_ = kFirstGruntMs;
     }
     void Tick(const SoundFacts& f) {
         if (!on_) return;
@@ -268,7 +272,7 @@ public:
         }
         if (f.ev & (sd::kEvHit | sd::kEvRound)) Grunt(NextGrunt(), f.game_ms, false);
         else if (!f.paused && f.game_ms >= next_grunt_) Grunt(NextGrunt(), f.game_ms, false);
-        out_.loops = f.paused ? 0 : LoopBit(kEngine);
+        out_.loops = f.paused || !kEngineLoop ? 0 : LoopBit(kEngine);
     }
     void Stop() {on_ = false; out_.loops = 0;}
     const Out& out() const {return out_;}

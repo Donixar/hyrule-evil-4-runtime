@@ -5074,7 +5074,7 @@ static float g_swc_short=0.f,g_swc_raise=0.f,g_swc_raise_now=0.f,g_swc_h=0.f;sta
 static swc::Pose g_swc_pose=swc::kPoses[0],g_swc_pose_now=swc::kPoses[0];static swc::Repick g_swc_repick;
 // candidate 8: the framing of the camera actually used (after this DLL's probe and hitCheck), judged in SwcFinish
 static swcz::Matrix g_swc_mat_used{};static swcz::Vec g_swc_b_used{},g_swc_look_used{},g_swc_link_used{};static float g_swc_fovy_used=0.f;
-static bool g_swc_full=false,g_swc_bad=false;static float g_swc_live_share=0.f,g_swc_live_head=0.f;static unsigned g_swc_bad_frames=0;
+static bool g_swc_full=false,g_swc_bad=false,g_swc_cut=false;static float g_swc_live_share=0.f,g_swc_live_head=0.f;static unsigned g_swc_bad_frames=0;
 static float g_swc_fovy0=0.f,g_swc_share=0.f,g_swc_head=0.f;static unsigned g_swc_fallbacks=0;
 static swc::Bars g_swc_bars;
 static swc::Sway g_swc_sway;
@@ -5123,21 +5123,23 @@ static bool SwcPrepare(void* self,uint32_t caller,const swcz::Matrix* matrix,con
     if(!g_swc_owner_ok){SwcCamAbort(swc::End::Owner);return false;}
     const swcz::Vec link=fr.pos,b{mat.v[0][3],mat.v[1][3],mat.v[2][3]};
     const swcz::Vec ncam=swc::Add(swcz::World(mat,in.campos[0]),b),nlook=swc::Add(swcz::World(mat,in.target),b);
+    const swcz::Vec ray=swc::Add(swcz::World(mat,in.campos[1]),b);   // candidate 15: where hitCheck's ray really starts
     if(g_swc_shot.first){
         g_swc_player=fr.player;g_swc_room=fr.room;g_swc_probe_t=1.f;
         g_swc_cam.SetSide(swc::SideOf(link,g_swc_owner,ncam));
         g_swc_short=g_swc_raise=g_swc_raise_now=0.f;g_swc_raised=0;g_swc_fallbacks=0;g_swc_fovy0=in.fovy;
         g_swc_pose=g_swc_pose_now=swc::kPoses[0];g_swc_repick.Reset(0);
-        g_swc_bad=false;g_swc_live_share=0.f;g_swc_live_head=0.f;g_swc_bad_frames=0;
+        g_swc_bad=false;g_swc_cut=false;g_swc_live_share=0.f;g_swc_live_head=0.f;g_swc_bad_frames=0;
         if(g_swc_segment){   // candidate 7: the first pose of the ladder that frames both, the native side first
             const float native=g_swc_cam.side();
-            const swc::Choice c=swc::Choose(SwcBlocked,link,g_swc_owner,native,in.fovy);
+            const swc::Choice c=swc::Choose(SwcBlocked,link,g_swc_owner,native,in.fovy,&ray);
             g_swc_cam.SetSide(c.side);g_swc_pose=g_swc_pose_now=swc::kPoses[c.pose];g_swc_repick.Took(c.pose);
             g_swc_share=c.share;g_swc_head=c.head;if(c.fallback)++g_swc_fallbacks;
             SwlLog("sword_lock cinema camera side native=%.0f picked=%.0f pose=%u fallback=%u ok=%u room=%.0f share=%.2f head=%.0f fovy=%.1f "
-                "max_share=%.2f min_head=%.0f tick=%lu",static_cast<double>(native),static_cast<double>(c.side),c.pose,c.fallback?1U:0U,c.ok?1U:0U,
+                "max_share=%.2f min_head=%.0f ray_mm=%.0f tick=%lu",static_cast<double>(native),static_cast<double>(c.side),c.pose,c.fallback?1U:0U,c.ok?1U:0U,
                 static_cast<double>(c.room),static_cast<double>(c.share),static_cast<double>(c.head),static_cast<double>(in.fovy),
-                static_cast<double>(swc::kMaxLinkShare),static_cast<double>(swc::kMinHeadMm),GetTickCount());
+                static_cast<double>(swc::kMaxLinkShare),static_cast<double>(swc::kMinHeadMm),
+                static_cast<double>(swc::Len(swc::Sub(ray,swcz::Vec{link.x,link.y+swc::kShoulderY,link.z}))),GetTickCount());
         }
     }else if(fr.player!=g_swc_player||fr.room!=g_swc_room||!fr.healthy){SwcCamAbort(swc::End::Room);return false;}
     // candidate 7: hitCheck kept pulling the pose in use in: the next pose that fits on this side (fresh frames only)
@@ -5146,10 +5148,13 @@ static bool SwcPrepare(void* self,uint32_t caller,const swcz::Matrix* matrix,con
     // often fine): only the live framing (the camera really used) drops a pose
     if(!g_swc_shot.first&&fresh&&g_swc_segment&&g_swc_shot.weight>=swc::kFullWeight&&g_swc_repick.Step(0.f,h,g_swc_bad)){
         const unsigned was=g_swc_repick.pose();
-        const swc::Choice c=swc::ChooseOn(SwcBlocked,link,g_swc_owner,g_swc_cam.side(),g_swc_fovy0,g_swc_repick.rejected(),was,g_swc_short);
+        bool cut=false;   // candidate 15: this side's ladder spent: the other side, in one cut, before the fallback
+        const swc::Choice c=swc::ChooseNext(SwcBlocked,link,g_swc_owner,g_swc_cam.side(),g_swc_fovy0,g_swc_repick.rejected(),
+            g_swc_repick.other_rejected(),!g_swc_repick.swapped(),was,g_swc_short,&ray,cut);
+        if(cut){g_swc_repick.Swap();g_swc_cam.SetSide(c.side);g_swc_pose_now=swc::kPoses[c.pose];g_swc_probe_t=1.f;g_swc_cut=true;}
         g_swc_repick.Took(c.pose);g_swc_pose=swc::kPoses[c.pose];g_swc_share=c.share;g_swc_head=c.head;if(c.fallback)++g_swc_fallbacks;
-        SwlLog("sword_lock cinema camera repick from=%u to=%u fallback=%u ok=%u short=%.0f room=%.0f share=%.2f head=%.0f rejected=0x%X tick=%lu",
-            was,c.pose,c.fallback?1U:0U,c.ok?1U:0U,static_cast<double>(g_swc_short),static_cast<double>(c.room),static_cast<double>(c.share),
+        SwlLog("sword_lock cinema camera repick from=%u to=%u cut=%u side=%.0f fallback=%u ok=%u short=%.0f room=%.0f share=%.2f head=%.0f rejected=0x%X tick=%lu",
+            was,c.pose,cut?1U:0U,static_cast<double>(c.side),c.fallback?1U:0U,c.ok?1U:0U,static_cast<double>(g_swc_short),static_cast<double>(c.room),static_cast<double>(c.share),
             static_cast<double>(c.head),g_swc_repick.rejected(),GetTickCount());
         g_swc_short=0.f;g_swc_bad=false;   // measured again on the new pose
     }
@@ -5207,8 +5212,9 @@ static void SwcFinish(const void* out){
         if(l.share>g_swc_live_share)g_swc_live_share=l.share;
         if(g_swc_live_head<=0.f||l.head<g_swc_live_head)g_swc_live_head=l.head;
     }
+    const bool cut=g_swc_cut;g_swc_cut=false;   // candidate 15: the side's change lands at once, no swing behind Link's back
     if(!g_swc_snap_ok)return;
-    if(!(swce::Distance(local,g_swc_asked)>swcb::kSnapPull))return;
+    if(!cut&&!(swce::Distance(local,g_swc_asked)>swcb::kSnapPull))return;
     const uint32_t at=swczr::base+swce::rva::smooth_flag;uint32_t flag=0;
     if(!m.Writable(at,sizeof(flag))||!m.Read(at,&flag,sizeof(flag)))return;
     flag|=1U;
