@@ -402,6 +402,7 @@ struct Choice {
     unsigned pose = 0; float side = 1.f; bool fallback = false, ok = false;
     float room = 0, share = 1, head = 0;   // the pose's room, Link's share, the camera's distance to his head
     float pulled = 0;                      // candidate 17: how far hitCheck's own answer pulled the pose in (mm)
+    bool body = false;                     // candidate 20: another Ganado stands between the camera and a fighter
     View view;
 };
 // Candidate 17 (Donald's published 3.6.0, 6-nov, duel 2: hitCheck pulled every pose in by 1255..1450 mm, the Judge said each one
@@ -422,10 +423,59 @@ inline Vec RayStart(Vec native, Vec look, Vec cam, float weight) {
     const Vec duel = Add(look, Scale(Sub(cam, look), kRayStartShare));
     return Add(native, Scale(Sub(duel, native), w));
 }
+// Candidate 20 (10-nov-2026, the published 3.6.1 DLL played by the bots: in 1 of 11 locks a villager stood between the
+// camera and the fighters for the whole lock; the Judge and the live framing looked at walls and at Link's share only, and
+// the log said bad_frames=0). The other Ganados' bodies count now: a pose whose camera sees Link's chest, the Salvador's
+// chest or the look point through one of them does not fit, and the live framing calls that frame bad (Repick then drops
+// the pose). A body is an upright cylinder over its feet; the fighters themselves are never in the list.
+constexpr float kBodyRadiusMm = 450.f;    // a villager's body and the part of a fighter it would cover
+// Choosing a pose asks for more room than keeping it (10-nov, the first candidate in the game: a villager 450-650 mm off the
+// line to the Salvador passed at the opening, the sway and the camera push brought him inside and the camera cut across
+// mid-lock). The Salvador sways up to 200 mm and the camera is pushed up to 140.
+constexpr float kBodyJudgeRadiusMm = 650.f;
+constexpr float kBodyHeightMm = 1900.f;
+constexpr float kBodyTrimMm = 350.f;      // a line to a fighter starts this far off his chest (his own body, a Ganado at his back)
+constexpr unsigned kMaxBodies = 32;
+struct Bodies {
+    Vec feet[kMaxBodies]{};
+    unsigned count = 0;
+    bool Add(Vec p) {if (count >= kMaxBodies || !Finite(p)) return false; feet[count++] = p; return true;}
+};
+// The segment a->b passes through the body standing at `feet`.
+inline bool HitsBody(Vec a, Vec b, Vec feet, float radius = kBodyRadiusMm, float height = kBodyHeightMm) {
+    if (!Finite(a) || !Finite(b) || !Finite(feet) || !(radius > 0.f) || !(height > 0.f)) return false;
+    const float dx = b.x - a.x, dz = b.z - a.z, fx = a.x - feet.x, fz = a.z - feet.z;
+    const float qa = dx * dx + dz * dz, qc = fx * fx + fz * fz - radius * radius;
+    float t0 = 0.f, t1 = 1.f;   // the part of a->b over the cylinder's footprint
+    if (qa > 1e-6f) {
+        const float qb = fx * dx + fz * dz, disc = qb * qb - qa * qc;
+        if (!(disc >= 0.f)) return false;
+        const float root = std::sqrt(disc);
+        t0 = (-qb - root) / qa; t1 = (-qb + root) / qa;
+        if (t0 < 0.f) t0 = 0.f;
+        if (t1 > 1.f) t1 = 1.f;
+        if (!(t0 <= t1)) return false;
+    } else if (qc > 0.f) return false;   // a vertical segment beside it
+    const float y0 = a.y + (b.y - a.y) * t0, y1 = a.y + (b.y - a.y) * t1;
+    return (y0 > y1 ? y0 : y1) >= feet.y && (y0 < y1 ? y0 : y1) <= feet.y + height;
+}
+// A body on the camera's line to the look point or to either fighter's chest.
+inline bool BodyBetween(const Bodies* bodies, Vec cam, Vec look, Vec link, Vec owner, float radius = kBodyRadiusMm) {
+    if (!bodies || !bodies->count || !Finite(cam) || !Finite(look) || !Finite(link) || !Finite(owner)) return false;
+    const Vec ends[3] = {look, {link.x, link.y + kShoulderY, link.z}, {owner.x, owner.y + kShoulderY, owner.z}};
+    for (const Vec& e : ends) {
+        const Vec d = Sub(cam, e);
+        const float l = Len(d);
+        if (!(l > kBodyTrimMm + 1.f)) continue;
+        const Vec from = Add(e, Scale(d, kBodyTrimMm / l));
+        for (unsigned i = 0; i < bodies->count; ++i) if (HitsBody(from, cam, bodies->feet[i], radius)) return true;
+    }
+    return false;
+}
 // One pose judged: its view pulled in to the probe's room (less hitCheck's last pull when it is the pose in use).
 // Candidate 15: `ray` is hitCheck's real ray start (M * campos[1]); without a readable one, Link's shoulder over his feet.
 template <class Blocked, class Hit = NoHit> Choice Judge(Blocked&& blocked, Vec link, Vec owner, float side, unsigned pose, float fovy, float pull,
-                                                         const Vec* ray = nullptr, const Hit& hit = Hit{}) {
+                                                         const Vec* ray = nullptr, const Hit& hit = Hit{}, const Bodies* bodies = nullptr) {
     Choice c; c.pose = pose < kPoseCount ? pose : kFallbackPose; c.side = side; c.fallback = c.pose == kFallbackPose;
     c.view = PoseView(link, owner, side, kPoses[c.pose]);
     if (!c.view.ok) return c;
@@ -449,20 +499,21 @@ template <class Blocked, class Hit = NoHit> Choice Judge(Blocked&& blocked, Vec 
     // guessed at the pull hitCheck might add. With its answer the framing itself decides; a pose pulled in but still framing
     // both is better than the fallback, down to kMinFrameMm from the look point.
     const float least = answered ? kMinFrameMm : kMinRoomShare * len;
-    c.ok = room >= least && c.share <= kMaxLinkShare && c.head >= kMinHeadMm;
+    c.body = BodyBetween(bodies, cam, c.view.look, link, owner, kBodyJudgeRadiusMm);   // candidate 20
+    c.ok = room >= least && c.share <= kMaxLinkShare && c.head >= kMinHeadMm && !c.body;
     return c;
 }
 // The first pose that fits on `side`, skipping the `rejected` ones (a bit per pose); none: the fallback (ok may be
 // false: the best there is). `current` / `pull`: hitCheck's last pull counts against the pose in use only.
 template <class Blocked, class Hit = NoHit> Choice ChooseOn(Blocked&& blocked, Vec link, Vec owner, float side, float fovy, uint32_t rejected,
                                                             unsigned current = kPoseCount, float pull = 0.f, const Vec* ray = nullptr,
-                                                            const Hit& hit = Hit{}) {
+                                                            const Hit& hit = Hit{}, const Bodies* bodies = nullptr) {
     for (unsigned i = 0; i < kFallbackPose; ++i) {
         if (rejected & (1u << i)) continue;
-        const Choice c = Judge(blocked, link, owner, side, i, fovy, i == current ? pull : 0.f, ray, hit);
+        const Choice c = Judge(blocked, link, owner, side, i, fovy, i == current ? pull : 0.f, ray, hit, bodies);
         if (c.ok) return c;
     }
-    return Judge(blocked, link, owner, side, kFallbackPose, fovy, kFallbackPose == current ? pull : 0.f, ray, hit);
+    return Judge(blocked, link, owner, side, kFallbackPose, fovy, kFallbackPose == current ? pull : 0.f, ray, hit, bodies);
 }
 // Candidate 15 (Donald's 3.6.0 play, 5-nov, duel 3: poses 0 and 1 did not fit on the native side, a wall there, and pose 2
 // was taken without looking across): both low poses gone on the native side and a lower one free on the other.
@@ -470,10 +521,10 @@ constexpr unsigned kSwingFromPose = 2;
 // The opening: the native side unless it has no pose that fits before the fallback, or only a high one against a lower
 // one across (the blend in swings there; a tie, or pose 1 on the native side, is not worth the swing).
 template <class Blocked, class Hit = NoHit> Choice Choose(Blocked&& blocked, Vec link, Vec owner, float native_side, float fovy, const Vec* ray = nullptr,
-                                                          const Hit& hit = Hit{}) {
-    const Choice a = ChooseOn(blocked, link, owner, native_side, fovy, 0, kPoseCount, 0.f, ray, hit);
+                                                          const Hit& hit = Hit{}, const Bodies* bodies = nullptr) {
+    const Choice a = ChooseOn(blocked, link, owner, native_side, fovy, 0, kPoseCount, 0.f, ray, hit, bodies);
     if (a.ok && !a.fallback && a.pose < kSwingFromPose) return a;
-    const Choice b = ChooseOn(blocked, link, owner, -native_side, fovy, 0, kPoseCount, 0.f, ray, hit);
+    const Choice b = ChooseOn(blocked, link, owner, -native_side, fovy, 0, kPoseCount, 0.f, ray, hit, bodies);
     if (a.ok && !a.fallback) return b.ok && !b.fallback && b.pose < a.pose ? b : a;
     if (b.ok && !b.fallback) return b;
     if (a.ok) return a;
@@ -484,12 +535,12 @@ template <class Blocked, class Hit = NoHit> Choice Choose(Blocked&& blocked, Vec
 // and the other side was never tried. `swapped`: the choice is on the other side, the camera cuts to it.
 template <class Blocked, class Hit = NoHit> Choice ChooseNext(Blocked&& blocked, Vec link, Vec owner, float side, float fovy, uint32_t rejected,
                                                               uint32_t other_rejected, bool may_swap, unsigned current, float pull, const Vec* ray,
-                                                              bool& swapped, const Hit& hit = Hit{}) {
+                                                              bool& swapped, const Hit& hit = Hit{}, const Bodies* bodies = nullptr) {
     swapped = false;
-    const Choice a = ChooseOn(blocked, link, owner, side, fovy, rejected, current, pull, ray, hit);
+    const Choice a = ChooseOn(blocked, link, owner, side, fovy, rejected, current, pull, ray, hit, bodies);
     if (a.ok && !a.fallback) return a;
     if (may_swap) {
-        const Choice b = ChooseOn(blocked, link, owner, -side, fovy, other_rejected, kPoseCount, 0.f, ray, hit);
+        const Choice b = ChooseOn(blocked, link, owner, -side, fovy, other_rejected, kPoseCount, 0.f, ray, hit, bodies);
         if (b.ok && !b.fallback) {swapped = true; return b;}
     }
     return a;
@@ -499,13 +550,15 @@ template <class Blocked, class Hit = NoHit> Choice ChooseNext(Blocked&& blocked,
 // saw it, so hitCheck's pull stayed small and Repick never ran; the opening's Judge had said the pose fit, but the
 // fighters move during the lock. The framing is now judged on the camera actually used (after the probe and
 // hitCheck): Link wider than kMaxLinkShare of the frame, or the camera nearer his head than kMinHeadMm, counts as a pull.
-struct Live {float share = 1.f, head = 0.f; bool bad = true;};
-inline Live LiveFraming(Vec cam, Vec look, Vec link, float fovy) {
+struct Live {float share = 1.f, head = 0.f; bool bad = true, body = false;};
+// Candidate 20: with the Salvador's feet and the bodies, a Ganado between the camera and a fighter is a bad frame too.
+inline Live LiveFraming(Vec cam, Vec look, Vec link, float fovy, const Vec* owner = nullptr, const Bodies* bodies = nullptr) {
     Live l;
     if (!Finite(cam) || !Finite(look) || !Finite(link)) return l;
     l.share = LinkShare(cam, look, link, fovy);
     l.head = Len(Sub(cam, Vec{link.x, link.y + kHeadY, link.z}));
-    l.bad = !(l.share <= kMaxLinkShare) || !(l.head >= kMinHeadMm);
+    l.body = owner && BodyBetween(bodies, cam, look, link, *owner);
+    l.bad = !(l.share <= kMaxLinkShare) || !(l.head >= kMinHeadMm) || l.body;
     return l;
 }
 // Candidate 11 (Donald's cand10 log: live_share=0.00 in all 11 duels, repicks=0 since cand7): the weight's critically

@@ -5076,6 +5076,22 @@ static swc::Pose g_swc_pose=swc::kPoses[0],g_swc_pose_now=swc::kPoses[0];static 
 static swcz::Matrix g_swc_mat_used{};static swcz::Vec g_swc_b_used{},g_swc_look_used{},g_swc_link_used{};static float g_swc_fovy_used=0.f;
 static bool g_swc_full=false,g_swc_bad=false,g_swc_cut=false;static float g_swc_live_share=0.f,g_swc_live_head=0.f;static unsigned g_swc_bad_frames=0;
 static float g_swc_fovy0=0.f,g_swc_share=0.f,g_swc_head=0.f;static unsigned g_swc_fallbacks=0;
+// candidate 20 (10-nov, the bots on the published 3.6.1: a villager in front of the camera hid a whole lock, bad_frames=0): the
+// other live Ganados' feet (SwkCrowd's pool walk, reads only), judged with the poses and with the live framing
+static swc::Bodies g_swc_bodies;static unsigned g_swc_body_frames=0;
+static void SwcReadBodies(){
+    g_swc_bodies=swc::Bodies{};
+    ImageMem m;mtg::Manager pool;
+    if(!g_swl_base||mtg::ReadManager(m,g_swl_base,mtg::Config{},pool)!=mtg::Reject::None)return;   // unread: no bodies, the camera as before
+    const uint32_t owner=g_swl.owner();
+    for(unsigned i=0;i<pool.count&&i<256;++i){
+        const uint32_t at=pool.array+i*pool.block;uint32_t vtable=0;
+        if(at==owner||!m.Read(at,&vtable,4)||vtable!=g_swl_base+mtg::layout::em10_vtable_rva)continue;
+        mtg::Raw r;
+        if(mtg::ReadRaw(m,at,r)!=mtg::Reject::None||(r.be_flag&0x201)!=1||!mtg::GanadoFamily(r.id)||r.hp<=0)continue;
+        g_swc_bodies.Add({r.pos.x,r.pos.y,r.pos.z});
+    }
+}
 static swc::Bars g_swc_bars;
 static swc::Sway g_swc_sway;
 static uint32_t g_swc_sway_owner=0;static double g_swc_sway_now=-1,g_swc_sway_end=-1;static swcz::Vec g_swc_sway_wrote{};
@@ -5089,10 +5105,11 @@ static void SwcCamLines(){
     while(g_swc_cam.Take(s))if(swc::Format(line,sizeof(line),s)>0){
         SwlLog("sword_lock cinema camera end %s tick=%lu",line,GetTickCount());
         SwlLog("sword_lock cinema camera framing pose=%u repicks=%u fallbacks=%u rejected=0x%X share=%.2f head=%.0f short=%.0f fovy=%.1f fov=%.2f "
-            "live_share=%.2f live_head=%.0f bad_frames=%u tick=%lu",g_swc_repick.pose(),g_swc_repick.picks(),g_swc_fallbacks,g_swc_repick.rejected(),
+            "live_share=%.2f live_head=%.0f bad_frames=%u body_frames=%u bodies=%u tick=%lu",g_swc_repick.pose(),g_swc_repick.picks(),g_swc_fallbacks,g_swc_repick.rejected(),
             static_cast<double>(g_swc_share),static_cast<double>(g_swc_head),static_cast<double>(g_swc_short),static_cast<double>(g_swc_fovy0),
             static_cast<double>(g_swc_cfg.fov),static_cast<double>(g_swc_live_share),static_cast<double>(g_swc_live_head),g_swc_bad_frames,
-            GetTickCount());   // candidate 7; candidate 8: the worst live framing at full weight, the frames it was bad
+            g_swc_body_frames,g_swc_bodies.count,GetTickCount());   // candidate 7; candidate 8: the worst live framing at full weight, the
+            // frames it was bad; candidate 20: the frames a Ganado stood between, and how many were read
     }
 }
 static void SwcCamAbort(swc::End why){g_swc_cam.Abort(why);g_swc_engaged=false;SwcCamLines();}
@@ -5146,23 +5163,24 @@ static bool SwcPrepare(void* self,uint32_t caller,const swcz::Matrix* matrix,con
         g_swc_short=g_swc_raise=g_swc_raise_now=0.f;g_swc_raised=0;g_swc_fallbacks=0;g_swc_fovy0=in.fovy;
         g_swc_pose=g_swc_pose_now=swc::kPoses[0];g_swc_repick.Reset(0);
         g_swc_bad=false;g_swc_cut=false;g_swc_live_share=0.f;g_swc_live_head=0.f;g_swc_bad_frames=0;
+        g_swc_body_frames=0;SwcReadBodies();   // candidate 20
         if(g_swc_segment){   // candidate 7: the first pose of the ladder that frames both, the native side first
             const float native=g_swc_cam.side();
             const swcz::Vec mid=swc::PoseView(link,g_swc_owner,native,swc::kPoses[0]).look;   // candidate 17: the rays start there now
-            const swc::Choice c=swc::Choose(SwcBlocked,link,g_swc_owner,native,in.fovy,&mid,hit);
+            const swc::Choice c=swc::Choose(SwcBlocked,link,g_swc_owner,native,in.fovy,&mid,hit,&g_swc_bodies);
             g_swc_cam.SetSide(c.side);g_swc_pose=g_swc_pose_now=swc::kPoses[c.pose];g_swc_repick.Took(c.pose);
             g_swc_share=c.share;g_swc_head=c.head;if(c.fallback)++g_swc_fallbacks;
             for(int k=0;k<2;++k)for(unsigned i=0;i<swc::kPoseCount;++i){   // candidate 18: why each pose was or was not taken
                 const float sd=k?-native:native;
-                const swc::Choice t=swc::Judge(SwcBlocked,link,g_swc_owner,sd,i,in.fovy,0.f,&mid,hit);
-                SwlLog("sword_lock cinema camera try side=%.0f pose=%u ok=%u room=%.0f pulled=%.0f share=%.2f head=%.0f",static_cast<double>(sd),i,t.ok?1U:0U,
-                    static_cast<double>(t.room),static_cast<double>(t.pulled),static_cast<double>(t.share),static_cast<double>(t.head));
+                const swc::Choice t=swc::Judge(SwcBlocked,link,g_swc_owner,sd,i,in.fovy,0.f,&mid,hit,&g_swc_bodies);
+                SwlLog("sword_lock cinema camera try side=%.0f pose=%u ok=%u room=%.0f pulled=%.0f share=%.2f head=%.0f body=%u",static_cast<double>(sd),i,t.ok?1U:0U,
+                    static_cast<double>(t.room),static_cast<double>(t.pulled),static_cast<double>(t.share),static_cast<double>(t.head),t.body?1U:0U);
             }
             SwlLog("sword_lock cinema camera side native=%.0f picked=%.0f pose=%u fallback=%u ok=%u room=%.0f pulled=%.0f share=%.2f head=%.0f fovy=%.1f "
-                "max_share=%.2f min_head=%.0f ray_mm=%.0f tick=%lu",static_cast<double>(native),static_cast<double>(c.side),c.pose,c.fallback?1U:0U,c.ok?1U:0U,
+                "max_share=%.2f min_head=%.0f ray_mm=%.0f bodies=%u body=%u tick=%lu",static_cast<double>(native),static_cast<double>(c.side),c.pose,c.fallback?1U:0U,c.ok?1U:0U,
                 static_cast<double>(c.room),static_cast<double>(c.pulled),static_cast<double>(c.share),static_cast<double>(c.head),static_cast<double>(in.fovy),
                 static_cast<double>(swc::kMaxLinkShare),static_cast<double>(swc::kMinHeadMm),
-                static_cast<double>(swc::Len(swc::Sub(ray,swcz::Vec{link.x,link.y+swc::kShoulderY,link.z}))),GetTickCount());
+                static_cast<double>(swc::Len(swc::Sub(ray,swcz::Vec{link.x,link.y+swc::kShoulderY,link.z}))),g_swc_bodies.count,c.body?1U:0U,GetTickCount());
         }
     }else if(fr.player!=g_swc_player||fr.room!=g_swc_room||!fr.healthy){SwcCamAbort(swc::End::Room);return false;}
     // candidate 7: hitCheck kept pulling the pose in use in: the next pose that fits on this side (fresh frames only)
@@ -5171,15 +5189,16 @@ static bool SwcPrepare(void* self,uint32_t caller,const swcz::Matrix* matrix,con
     // often fine): only the live framing (the camera really used) drops a pose
     if(!g_swc_shot.first&&fresh&&g_swc_segment&&g_swc_shot.weight>=swc::kFullWeight&&g_swc_repick.Step(0.f,h,g_swc_bad)){
         const unsigned was=g_swc_repick.pose();
+        SwcReadBodies();   // candidate 20: where the others stand now
         bool cut=false;   // candidate 15: this side's ladder spent: the other side, in one cut, before the fallback
         const swcz::Vec mid=swc::PoseView(link,g_swc_owner,g_swc_cam.side(),swc::kPoses[0]).look;   // candidate 17
         const swc::Choice c=swc::ChooseNext(SwcBlocked,link,g_swc_owner,g_swc_cam.side(),g_swc_fovy0,g_swc_repick.rejected(),
-            g_swc_repick.other_rejected(),!g_swc_repick.swapped(),was,0.f,&mid,cut,hit);
+            g_swc_repick.other_rejected(),!g_swc_repick.swapped(),was,0.f,&mid,cut,hit,&g_swc_bodies);
         if(cut){g_swc_repick.Swap();g_swc_cam.SetSide(c.side);g_swc_pose_now=swc::kPoses[c.pose];g_swc_probe_t=1.f;g_swc_cut=true;}
         g_swc_repick.Took(c.pose);g_swc_pose=swc::kPoses[c.pose];g_swc_share=c.share;g_swc_head=c.head;if(c.fallback)++g_swc_fallbacks;
-        SwlLog("sword_lock cinema camera repick from=%u to=%u cut=%u side=%.0f fallback=%u ok=%u short=%.0f room=%.0f pulled=%.0f share=%.2f head=%.0f rejected=0x%X tick=%lu",
+        SwlLog("sword_lock cinema camera repick from=%u to=%u cut=%u side=%.0f fallback=%u ok=%u short=%.0f room=%.0f pulled=%.0f share=%.2f head=%.0f rejected=0x%X body=%u tick=%lu",
             was,c.pose,cut?1U:0U,static_cast<double>(c.side),c.fallback?1U:0U,c.ok?1U:0U,static_cast<double>(g_swc_short),static_cast<double>(c.room),static_cast<double>(c.pulled),static_cast<double>(c.share),
-            static_cast<double>(c.head),g_swc_repick.rejected(),GetTickCount());
+            static_cast<double>(c.head),g_swc_repick.rejected(),c.body?1U:0U,GetTickCount());
         g_swc_short=0.f;g_swc_bad=false;   // measured again on the new pose
     }
     if(fresh)g_swc_pose_now=swc::Lerp(g_swc_pose_now,g_swc_pose,swc::PoseEase(h));   // candidate 8: ~0.25 s, not ~5 s
@@ -5230,8 +5249,9 @@ static void SwcFinish(const void* out){
         g_swc_short=pulled>g_swc_short?pulled:g_swc_short+(pulled-g_swc_short)*swc::Clamp(g_swc_h*0.006f,0.f,1.f);
     }
     if(g_swc_full){   // candidate 8: the camera actually used (the probe's pull and hitCheck's), judged at full weight
-        const swc::Live l=swc::LiveFraming(swc::Add(swcz::World(g_swc_mat_used,local),g_swc_b_used),g_swc_look_used,g_swc_link_used,g_swc_fovy_used);
-        g_swc_bad=l.bad;if(l.bad)++g_swc_bad_frames;
+        const swc::Live l=swc::LiveFraming(swc::Add(swcz::World(g_swc_mat_used,local),g_swc_b_used),g_swc_look_used,g_swc_link_used,g_swc_fovy_used,
+            g_swc_owner_ok?&g_swc_owner:nullptr,&g_swc_bodies);   // candidate 20: a Ganado between is a bad frame too
+        g_swc_bad=l.bad;if(l.bad)++g_swc_bad_frames;if(l.body)++g_swc_body_frames;
         if(l.share>g_swc_live_share)g_swc_live_share=l.share;
         if(g_swc_live_head<=0.f||l.head<g_swc_live_head)g_swc_live_head=l.head;
     }
