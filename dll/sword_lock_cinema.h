@@ -347,10 +347,11 @@ constexpr Pose kPoses[] = {
     {0.35f, 250.f, 1.00f},    // 0: H2c's (a little behind Link, the blades' height)
     {0.12f, 550.f, 1.05f},    // 1: nearer the profile, a little up
     {-0.10f, 850.f, 1.10f},   // 2: the profile across the contact, a touch on the Salvador's side
-    {0.05f, 1350.f, 1.00f},   // 3: over the contact, looking down
-    {0.35f, 2600.f, 0.45f},   // 4: the fallback, a high three-quarter view from above (steep: over walls on both sides)
+    {0.f, 1100.f, 0.72f},     // 3: candidate 17, the near pose: pure profile, close enough to fit between two walls
+    {0.05f, 1350.f, 1.00f},   // 4: over the contact, looking down
+    {0.35f, 2600.f, 0.45f},   // 5: the fallback, a high three-quarter view from above (steep: over walls on both sides)
 };
-constexpr unsigned kPoseCount = sizeof(kPoses) / sizeof(kPoses[0]), kFallbackPose = kPoseCount - 1;
+constexpr unsigned kPoseCount = sizeof(kPoses) / sizeof(kPoses[0]), kFallbackPose = kPoseCount - 1, kNearPose = 3;
 constexpr float kLinkWidthMm = 900.f;     // Link's silhouette (shoulders, shield and sword arm) seen from the side
 constexpr float kMaxLinkShare = 1.f / 3.f;
 constexpr float kMinHeadMm = 1600.f;      // the camera never nearer his head than this
@@ -400,12 +401,31 @@ inline float LinkShare(Vec cam, Vec look, Vec link, float fovy) {
 struct Choice {
     unsigned pose = 0; float side = 1.f; bool fallback = false, ok = false;
     float room = 0, share = 1, head = 0;   // the pose's room, Link's share, the camera's distance to his head
+    float pulled = 0;                      // candidate 17: how far hitCheck's own answer pulled the pose in (mm)
     View view;
 };
+// Candidate 17 (Donald's published 3.6.0, 6-nov, duel 2: hitCheck pulled every pose in by 1255..1450 mm, the Judge said each one
+// fit, and the camera walked up the ladder to the fallback in 1.6 s on Link's back). The disassembly says why: hitCheck
+// (0x19C880) casts three rays (centre and the near plane's two sides) through its own test (0x2F1E30: EatMgr mask 0x8000 and two
+// more collision systems), and the wall probe is the Ganados' sight test (mask 0x4000), which does not see the same walls.
+// `hit(cam, look, fovy, got)`: the camera hitCheck returns when asked for cam; false: no answer (the probe's verdict stands).
+struct NoHit {bool operator()(Vec, Vec, float, Vec&) const {return false;}};
+// Where hitCheck's rays start: the native shoulder at weight 0, at full weight just off the look point toward the camera.
+// From the shoulder (~0.45 m beside Link, often against the wall he stands at) a pull lands on his back; from the look point
+// it stays on the line between the blades and the camera, both fighters in frame. Not the look point itself: hitCheck takes
+// its side vector from start to target.
+constexpr float kRayStartShare = 0.05f;
+inline Vec RayStart(Vec native, Vec look, Vec cam, float weight) {
+    if (!Finite(native) || !Finite(look) || !Finite(cam) || !std::isfinite(weight)) return native;
+    const float w = Clamp(weight, 0.f, 1.f);
+    if (w == 0.f) return native;
+    const Vec duel = Add(look, Scale(Sub(cam, look), kRayStartShare));
+    return Add(native, Scale(Sub(duel, native), w));
+}
 // One pose judged: its view pulled in to the probe's room (less hitCheck's last pull when it is the pose in use).
 // Candidate 15: `ray` is hitCheck's real ray start (M * campos[1]); without a readable one, Link's shoulder over his feet.
-template <class Blocked> Choice Judge(Blocked&& blocked, Vec link, Vec owner, float side, unsigned pose, float fovy, float pull,
-                                      const Vec* ray = nullptr) {
+template <class Blocked, class Hit = NoHit> Choice Judge(Blocked&& blocked, Vec link, Vec owner, float side, unsigned pose, float fovy, float pull,
+                                                         const Vec* ray = nullptr, const Hit& hit = Hit{}) {
     Choice c; c.pose = pose < kPoseCount ? pose : kFallbackPose; c.side = side; c.fallback = c.pose == kFallbackPose;
     c.view = PoseView(link, owner, side, kPoses[c.pose]);
     if (!c.view.ok) return c;
@@ -413,33 +433,47 @@ template <class Blocked> Choice Judge(Blocked&& blocked, Vec link, Vec owner, fl
     const float len = Len(Sub(c.view.cam, c.view.look));
     const float a = Room(blocked, c.view.look, c.view.cam);
     const float b = Room(blocked, shoulder, c.view.cam) + Len(Sub(c.view.look, shoulder));
-    const float room = Clamp((a < b ? a : b) - (pull > 0.f ? pull : 0.f), 0.f, len);
-    const Vec cam = Pull(c.view.look, c.view.cam, len > 0.f ? room / len : 0.f);
+    float room = Clamp((a < b ? a : b) - (pull > 0.f ? pull : 0.f), 0.f, len);
+    Vec cam = Pull(c.view.look, c.view.cam, len > 0.f ? room / len : 0.f);
+    Vec got{};
+    bool answered = false;
+    if (hit(cam, c.view.look, fovy, got) && Finite(got)) {   // candidate 17: the camera hitCheck would really leave
+        answered = true;
+        c.pulled = Len(Sub(got, cam)); cam = got;
+        const float left = Len(Sub(got, c.view.look));
+        if (left < room) room = left;
+    }
     c.room = room; c.share = LinkShare(cam, c.view.look, link, fovy);
     c.head = Len(Sub(cam, Vec{link.x, link.y + kHeadY, link.z}));
-    c.ok = room >= kMinRoomShare * len && c.share <= kMaxLinkShare && c.head >= kMinHeadMm;
+    // Candidate 18 (Donald's cand17 play, 6-nov: 2 of 5 duels at the high fallback with no bad frame in any): kMinRoomShare only
+    // guessed at the pull hitCheck might add. With its answer the framing itself decides; a pose pulled in but still framing
+    // both is better than the fallback, down to kMinFrameMm from the look point.
+    const float least = answered ? kMinFrameMm : kMinRoomShare * len;
+    c.ok = room >= least && c.share <= kMaxLinkShare && c.head >= kMinHeadMm;
     return c;
 }
 // The first pose that fits on `side`, skipping the `rejected` ones (a bit per pose); none: the fallback (ok may be
 // false: the best there is). `current` / `pull`: hitCheck's last pull counts against the pose in use only.
-template <class Blocked> Choice ChooseOn(Blocked&& blocked, Vec link, Vec owner, float side, float fovy, uint32_t rejected,
-                                         unsigned current = kPoseCount, float pull = 0.f, const Vec* ray = nullptr) {
+template <class Blocked, class Hit = NoHit> Choice ChooseOn(Blocked&& blocked, Vec link, Vec owner, float side, float fovy, uint32_t rejected,
+                                                            unsigned current = kPoseCount, float pull = 0.f, const Vec* ray = nullptr,
+                                                            const Hit& hit = Hit{}) {
     for (unsigned i = 0; i < kFallbackPose; ++i) {
         if (rejected & (1u << i)) continue;
-        const Choice c = Judge(blocked, link, owner, side, i, fovy, i == current ? pull : 0.f, ray);
+        const Choice c = Judge(blocked, link, owner, side, i, fovy, i == current ? pull : 0.f, ray, hit);
         if (c.ok) return c;
     }
-    return Judge(blocked, link, owner, side, kFallbackPose, fovy, kFallbackPose == current ? pull : 0.f, ray);
+    return Judge(blocked, link, owner, side, kFallbackPose, fovy, kFallbackPose == current ? pull : 0.f, ray, hit);
 }
 // Candidate 15 (Donald's 3.6.0 play, 5-nov, duel 3: poses 0 and 1 did not fit on the native side, a wall there, and pose 2
 // was taken without looking across): both low poses gone on the native side and a lower one free on the other.
 constexpr unsigned kSwingFromPose = 2;
 // The opening: the native side unless it has no pose that fits before the fallback, or only a high one against a lower
 // one across (the blend in swings there; a tie, or pose 1 on the native side, is not worth the swing).
-template <class Blocked> Choice Choose(Blocked&& blocked, Vec link, Vec owner, float native_side, float fovy, const Vec* ray = nullptr) {
-    const Choice a = ChooseOn(blocked, link, owner, native_side, fovy, 0, kPoseCount, 0.f, ray);
+template <class Blocked, class Hit = NoHit> Choice Choose(Blocked&& blocked, Vec link, Vec owner, float native_side, float fovy, const Vec* ray = nullptr,
+                                                          const Hit& hit = Hit{}) {
+    const Choice a = ChooseOn(blocked, link, owner, native_side, fovy, 0, kPoseCount, 0.f, ray, hit);
     if (a.ok && !a.fallback && a.pose < kSwingFromPose) return a;
-    const Choice b = ChooseOn(blocked, link, owner, -native_side, fovy, 0, kPoseCount, 0.f, ray);
+    const Choice b = ChooseOn(blocked, link, owner, -native_side, fovy, 0, kPoseCount, 0.f, ray, hit);
     if (a.ok && !a.fallback) return b.ok && !b.fallback && b.pose < a.pose ? b : a;
     if (b.ok && !b.fallback) return b;
     if (a.ok) return a;
@@ -448,14 +482,14 @@ template <class Blocked> Choice Choose(Blocked&& blocked, Vec link, Vec owner, f
 // During the duel, a pose dropped (Repick): the ladder on this side, then the other side's (one cut at most: the caller
 // says if it may still cut), the fallback last. Same duel 3: every pose left on the side in use was pulled to Link's back
 // and the other side was never tried. `swapped`: the choice is on the other side, the camera cuts to it.
-template <class Blocked> Choice ChooseNext(Blocked&& blocked, Vec link, Vec owner, float side, float fovy, uint32_t rejected,
-                                           uint32_t other_rejected, bool may_swap, unsigned current, float pull, const Vec* ray,
-                                           bool& swapped) {
+template <class Blocked, class Hit = NoHit> Choice ChooseNext(Blocked&& blocked, Vec link, Vec owner, float side, float fovy, uint32_t rejected,
+                                                              uint32_t other_rejected, bool may_swap, unsigned current, float pull, const Vec* ray,
+                                                              bool& swapped, const Hit& hit = Hit{}) {
     swapped = false;
-    const Choice a = ChooseOn(blocked, link, owner, side, fovy, rejected, current, pull, ray);
+    const Choice a = ChooseOn(blocked, link, owner, side, fovy, rejected, current, pull, ray, hit);
     if (a.ok && !a.fallback) return a;
     if (may_swap) {
-        const Choice b = ChooseOn(blocked, link, owner, -side, fovy, other_rejected, kPoseCount, 0.f, ray);
+        const Choice b = ChooseOn(blocked, link, owner, -side, fovy, other_rejected, kPoseCount, 0.f, ray, hit);
         if (b.ok && !b.fallback) {swapped = true; return b;}
     }
     return a;

@@ -60,6 +60,10 @@ constexpr uint8_t kSalvadorId = 0x15;      // em10 Dr. Salvador (nightcheck ENCO
 // [Combat] SwordLockPad (lab DLL only): missing = 0 (closed); "1" opens the duel on a pad; anything else counts a problem
 // and stays closed.
 struct Config {bool pad = false;};
+#if LINK_SWORD_LOCK_GRADUATED
+// 3.6.1: the published DLL does not read the key: on a pad the duel never opens.
+template <class Get> Config ReadConfig(Get&&, unsigned&) {return Config{};}
+#else
 template <class Get> Config ReadConfig(Get&& get, unsigned& problems) {
     Config c; wchar_t v[16]{};
     get(L"SwordLockPad", v, 16);
@@ -68,6 +72,7 @@ template <class Get> Config ReadConfig(Get&& get, unsigned& problems) {
     else {c.pad = false; ++problems;}
     return c;
 }
+#endif
 enum class Why : uint8_t {Ok, Owner, Device};
 inline const char* WhyName(Why w) {return w == Why::Owner ? "owner" : w == Why::Device ? "device" : "ok";}
 struct Device {bool read = false; int32_t device = -1, selector = -1;};

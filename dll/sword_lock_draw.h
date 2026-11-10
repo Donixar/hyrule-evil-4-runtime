@@ -246,7 +246,12 @@ struct Plan {
     char seq[64] = "";        // FormatSignature(sig)
 };
 // The H1c duel exactly (fixed sequence, LabSetup with the mash gain, H1c's two controls).
-inline sd::Duel::Setup FallbackSetup(sd::Difficulty d, const Config& c) {return lab::LabSetup(d, c.duel, c.mash_gain);}
+// 3.6.1: with the overtime rounds too (the 3.6.0 review: fewer than 3 keys in the bag or failed icon pins fell here, and here a duel could still draw).
+inline sd::Duel::Setup FallbackSetup(sd::Difficulty d, const Config& c) {
+    sd::Duel::Setup u = lab::LabSetup(d, c.duel, c.mash_gain);
+    u.tuning.overtime = c.overtime;
+    return u;
+}
 inline sd::Duel::Setup DrawnSetup(sd::Difficulty d, const Config& c, const sd::Sequence& s, const sd::Pool& p) {
     sd::Duel::Setup u = sd::Duel::For(d, c.duel, s, p);
     u.mash_gain = c.mash_gain;

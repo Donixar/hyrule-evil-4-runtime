@@ -5123,7 +5123,23 @@ static bool SwcPrepare(void* self,uint32_t caller,const swcz::Matrix* matrix,con
     if(!g_swc_owner_ok){SwcCamAbort(swc::End::Owner);return false;}
     const swcz::Vec link=fr.pos,b{mat.v[0][3],mat.v[1][3],mat.v[2][3]};
     const swcz::Vec ncam=swc::Add(swcz::World(mat,in.campos[0]),b),nlook=swc::Add(swcz::World(mat,in.target),b);
-    const swcz::Vec ray=swc::Add(swcz::World(mat,in.campos[1]),b);   // candidate 15: where hitCheck's ray really starts
+    const swcz::Vec ray=swc::Add(swcz::World(mat,in.campos[1]),b);   // candidate 15: where hitCheck's ray started natively
+    const swce::Inverse n=swce::Invert(mat);
+    if(!n.ok){SwcCamAbort(swc::End::Matrix);return false;}
+    // candidate 17: the poses are judged by hitCheck itself (it writes only `out` and its own stack)
+    const float duel_fovy=swc::DuelFovy(in.fovy,g_swc_cfg.fov,1.f);
+    const auto hit=[&](swcz::Vec c,swcz::Vec l,float,swcz::Vec& got)->bool{
+        if(!swczr::original_hit)return false;
+        swcz::Offset ask=in;float back[8]{};
+        ask.campos[0]=swce::Mul(n,swc::Sub(c,b));ask.campos[1]=swce::Mul(n,swc::Sub(swc::RayStart(ray,l,c,1.f),b));
+        ask.target=swce::Mul(n,swc::Sub(l,b));ask.fovy=duel_fovy;
+        if(!swc::Finite(ask.campos[0])||!swc::Finite(ask.campos[1])||!swc::Finite(ask.target))return false;
+        swczr::original_hit(self,matrix,&ask,back);
+        const swcz::Vec local{back[0],back[1],back[2]};
+        if(!swc::Finite(local))return false;
+        got=swc::Add(swcz::World(mat,local),b);
+        return true;
+    };
     if(g_swc_shot.first){
         g_swc_player=fr.player;g_swc_room=fr.room;g_swc_probe_t=1.f;
         g_swc_cam.SetSide(swc::SideOf(link,g_swc_owner,ncam));
@@ -5132,12 +5148,19 @@ static bool SwcPrepare(void* self,uint32_t caller,const swcz::Matrix* matrix,con
         g_swc_bad=false;g_swc_cut=false;g_swc_live_share=0.f;g_swc_live_head=0.f;g_swc_bad_frames=0;
         if(g_swc_segment){   // candidate 7: the first pose of the ladder that frames both, the native side first
             const float native=g_swc_cam.side();
-            const swc::Choice c=swc::Choose(SwcBlocked,link,g_swc_owner,native,in.fovy,&ray);
+            const swcz::Vec mid=swc::PoseView(link,g_swc_owner,native,swc::kPoses[0]).look;   // candidate 17: the rays start there now
+            const swc::Choice c=swc::Choose(SwcBlocked,link,g_swc_owner,native,in.fovy,&mid,hit);
             g_swc_cam.SetSide(c.side);g_swc_pose=g_swc_pose_now=swc::kPoses[c.pose];g_swc_repick.Took(c.pose);
             g_swc_share=c.share;g_swc_head=c.head;if(c.fallback)++g_swc_fallbacks;
-            SwlLog("sword_lock cinema camera side native=%.0f picked=%.0f pose=%u fallback=%u ok=%u room=%.0f share=%.2f head=%.0f fovy=%.1f "
+            for(int k=0;k<2;++k)for(unsigned i=0;i<swc::kPoseCount;++i){   // candidate 18: why each pose was or was not taken
+                const float sd=k?-native:native;
+                const swc::Choice t=swc::Judge(SwcBlocked,link,g_swc_owner,sd,i,in.fovy,0.f,&mid,hit);
+                SwlLog("sword_lock cinema camera try side=%.0f pose=%u ok=%u room=%.0f pulled=%.0f share=%.2f head=%.0f",static_cast<double>(sd),i,t.ok?1U:0U,
+                    static_cast<double>(t.room),static_cast<double>(t.pulled),static_cast<double>(t.share),static_cast<double>(t.head));
+            }
+            SwlLog("sword_lock cinema camera side native=%.0f picked=%.0f pose=%u fallback=%u ok=%u room=%.0f pulled=%.0f share=%.2f head=%.0f fovy=%.1f "
                 "max_share=%.2f min_head=%.0f ray_mm=%.0f tick=%lu",static_cast<double>(native),static_cast<double>(c.side),c.pose,c.fallback?1U:0U,c.ok?1U:0U,
-                static_cast<double>(c.room),static_cast<double>(c.share),static_cast<double>(c.head),static_cast<double>(in.fovy),
+                static_cast<double>(c.room),static_cast<double>(c.pulled),static_cast<double>(c.share),static_cast<double>(c.head),static_cast<double>(in.fovy),
                 static_cast<double>(swc::kMaxLinkShare),static_cast<double>(swc::kMinHeadMm),
                 static_cast<double>(swc::Len(swc::Sub(ray,swcz::Vec{link.x,link.y+swc::kShoulderY,link.z}))),GetTickCount());
         }
@@ -5149,12 +5172,13 @@ static bool SwcPrepare(void* self,uint32_t caller,const swcz::Matrix* matrix,con
     if(!g_swc_shot.first&&fresh&&g_swc_segment&&g_swc_shot.weight>=swc::kFullWeight&&g_swc_repick.Step(0.f,h,g_swc_bad)){
         const unsigned was=g_swc_repick.pose();
         bool cut=false;   // candidate 15: this side's ladder spent: the other side, in one cut, before the fallback
+        const swcz::Vec mid=swc::PoseView(link,g_swc_owner,g_swc_cam.side(),swc::kPoses[0]).look;   // candidate 17
         const swc::Choice c=swc::ChooseNext(SwcBlocked,link,g_swc_owner,g_swc_cam.side(),g_swc_fovy0,g_swc_repick.rejected(),
-            g_swc_repick.other_rejected(),!g_swc_repick.swapped(),was,g_swc_short,&ray,cut);
+            g_swc_repick.other_rejected(),!g_swc_repick.swapped(),was,0.f,&mid,cut,hit);
         if(cut){g_swc_repick.Swap();g_swc_cam.SetSide(c.side);g_swc_pose_now=swc::kPoses[c.pose];g_swc_probe_t=1.f;g_swc_cut=true;}
         g_swc_repick.Took(c.pose);g_swc_pose=swc::kPoses[c.pose];g_swc_share=c.share;g_swc_head=c.head;if(c.fallback)++g_swc_fallbacks;
-        SwlLog("sword_lock cinema camera repick from=%u to=%u cut=%u side=%.0f fallback=%u ok=%u short=%.0f room=%.0f share=%.2f head=%.0f rejected=0x%X tick=%lu",
-            was,c.pose,cut?1U:0U,static_cast<double>(c.side),c.fallback?1U:0U,c.ok?1U:0U,static_cast<double>(g_swc_short),static_cast<double>(c.room),static_cast<double>(c.share),
+        SwlLog("sword_lock cinema camera repick from=%u to=%u cut=%u side=%.0f fallback=%u ok=%u short=%.0f room=%.0f pulled=%.0f share=%.2f head=%.0f rejected=0x%X tick=%lu",
+            was,c.pose,cut?1U:0U,static_cast<double>(c.side),c.fallback?1U:0U,c.ok?1U:0U,static_cast<double>(g_swc_short),static_cast<double>(c.room),static_cast<double>(c.pulled),static_cast<double>(c.share),
             static_cast<double>(c.head),g_swc_repick.rejected(),GetTickCount());
         g_swc_short=0.f;g_swc_bad=false;   // measured again on the new pose
     }
@@ -5184,12 +5208,11 @@ static bool SwcPrepare(void* self,uint32_t caller,const swcz::Matrix* matrix,con
     // Link's shoulder; the rise only grows during a duel (no bob as it clears the wall) and eases in, scaled by the weight
     // (cand6's rise is superseded by candidate 7's ladder: its higher poses; g_swc_h keeps hitCheck's pull decay in game time)
     if(g_swc_shot.weight>0.f)g_swc_h=static_cast<float>(h);
-    const swce::Inverse n=swce::Invert(mat);
-    if(!n.ok){SwcCamAbort(swc::End::Matrix);return false;}
     swcz::Offset o=in;
-    o.campos[0]=swce::Mul(n,swc::Sub(cam,b));o.target=swce::Mul(n,swc::Sub(look,b));   // campos[1] (hitCheck's ray start) untouched
+    o.campos[0]=swce::Mul(n,swc::Sub(cam,b));o.target=swce::Mul(n,swc::Sub(look,b));
+    o.campos[1]=swce::Mul(n,swc::Sub(swc::RayStart(ray,look,cam,g_swc_shot.weight),b));   // candidate 17: hitCheck's rays start by the blades
     o.fovy=swc::DuelFovy(in.fovy,g_swc_cfg.fov,g_swc_shot.weight);   // candidate 7: wider during the lock (1 = native), eased
-    if(!swc::Finite(o.campos[0])||!swc::Finite(o.target)){SwcCamAbort(swc::End::Matrix);return false;}
+    if(!swc::Finite(o.campos[0])||!swc::Finite(o.campos[1])||!swc::Finite(o.target)){SwcCamAbort(swc::End::Matrix);return false;}
     out=o;g_swc_asked=o.campos[0];g_swc_engaged=true;
     g_swc_mat_used=mat;g_swc_b_used=b;g_swc_look_used=look;g_swc_link_used=link;g_swc_fovy_used=o.fovy;   // candidate 8
     g_swc_full=!g_swc_shot.first&&g_swc_segment&&g_swc_shot.weight>=swc::kFullWeight;
