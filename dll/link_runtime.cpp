@@ -90,6 +90,7 @@
 #include "shield_guard_assets.h"
 #include "parry_riposte.h"
 #include "native_hitpart.h"
+#include "native_hitpart_em39.h"   // fila 16: Dark Link's (em39) head node for the Blade Lock's win exit
 #include "native_pins.h"
 #include "fairy_revive.h"
 #include "boss_music_duck.h"
@@ -4212,6 +4213,34 @@ static void SwlEnd(const swl::World& w,const char* result,const char* reason){
         SwlFreezeName(g_swl_freeze_result),g_swl_stop_before,g_swl_stop_after,stop_end,restored?1U:0U,ssl::arm::Name(arm),
         g_swl.watch_cut()?1U:0U,g_swl_start_tick,GetTickCount(),w.readable?g_swl.ElapsedMs(w.now):-1.0);
 }
+#if LINK_SWORD_LOCK
+// Fila 16 (14-nov): Dark Link's exit blow on his head node (native_hitpart_em39.h). em39 is not em10, so ose::Fire never
+// found a hit part (`flash=no_hitpart`); in r31c (type 2/3) only the head gives em39DmCk a reaction (Dm_T_Head), whatever
+// the weapon. The same record ose::Fire publishes (ose::Args), the same checks: alive, nothing pending, the record read back.
+static const char* g_swdl_head="-";   // the em39 head verdict of the last exit (logged)
+static ose::Shot SwdlFireHead(ImageMem& m,uint32_t actor,ose::Blow blow,const float (&from)[3]){
+    namespace e39=link_runtime::native_hitpart::em39;
+    namespace nhp=link_runtime::native_hitpart;
+    e39::Ranges r;r.image_base=g_swl_base;nhp::Ranges pool;pool.image_base=g_swl_base;
+    if(nhp::ReadPool(m,g_swl_base,pool)){r.pool_base=pool.pool_base;r.pool_count=pool.pool_count;r.pool_block=pool.pool_block;}
+    e39::Node n;const e39::Verdict v=e39::Head(m,r,actor,n);g_swdl_head=e39::Name(v);
+    if(v==e39::Verdict::ReadFailed)return ose::Shot::Unreadable;
+    if(v!=e39::Verdict::Ok)return ose::Shot::NoHitpart;
+    int16_t hp=0,hp_max=0;uint8_t pending=0;float pos[3]{};
+    if(!m.Read(actor+ose::dmg::layout::hp,&hp,2)||!m.Read(actor+ose::dmg::layout::hp_max,&hp_max,2)||
+       !m.Read(actor+ose::dmg::layout::dmg_flag,&pending,1)||!m.Read(actor+ose::dmg::layout::actor_pos,pos,12))return ose::Shot::Unreadable;
+    if(hp<=0||hp_max<=0||hp>hp_max)return ose::Shot::Dead;
+    if(pending&1)return ose::Shot::Pending;
+    ose::dmg::Facts f;std::memcpy(f.from,from,sizeof(f.from));f.hitpart=n.address;f.parts_no=n.parts_no;
+    const float dx=pos[0]-from[0],dy=pos[1]-from[1],dz=pos[2]-from[2],d2=dx*dx+dy*dy+dz*dz;
+    f.hitpart_len=n.len_repaired?(std::isfinite(d2)?d2:0.f):n.len;
+    const ose::dmg::PublishArgs a=ose::Args(actor,blow,f);
+    if(!SwlPublish(a))return ose::Shot::Failed;
+    ose::dmg::Record live;
+    if(!ose::dmg::ReadRecord(m,actor,live)||ose::dmg::Mismatch(ose::dmg::Expected(a),live))return ose::Shot::Mismatch;
+    return ose::Shot::Published;
+}
+#endif
 // The exit blow on the owner, re-identified first (never a stale pointer): g_swl_shot says what happened.
 static void SwlFire(const swl::World& w){
     const ose::Blow blow=g_swl_cfg.exit==swl::Exit::Kick?ose::Blow::Charge:ose::Blow::Flash;
@@ -4220,14 +4249,14 @@ static void SwlFire(const swl::World& w){
         ImageMem m;float pos[3]{};
         if(!m.Read(w.player+0x94,pos,sizeof(pos)))g_swl_shot="no_link";
 #if LINK_SWORD_LOCK
-        else if(g_swdl_foe==swdl::Foe::DarkLink){   // the flash, else his own knock-down (the kick record); the log says which
-            const auto publish=[](const ose::dmg::PublishArgs& a){return SwlPublish(a);};
-            const ose::Shot flash=ose::Fire(m,g_swl_base,g_swl.owner(),blow,pos,publish);
+        else if(g_swdl_foe==swdl::Foe::DarkLink){   // the flash on his head node, else his own knock-down (the kick record)
+            g_swdl_head="-";
+            const ose::Shot flash=SwdlFireHead(m,g_swl.owner(),blow,pos);
             const bool charge=blow==ose::Blow::Flash&&swdl::ChargeAfter(static_cast<swdl::Shot>(flash));
-            const ose::Shot kick=charge?ose::Fire(m,g_swl_base,g_swl.owner(),ose::Blow::Charge,pos,publish):flash;
+            const ose::Shot kick=charge?SwdlFireHead(m,g_swl.owner(),ose::Blow::Charge,pos):flash;
             g_swl_shot=ose::ShotName(kick);
-            SwlLog("sword_lock darklink exit blow=%s flash=%s fallback=%s shot=%s owner=0x%08X tick=%lu",charge?"charge":ose::BlowName(blow),
-                ose::ShotName(flash),charge?"kick_0x14":"-",ose::ShotName(kick),g_swl.owner(),GetTickCount());
+            SwlLog("sword_lock darklink exit blow=%s flash=%s fallback=%s shot=%s head=%s owner=0x%08X tick=%lu",charge?"charge":ose::BlowName(blow),
+                ose::ShotName(flash),charge?"kick_0x14":"-",ose::ShotName(kick),g_swdl_head,g_swl.owner(),GetTickCount());
         }
 #endif
         else g_swl_shot=ose::ShotName(ose::Fire(m,g_swl_base,g_swl.owner(),blow,pos,[](const ose::dmg::PublishArgs& a){return SwlPublish(a);}));
@@ -4641,6 +4670,7 @@ static uint64_t g_swkw_lease=0;
 static unsigned g_swkw_targets=0,g_swkw_close=0,g_swkw_need=0,g_swkw_dropped=0,g_swkw_published=0,g_swkw_applied=0,g_swkw_skipped=0;
 static const char* g_swkw_why="-";             // why the world went on (SpinWhyName) or why there was no spin (readiness)
 static const char* g_swkw_wait="-";            // what kept SwordDecide's gate shut on the last decide without a request
+static uint32_t g_swkw_routine=0;              // Link's routine on the last decide without a request (fila 28: 0x01030B00)
 static const char* g_swkw_lease_end="-";       // the spin lease's end event (finished, cancelled, abandoned)
 static uint32_t g_swkw_player=0,g_swkw_global=0,g_swkw_room=0;   // the world at the release frame (a load ends the hold)
 static double g_swkw_deadline=0;               // the hit list's deadline set at the strike (WinSpinDeadline, game frames)
@@ -5927,7 +5957,7 @@ static void SwkEnded(const swl::World& w,const char* release){
 static void SwkWinSpinReset(){
     g_swkw=swk::WinSpinHold{};g_swkw_push.Reset();g_swkw_due=g_swkw_struck=g_swkw_lease_over=false;g_swkw_lease=0;
     g_swkw_targets=g_swkw_close=g_swkw_need=g_swkw_dropped=g_swkw_published=g_swkw_applied=g_swkw_skipped=0;
-    g_swkw_why=g_swkw_wait=g_swkw_lease_end="-";g_swkw_player=g_swkw_global=g_swkw_room=0;
+    g_swkw_why=g_swkw_wait=g_swkw_lease_end="-";g_swkw_player=g_swkw_global=g_swkw_room=0;g_swkw_routine=0;
     g_swkw_deadline=0;g_swkw_expired=g_swkw_owner_due=false;g_swkw_world_frame=0;
 }
 static bool SwkWinSpinHoldsOwner(){return g_swkw.Holding();}
@@ -5940,8 +5970,9 @@ static double SwkWinSpinDeadline(double now,double span){
 }
 static void SwkWinSpinStartLine(bool ok){
     int hp=0,hp_max=0;GreatHealth(hp,hp_max);
-    SwlLog("sword_lock duel winspin start ok=%u why=%s wait=%s lease=%llu wait_ms=%.1f requests=%u drops=%u great=1 hp=%d/%d radius=%u "
-        "permille=%u sparkles=%u sound=%u hits=0 pushed=0 excluded_owner=%u tick=%lu",ok?1U:0U,ok?"-":g_swkw_why,g_swkw_wait,
+    SwlLog("sword_lock duel winspin start ok=%u why=%s wait=%s routine=0x%08X knife_ms=%.1f knife_end_ms=%.1f lease=%llu wait_ms=%.1f "
+        "requests=%u drops=%u great=1 hp=%d/%d radius=%u permille=%u sparkles=%u sound=%u hits=0 pushed=0 excluded_owner=%u tick=%lu",
+        ok?1U:0U,ok?"-":g_swkw_why,g_swkw_wait,g_swkw_routine,g_swkw.knife_ms(),g_swkw.knife_end_ms(),
         ok?g_swkw_lease:0ULL,g_swkw.start_ms(),g_swkw.requests(),g_swkw.drops(),hp,hp_max,g_cmb.great.radius,g_cmb.great.permille,
         g_cmb.great.sparkles,g_great_spin_sound.Loaded()?1U:0U,swk::kExcludeOwner?1U:0U,GetTickCount());
 }
@@ -5959,6 +5990,7 @@ static bool SwkWinSpinBegin(mortal::dispatch::Runtime* run,const swl::World& w){
     SwlFire(w);                            // the flash 0x17 pending on the owner (stunned on its first move: the E KICK)
     const bool cancelled=SwlCancel(run);   // the hold lease back: Link free for the spin, the world still frozen
     g_swkw_player=w.player;g_swkw_global=w.global;g_swkw_room=w.room;
+    g_swkw_wait="-";g_swkw_routine=0;   // this hold's own gate, not a previous duel's
     g_swkw.Begin(w.now);
     SwiReset("end");
     SwlLog("sword_lock duel release=winspin shot=%s lease_cancel=%u great_spin=%u radius=%u permille=%u sparkles=%u bullets=%u start_max_ms=%.0f "
@@ -6047,10 +6079,14 @@ static void SwkWinSpinFrame(mortal::dispatch::Runtime* run,const swl::World& w){
         }
     }
     f.need=g_swkw_need;
+    f.decide=run!=nullptr;   // a core frame cannot request (SwkWinSpinBlocker: core_frame): it never ends the knife's wait
     if(!f.lease&&!f.requested){
         const char* b=SwkWinSpinBlocker(run,p,player);
         f.can_request=b==nullptr;
         if(b&&run)g_swkw_wait=b;
+        // Fila 28: the native knife's own put-away (or draw) on the release frame; the start waits for it (kWinSpinKnifeMs).
+        f.knife=player&&swk::KnifeWait(p.routine,g_swkw.knife_ms()>=0);
+        if(player)g_swkw_routine=p.routine;
     }
     const swk::SpinStep s=g_swkw.Tick(f);
     if(s.request)SwkWinSpinRequest(p);

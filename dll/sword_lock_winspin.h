@@ -130,6 +130,27 @@ template <class List> unsigned NeedFor(const List& list, float radius) {
 // ------------------------------------------------------------------ the hold
 inline constexpr double kWinSpinStartMs = 500;   // the spin's lease must start by then (game time from the release frame)
 inline constexpr double kWinSpinHoldMs = 900;    // the world goes on by then, whatever happened (the probe watches 1000)
+// Fila 28 (14-nov): in the 10 wins without the spin of the 6-nov and 10-nov logs (of 29), Link was in the native knife's
+// put-away (routine 0x01030B00: r1 0x0B, r2 3) on the release frame, and SwordDecide's gate (SwkWinSpinBlocker, wait=
+// routine) only starts from the held knife or a normal idle/move routine, as the charge spin's release waits for the
+// native knife-down (spin_attack_runtime.h). That put-away took 280-670 ms: 2 wins started at 303 ms, 10 hit the 500 ms
+// limit (`winspin start ok=0 why=no_start requests=0`). While Link is in the knife's own draw or put-away the start may wait
+// until kWinSpinKnifeMs, still inside the hold cap; any other busy routine keeps the 500 ms limit.
+inline constexpr double kWinSpinKnifeMs = 850;
+// The native knife's own draw (r2 0) or put-away (r2 3): r0 0, r1 0x0B. The held knife (0x01010B00) starts the spin at
+// once; the knife attack (r2 2) is not a transition the start waits for.
+inline bool KnifeTransition(uint32_t routine) {
+    if ((routine & 0xFFFF) != 0x0B00) return false;
+    const uint32_t r2 = (routine >> 16) & 0xFF;
+    return r2 == 0 || r2 == 3;
+}
+// What the start keeps waiting for: the knife's transition, and once it was seen, the normal family's steps it settles
+// into (r0 0, r1 0..4; spin_attack.h NormalFamily). Live, candidate 2 (14-nov): the put-away ended at 678.8 ms into the
+// entry step 0x00000000 for a frame before the idle 0x00010000; that frame is not startable and ended the wait at 500 ms.
+inline bool KnifeWait(uint32_t routine, bool knife_seen) {
+    if (KnifeTransition(routine)) return true;
+    return knife_seen && (routine & 0xFF) == 0 && ((routine >> 8) & 0xFF) <= 4;
+}
 inline constexpr double kWinSpinHoldFrames = kWinSpinHoldMs * 0.06;   // the same cap in game frames (60 Hz): 54
 // The hit list's deadline for the win spin (SwordDecide, its strike). The normal spin's is strike + span (span = max(24 +
 // 2 x bullets, 2 x targets) frames): a running Ganado consumes its record on the next frame, so one target per 1-2 frames.
@@ -164,6 +185,8 @@ struct SpinFacts {
     bool freeze_ok = true;     // our freeze still holds the bits it took
     bool link_taken = false;   // Link's routine r0 neither 0 (free) nor 5 (a dispatch lease): a grab, a hit
     bool can_request = false;  // a decide where SwordDecide would start the spin now (its own gate, read by the runtime)
+    bool knife = false;        // Link in the native knife's draw or put-away (KnifeTransition): the start waits longer
+    bool decide = true;        // a decide (SwordDecide's gate read); false on a core frame, where nothing can be requested
     bool requested = false;    // our request still queued (g_sword_request with lab_win)
     bool lease = false;        // our spin's lease runs
     bool struck = false;       // its strike ran (the hit list began)
@@ -180,7 +203,7 @@ class WinSpinHold {
 public:
     void Begin(double now) {
         phase_ = SpinPhase::Wait; t0_ = now; requests_ = drops_ = 0; need_ = 0; started_ = struck_ = false;
-        start_ms_ = strike_ms_ = release_ms_ = -1; why_ = SpinWhy::None;
+        start_ms_ = strike_ms_ = release_ms_ = knife_ms_ = knife_end_ms_ = -1; why_ = SpinWhy::None;
     }
     // The duel ended some other way while held (never expected: the probe has no abandon after its release).
     void Stop(double now) {if (Holding()) End(SpinWhy::Stopped, now);}
@@ -199,10 +222,17 @@ public:
         if (safety != SpinWhy::None) return Release(s, safety, f.now);
         const double t = Ms(f.now - t0_);
         if (phase_ == SpinPhase::Wait || phase_ == SpinPhase::Requested) {
+            if (f.knife && knife_ms_ < 0) knife_ms_ = t;
+            if (!f.knife && knife_ms_ >= 0 && knife_end_ms_ < 0) knife_end_ms_ = t;
             if (f.lease) {phase_ = SpinPhase::Spinning; started_ = true; start_ms_ = t; s.started = true;}
             else {
-                if (game_clock::Reached(t, kWinSpinStartMs)) return Release(s, SpinWhy::NoStart, f.now);
                 if (phase_ == SpinPhase::Requested && !f.requested) {phase_ = SpinPhase::Wait; ++drops_;}   // dropped: ask again
+                // The 500 ms limit, or kWinSpinKnifeMs while Link is still in the knife's own draw or put-away (fila 28).
+                // Once the knife was seen, 850 ms also holds on a tick that cannot judge Link (a core frame: nothing can be
+                // requested there), on a decide where Link is free (it is asked on this tick), and while that request
+                // waits for SwordDecide. The first decide that finds Link busy with something else applies 500 ms again.
+                const bool knife_wait = f.knife || (knife_ms_ >= 0 && (!f.decide || f.can_request || phase_ == SpinPhase::Requested));
+                if (game_clock::Reached(t, knife_wait ? kWinSpinKnifeMs : kWinSpinStartMs)) return Release(s, SpinWhy::NoStart, f.now);
                 if (phase_ == SpinPhase::Wait && f.can_request) {phase_ = SpinPhase::Requested; ++requests_; s.request = true;}
                 return s;
             }
@@ -230,6 +260,8 @@ public:
     double start_ms() const {return start_ms_;}     // game ms from the release frame (-1: never)
     double strike_ms() const {return strike_ms_;}
     double release_ms() const {return release_ms_;}
+    double knife_ms() const {return knife_ms_;}           // first knife draw/put-away tick while waiting (-1: none)
+    double knife_end_ms() const {return knife_end_ms_;}   // the first tick after it (-1: never seen to end)
     SpinWhy why() const {return why_;}
     double t0() const {return t0_;}                 // game time of the release frame (Begin)
     double ElapsedMs(double now) const {return Ms(now - t0_);}
@@ -238,7 +270,7 @@ private:
     SpinStep& Release(SpinStep& s, SpinWhy why, double now) {End(why, now); s.release = true; s.why = why; return s;}
     SpinPhase phase_ = SpinPhase::Off;
     SpinWhy why_ = SpinWhy::None;
-    double t0_ = 0, start_ms_ = -1, strike_ms_ = -1, release_ms_ = -1;
+    double t0_ = 0, start_ms_ = -1, strike_ms_ = -1, release_ms_ = -1, knife_ms_ = -1, knife_end_ms_ = -1;
     unsigned requests_ = 0, drops_ = 0, need_ = 0;
     bool started_ = false, struck_ = false;
 };
