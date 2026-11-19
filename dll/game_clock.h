@@ -45,7 +45,7 @@ public:
         if (!known_) { known_ = true; frame_ = frame; elapsed_ = double(frame); return elapsed_; }
         const int32_t delta = static_cast<int32_t>(frame - frame_);  // wraps like the counter
         frame_ = frame;
-        elapsed_ += double(delta) * step_;
+        elapsed_ = std::fmax(0.0, elapsed_ + double(delta) * step_);  // never below 0: at 30 FPS (step 2) a load to a lower counter gave 2*C - C1 < 0
         return elapsed_;
     }
 };

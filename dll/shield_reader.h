@@ -106,6 +106,10 @@ template<class Memory> bool ReadFrame(Memory& memory,const NativeAccess& a,const
     uint32_t player=0,global=0;
     return Word(memory,player_slot,player)&&player==f.player&&Word(memory,global_slot,global)&&global==f.global;
 }
+// STA_INTO_SHOP (status2 0x40000) can stay latched in play after the Merchant (r11c, r31d): with it the parry
+// input, the rear shield and the shield trace read "not gameplay". CombatShopFlagFix=1 (absent = 1) reads past
+// that one bit; a real shop or case is still gated by SSCRN_REQUEST/SUSPEND/STOP. Set once at startup from the INI.
+inline bool shop_flag_fix=true;
 inline bool Gameplay(const Frame& f) {
     const int hp=static_cast<int16_t>(f.health&0xFFFF),maximum=static_cast<int16_t>(f.health>>16);
     // Same verified UHD gates as the native health QA; latched ROOMJUMP remains allowed.
@@ -114,7 +118,7 @@ inline bool Gameplay(const Frame& f) {
     constexpr uint32_t stop_block=0x80000000U|0x10000000U|0x02000000U;
     constexpr uint32_t status0_block=0x10000000U|0x08000000U|0x04000000U|0x00100000U|0x00040000U|0x00001000U|0x80U;
     constexpr uint32_t status1_block=0x10000000U|2U;
-    constexpr uint32_t status2_block=0x04000000U|0x00080000U|0x00040000U|0x00008000U;
+    const uint32_t status2_block=0x04000000U|0x00080000U|0x00008000U|(shop_flag_fix?0U:0x00040000U);
     constexpr uint32_t status3_block=0x00008000U|0x00004000U|0x00002000U|0x00001000U|0x00000800U;
     return hp>0&&hp<=maximum&&(f.routine&0xFF)==3&&!(f.system&system_block)&&!(f.stop&stop_block)&&
         !(U32(f.status.data())&status0_block)&&!(U32(f.status.data()+4)&status1_block)&&

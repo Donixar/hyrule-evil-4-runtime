@@ -65,7 +65,9 @@ struct Hold {
         if(!known||id!=identity){Start(id,f);const Result r=check();if(r==Result::Fault)return false;
             blocked=r==Result::Blocked?dt:0;return blocked<kDrop;}
         if(blocked>0)blocked+=dt;
-        if(uint32_t(f-frame)>=kEvery){frame=f;const Result r=check();
+        // Also on the tick the timer runs out: the last result can be kEvery ticks old (267 ms at 30 FPS, 48 ms at
+        // 165), and the lock must not drop on a stale "blocked" after the target came back into view.
+        if(uint32_t(f-frame)>=kEvery||blocked>=kDrop){frame=f;const Result r=check();
             if(r==Result::Fault)return false;
             if(r==Result::Clear)blocked=0;else if(blocked==0)blocked=dt;}
         return blocked<kDrop;

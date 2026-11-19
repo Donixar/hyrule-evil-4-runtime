@@ -287,6 +287,63 @@ static void CartGameTime() {
         Check(!d::Run(s, c, context, f).cancel, "an unknown game time fails closed (native damage)");
     }
 }
+// The other routes' follow-ups (a Krauser blow or kick, bats, the tree swing) expire on game time as well: a pause or
+// the case right after the block must not drop them. Same bounds as before in 60 Hz frames: 6 / 30, a kick 42 / 90.
+static void FollowGameTime() {
+    auto krauser = [](unsigned char routine) {
+        d::Contact c{};
+        c.route = d::Route::Krauser;
+        c.actor.owner = 0x10000;
+        c.actor.routine[0] = 1;
+        c.actor.routine[1] = routine;
+        return c;
+    };
+    auto sphere = [](uint32_t esi) {auto h = Hit(0x15585F); h.producer_esi = esi; return h;};
+    p::input::Sample context{};
+    {
+        ComposedSources s; d::Follows f; const auto c = krauser(0x10);
+        Check(d::Run(s, c, context, f).cancel && s.consumes == 1, "arm: a non-kick blow blocked with the press");
+        s.now += 5000; s.game += 0.36; ++context.frame;   // the pause menu: wall time passes, game time does not
+        Check(d::Run(s, c, context, f).follow, "a pause after the block keeps its follow-up");
+        s.now += 6; s.game += 6.2; ++context.frame;
+        Check(!d::Run(s, c, context, f).cancel && s.consumes == 1, "a real gap (over 6 frames of game time) ends it, no second press");
+    }
+    {   // The wall clock stands still: game time alone bounds the follow-up.
+        ComposedSources s; d::Follows f; const auto c = krauser(0x10);
+        Check(d::Run(s, c, context, f).cancel, "arm: second blow");
+        for (unsigned i = 0; i != 6; ++i) {
+            s.game += 5.0; ++context.frame;
+            Check(d::Run(s, c, context, f).follow, "contacts up to 30 frames (500 ms) of game time after the block follow");
+        }
+        s.game += 0.1; ++context.frame;
+        Check(!d::Run(s, c, context, f).cancel && s.consumes == 1, "a follow-up cannot renew its 30-frame lifetime");
+    }
+    {
+        ComposedSources s; d::Follows f; const auto c = krauser(0x10);
+        Check(d::Run(s, c, context, f).cancel, "arm: third blow");
+        s.now += 6; s.game -= 3.0; ++context.frame;
+        Check(!d::Run(s, c, context, f).cancel, "a game clock that went back ends the follow-up");
+    }
+    {
+        ComposedSources s; d::Follows f; const auto c = krauser(0x2B);
+        Check(d::Run(s, c, context, f).cancel, "arm: a kick blocked on the box");
+        s.now += 5000; s.game += 1.0;
+        Check(d::FollowKick(s, sphere(c.actor.owner), c, context, f), "a pause inside the kick keeps its sphere samples followed");
+        s.game += 42.1;
+        Check(!d::FollowKick(s, sphere(c.actor.owner), c, context, f) && s.consumes == 1,
+              "over 42 frames (700 ms) of game time since the last sample: no longer that kick");
+    }
+    {
+        ComposedSources s; d::Follows f; const auto c = krauser(0x2B);
+        Check(d::Run(s, c, context, f).cancel, "arm: second kick");
+        for (unsigned i = 0; i != 3; ++i) {
+            s.game += 30.0;
+            Check(d::FollowKick(s, sphere(c.actor.owner), c, context, f), "kick samples up to 90 frames (1500 ms) after the block follow");
+        }
+        s.game += 0.1;
+        Check(!d::FollowKick(s, sphere(c.actor.owner), c, context, f), "a kick cannot renew its 90-frame lifetime");
+    }
+}
 // hunt-findings P2-1: box first. em39 tests the box (0x146172) before the leg spheres (0x15585F) in each frame; a box
 // block must cover the same kick's sphere samples, which reach tier 2 with the press already spent.
 static void KickBoxFirst() {
@@ -318,7 +375,7 @@ static void KickBoxFirst() {
         s.now = 1000 + 1500;
         Check(d::FollowKick(s, sphere(c.actor.owner), c, context, f), "kick age includes 1500 ms");
         ++s.now;
-        Check(!d::FollowKick(s, sphere(c.actor.owner), c, context, f), "a kick cannot renew its absolute lifetime");
+        s.game += 90.1; Check(!d::FollowKick(s, sphere(c.actor.owner), c, context, f), "a kick cannot renew its absolute lifetime");
     }
     for (unsigned bad = 0; bad != 11; ++bad) {
         ComposedSources s; d::Follows f; auto c = krauser(); auto ctx = context;
@@ -333,7 +390,7 @@ static void KickBoxFirst() {
         if (bad == 5) ++s.resource.resource;          // another Link resource
         if (bad == 6) s.safe = false;
         if (bad == 7) s.blocked = true;
-        if (bad == 8) s.now += 701;                   // past the kick gap
+        if (bad == 8) {s.now += 701; s.game += 42.1;} // past the kick gap (game time decides)
         if (bad == 9) c.actor.routine[1] = 0x10;      // not a kick routine
         if (bad == 10) c.route = d::Route::Bats;
         Check(!d::FollowKick(s, h, c, ctx, f) && s.consumes == 1, "box-first bridge rejects other producers, kicks, contexts and gaps");
@@ -402,7 +459,7 @@ static void KickGap() {
     s.now = 2500;
     Check(d::Run(s, c, context, f).follow, "kick age includes 1500 ms boundary");
     ++s.now;
-    Check(!d::Run(s, c, context, f).cancel, "kick cannot renew its absolute lifetime");
+    s.game += 90.1; Check(!d::Run(s, c, context, f).cancel, "kick cannot renew its absolute lifetime");
     for (unsigned bad = 0; bad != 15; ++bad) {
         ComposedSources n;
         d::Follows slots;
@@ -428,7 +485,7 @@ static void KickGap() {
         if (bad == 10) ++actor_contact.actor.guid;
         if (bad == 11) ++ctx.room;
         if (bad == 12) ++n.resource.resource;
-        if (bad == 13) n.now += 368;
+        if (bad == 13) {n.now += 368; n.game += 42.1;}
         if (bad == 14) n.At(0, -500);
         Check(!d::Run(n, actor_contact, ctx, slots).cancel, "kick follow rejects new routines, identities, context, rear and long gaps");
     }
@@ -445,6 +502,7 @@ int main(int argc, char** argv) {
     DirectComposition();
     CartRunFollow();
     CartGameTime();
+    FollowGameTime();
     KickBoxFirst();
     KickGap();
     ActorContracts();

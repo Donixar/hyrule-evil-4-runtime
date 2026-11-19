@@ -1887,6 +1887,9 @@ static bool g_oca_theme_ok=false;                 // the recording loaded (else 
 // OcarinaSongPlayback (18-oct): the whole song (link_ocarina_play_<song>.wav, backing + ocarina lead) as the replay.
 // 1..3 play Serenity/Sheik/Epona, 4 fade all out; taken by the worker.
 static std::atomic<int> g_oca_play{0};
+// GetTickCount of the last player dispatch (end of OcarinaDecide / OcarinaObserve). The worker holds a playing recording
+// while it is stale (oca::BeatStale): the replay's timeline is game steps, and none run under a pause, the case or a load.
+static std::atomic<uint32_t> g_oca_beat{0};
 static bool g_oca_play_ok[3]={};                  // that song's recording loaded (else the 17-oct replay)
 static int g_oca_play_hp=-1;                      // Link's HP when the song matched (damage cuts the playback)
 static bool g_oca_song_was_busy=false;
@@ -1971,7 +1974,8 @@ struct OcaHost {
         if(!link_runtime::IsPointer(player))return false;
         if(g_oca_session.state()==oca::State::Idle){
             LocalMemory m;link_runtime::HealthState health;unsigned costume=0;
-            if(!link_runtime::ReadHealth(m,g_oca_player_slot,g_oca_global_slot,health)||!health.eligible||health.player!=player)return false;
+            // Past a latched STA_INTO_SHOP, like the combat skills (g_cmb_shop_flag_fix is declared further down).
+            if(!link_runtime::low_health::ReadHealth(m,g_oca_player_slot,g_oca_global_slot,link_runtime::shield::shop_flag_fix,health)||!health.eligible||health.player!=player)return false;
             if(!link_runtime::ReadSwordCostume(m,g_oca_player_slot,g_oca_global_slot,costume))return false;
             if(g_oca_cfg.mount&&ocr::CostumeAsset(costume)<0)return false;
             if(g_oca_run&&g_oca_run->active)return false;              // Mortal Draw (or anything) owns the body
@@ -1981,7 +1985,7 @@ struct OcaHost {
         }
         if(g_oca_session_player&&player!=g_oca_session_player)return false;
         LocalMemory m;link_runtime::HealthState health;
-        if(!link_runtime::ReadHealth(m,g_oca_player_slot,g_oca_global_slot,health)||!health.eligible)return false;
+        if(!link_runtime::low_health::ReadHealth(m,g_oca_player_slot,g_oca_global_slot,link_runtime::shield::shop_flag_fix,health)||!health.eligible)return false;
         return !(g_oca_cfg.pose&&g_oca_lease_lost);
     }
     // Ready = knife in hand (bit 8 of m_pKnife) or, with Pose=1, outside steady
@@ -2189,7 +2193,7 @@ static void __cdecl OcarinaDecide(mortal::dispatch::Runtime& run,void* player){
     g_oca_run=&run;
     LocalMemory m;
     link_runtime::HealthState health;
-    const bool gameplay=link_runtime::ReadHealth(m,g_oca_player_slot,g_oca_global_slot,health)&&health.eligible&&
+    const bool gameplay=link_runtime::low_health::ReadHealth(m,g_oca_player_slot,g_oca_global_slot,link_runtime::shield::shop_flag_fix,health)&&health.eligible&&
         health.player==reinterpret_cast<uint32_t>(player);
     if(g_oca_cfg.item&&g_oca_session.state()==oca::State::Idle){OcaItemHost item;item.gameplay=gameplay;g_oca_grant.Tick(item);
         if(g_oca_manual_on){OcaManualRows();if(g_oca_manual_on)g_oca_manual.Tick(item);}}
@@ -2221,6 +2225,7 @@ static void __cdecl OcarinaDecide(mortal::dispatch::Runtime& run,void* player){
     if(g_oca_session.state()==oca::State::Playing)g_oca_song.OnOpen(g_oca_session.token());
     g_oca_song.Tick(g_oca_song_host,false,GameStep(g_oca_global_slot));
     OcaStaffPaint(gameplay);
+    g_oca_beat.store(static_cast<uint32_t>(GetTickCount()),std::memory_order_release);   // last: this dispatch's stop requests are already posted
     uint32_t on=0;m.Read32(g_oca_input,on);
     if(g_oca_knife.Suppress(on)){
         OcaSuppressKnife();
@@ -2236,6 +2241,7 @@ static void __cdecl OcarinaObserve(mortal::dispatch::Runtime& run,void*){
     ocr::Frame(g_oca_session,g_oca_host,{},true,GameStep(g_oca_global_slot));
     g_oca_song.Tick(g_oca_song_host,true,GameStep(g_oca_global_slot));
     OcaStaffPaint(false);   // native frames: units and texture freed
+    g_oca_beat.store(static_cast<uint32_t>(GetTickCount()),std::memory_order_release);   // last: this dispatch's stop requests are already posted
     link_runtime::parry::input::SetOcarinaBlocks(g_oca_session.BlocksParry());
 }
 static void __cdecl CombinedObserve(mortal::dispatch::Runtime& run,void* player){
@@ -4108,8 +4114,9 @@ static bool SwordLockGuard(const link_runtime::parry::Candidate& c){
     const uint32_t owner=s.Owner(c);
     if(!owner)return false;
     const double now=GameNow(g_swl_global_slot);
-    // H1c lab: only while the world is ours (the duel and its exit slide); afterwards the rearmed Follow alone (no extra
-    // invulnerability), and a landing contact of the owner counts in the after watch.
+    // H1c lab: only while the world is ours (the duel and its exit slide) and through a win's Great Spin, whose lease
+    // keeps tier 2 from the rearmed Follow (SwkGuarding); afterwards the Follow alone (no extra invulnerability), and a
+    // landing contact of the owner counts in the after watch.
     const bool lab=g_swk_on.load(std::memory_order_acquire);
     const bool guard=owner==g_swl.owner()&&(lab?SwkGuarding():g_swl.Guarding(now));
     if(lab&&!guard&&owner==g_swl.owner())SwkHit();
@@ -5660,8 +5667,10 @@ static void SwkQueued(const link_runtime::parry::general::Applied& a){
     g_swk_swing=swk::Save(g_gen.follow);
     std::memcpy(g_swk_hit,a.hit,sizeof(g_swk_hit));
 }
-// The lab guard: only while the world is ours (the duel and its exit slide), as the frozen owner cannot swing then.
-static bool SwkGuarding(){return g_swl.Holding()||g_swk.Holding();}
+// The lab guard: while the world is ours (the duel and its exit slide), as the frozen owner cannot swing then, and
+// through a win's Great Spin after the world goes on: its lease blocks tier 2 (mortal_blocks), so the Follow rearmed at
+// the release cannot cancel the owner's resumed swing when the flash was not published (6-nov: input_blocked, 800 landed).
+static bool SwkGuarding(){return g_swl.Holding()||g_swk.Holding()||(g_sword_action.lease&&g_sword_action.request.lab_win);}
 static void SwkHit(){if(g_swk.stage()==swk::Stage::After)++g_swk_hits;}
 static bool SwkNoSwing(){return !g_swk_forced&&(!g_swk_swing.valid||!g_swk_swing.known);}   // a forced request has no swing (waived)
 // Admission (the decide frame after the block): another hostile live Ganado within SwordLockCrowdMm of Link, or a
@@ -6333,7 +6342,11 @@ static void SwordLockPad(){
     // The MENUS binding set (a pause or a menu opened mid-duel): its Enter/Esc/arrows pass and feed nothing to the duel.
     const swk::PadOut o=g_swk.Pad(on,trg,swk::ReadContext(m,g_swk_base));
     if(o.write){m.Write(g_swk_base+ck::rva::kKeyOn,&o.on,4);m.Write(g_swk_base+ck::rva::kKeyTrg,&o.trg,4);}
-    if(g_swi_painter.visible()&&swk::Paused(swk::ReadContext(m,g_swk_base)))SwiPause();   // the icon hides in a pause (no player frame there)
+    if(swk::Paused(swk::ReadContext(m,g_swk_base))){   // no player frame runs under a menu: SwkFrame cannot hide or silence there
+        if(g_swi_painter.visible())SwiPause();
+        // The directors keep their state: the next duel tick publishes the loops again (or SwkEnded their silence).
+        g_sws_loops.store(0,std::memory_order_release);g_swsv_loops.store(0,std::memory_order_release);g_swdl_loops.store(0,std::memory_order_release);
+    }
     if(o.released)SwlLog("sword_lock duel mask off held=0x00000000 at=release real_on=0x%08X frame=%u tick=%lu",on,CmbFrame(),GetTickCount());
 }
 // The arbiter entry (after the Mortal Draw prompt and the H1a census, which keep priority): the duel's one native offer
@@ -6596,7 +6609,7 @@ static void __cdecl CombinedDecide(mortal::dispatch::Runtime& run,void* player){
 // is queued after that ramp, so it starts once the fade ends (review I2).
 class OcaNoteVoice {
     HWAVEOUT out=nullptr;WAVEHDR main{},ramp{};link_runtime::WaveData wave;std::vector<int16_t> tail;
-    unsigned block=2;DWORD base=0;bool ramp_prepared=false;
+    unsigned block=2;DWORD base=0;bool ramp_prepared=false,held=false;   // held: the device is paused under a playing recording (Hold)
     void DropRamp(){if(ramp_prepared){waveOutUnprepareHeader(out,&ramp,sizeof(ramp));ramp_prepared=false;}}
 public:
     ~OcaNoteVoice(){if(out){waveOutReset(out);DropRamp();waveOutUnprepareHeader(out,&main,sizeof(main));waveOutClose(out);}}
@@ -6620,13 +6633,23 @@ public:
         if(waveOutPrepareHeader(out,&main,sizeof(main))!=MMSYSERR_NOERROR){waveOutClose(out);out=nullptr;return false;}
         return true;
     }
+    // The flow that times this recording is not running (pause menu, case, load): the device waits in place and goes on
+    // from the same sample. Only a playing recording is held; Play and FadeStop let go of it themselves.
+    void Hold(bool on){
+        if(!out||on==held)return;
+        if(on){if(!(main.dwFlags&WHDR_INQUEUE)||waveOutPause(out)!=MMSYSERR_NOERROR)return;}
+        else waveOutRestart(out);
+        held=on;
+    }
     bool Play(){
+        if(held){waveOutReset(out);waveOutRestart(out);held=false;}   // left held with no stop: drop it, the device runs again
         if(!out||(main.dwFlags&WHDR_INQUEUE))return false;
         if(ramp_prepared&&(ramp.dwFlags&WHDR_INQUEUE))base=ramp.dwBufferLength;   // plays right after the fade
         else {waveOutReset(out);DropRamp();base=0;}                              // position counter back to 0
         return waveOutWrite(out,&main,sizeof(main))==MMSYSERR_NOERROR;
     }
     void FadeStop(){
+        if(held){waveOutReset(out);DropRamp();waveOutRestart(out);held=false;return;}   // held = already silent: cut, no fade tail
         if(!out||!(main.dwFlags&WHDR_INQUEUE))return;
         MMTIME t{};t.wType=TIME_BYTES;
         const bool known=waveOutGetPosition(out,&t,sizeof(t))==MMSYSERR_NOERROR&&t.wType==TIME_BYTES&&t.u.cb>=base;
@@ -6870,11 +6893,16 @@ struct OcaWorker {
         }
         if(g_oca_cfg.notes){if(!focused)g_oca_audio.FadeStop();consumer.Poll(g_oca_notes,g_oca_audio);}
         if(g_oca_jingle.exchange(false,std::memory_order_acq_rel))g_oca_jingle_voice.Play();
+        // Read before the requests below: a dispatch posts its stop first and its stamp last, so a fresh stamp never
+        // lets a recording go on that the same dispatch just stopped (a load from the pause menu).
+        const uint32_t oca_beat=g_oca_beat.load(std::memory_order_acquire);
+        const bool oca_stale=oca::BeatStale(static_cast<uint32_t>(GetTickCount()),oca_beat);
         switch(g_oca_theme.exchange(0,std::memory_order_acq_rel)){case 1:g_oca_theme_voice.Play();break;case 2:g_oca_theme_voice.FadeStop();break;default:break;}
         if(!focused)g_oca_theme_voice.FadeStop();
         if(const int pv=g_oca_play.exchange(0,std::memory_order_acq_rel)){
             if(pv>=1&&pv<=3)g_oca_play_voice[pv-1].Play();else for(auto& v:g_oca_play_voice)v.FadeStop();}
         if(!focused)for(auto& v:g_oca_play_voice)v.FadeStop();
+        g_oca_theme_voice.Hold(oca_stale);for(auto& v:g_oca_play_voice)v.Hold(oca_stale);   // no player dispatch: the recordings wait with the flow
         switch(g_oca_effect_sound.exchange(0,std::memory_order_acq_rel)){case 1:g_oca_flash_voice.Play();break;case 2:g_oca_howl_voice.Play();break;default:break;}
         unsigned r=g_oca_read.load(std::memory_order_relaxed);const unsigned w=g_oca_write.load(std::memory_order_acquire);
         while(r!=w){
@@ -6898,16 +6926,17 @@ static bool StartMortalTrial(unsigned char* base,unsigned size,const wchar_t* di
         if(contextual){
         std::vector<unsigned char> fcv,seq,wav;
         if(!MortalRead(directory,L"link_mortal_draw.fcv",mortal::resident_assets::fcv_size,fcv)||
-           !MortalRead(directory,L"link_mortal_draw.seq",mortal::resident_assets::seq_size,seq)||
-           !MortalRead(directory,L"link_mortal_draw_voice.wav",80220,wav)){Log("MortalDrawTrial disabled: exact-size assets missing");return false;}
+           !MortalRead(directory,L"link_mortal_draw.seq",mortal::resident_assets::seq_size,seq)){Log("MortalDrawTrial disabled: exact-size assets missing");return false;}
+        const bool voice_file=MortalRead(directory,L"link_mortal_draw_voice.wav",80220,wav);   // optional: this setup is the only start of the shared player dispatch, so the voice must not gate it
         unsigned char digest[32]{};
-        if(!mortal::resident_assets::detail::Hash(wav.data(),wav.size(),digest)||!mortal::resident_assets::detail::Matches(digest,"de80acce33c0757dc941b9d764f967a55d02300ad527999d30584283a53c1e7d")){Log("MortalDrawTrial disabled: voice pin");return false;}
+        const bool voice_pinned=voice_file&&mortal::resident_assets::detail::Hash(wav.data(),wav.size(),digest)&&mortal::resident_assets::detail::Matches(digest,"de80acce33c0757dc941b9d764f967a55d02300ad527999d30584283a53c1e7d");
         const auto prepared=mortal::resident_assets::Prepare(fcv.data(),fcv.size(),seq.data(),seq.size());
         if(prepared!=mortal::resident_assets::Result::Prepared&&prepared!=mortal::resident_assets::Result::Reused){Log("MortalDrawTrial disabled: asset pins %u",static_cast<unsigned>(prepared));return false;}
-        wchar_t path[MAX_PATH]{};if(link_runtime::paths::Format(path,L"%slink_mortal_draw_voice.wav",directory)<0||!audio.Load(path,35,"de80acce33c0757dc941b9d764f967a55d02300ad527999d30584283a53c1e7d")){Log("MortalDrawTrial disabled: voice backend");return false;}
+        wchar_t path[MAX_PATH]{};const bool voice_ready=voice_pinned&&link_runtime::paths::Format(path,L"%slink_mortal_draw_voice.wav",directory)>=0&&audio.Load(path,35,"de80acce33c0757dc941b9d764f967a55d02300ad527999d30584283a53c1e7d");if(!voice_ready)Log("MortalDrawContextual voice silent: file=%u pin=%u (link_mortal_draw_voice.wav missing or changed, or no audio device); the clip and the player dispatch still start",voice_file?1U:0U,voice_pinned?1U:0U);   // an unloaded AlertVoice never plays (Play returns false)
         }
         // Ocarina (Task 10): its own resident files and pins; a failure leaves Mortal Draw as before.
-        if(ocarina_wanted&&!StartOcarina(n,directory)){ocarina_wanted=false;if(!contextual&&!sword_wanted&&!ztarget_face)return false;}
+        // The HUD is a dispatch user too (the worker's mortal_native counts it): a failed ocarina must not take the hearts away.
+        if(ocarina_wanted&&!StartOcarina(n,directory)){ocarina_wanted=false;if(!contextual&&!sword_wanted&&!ztarget_face&&!g_hud_cfg.Any())return false;}
         auto status=MH_Initialize();if(status!=MH_OK&&status!=MH_ERROR_ALREADY_INITIALIZED)return false;
         status=mortal::dispatch_hooks::Prepare(n);if(status!=MH_OK){Log("MortalDrawTrial disabled: prepare %s",MH_StatusToString(status));return false;}
         g_mortal_native=n;auto& run=mortal::dispatch_hooks::runtime;
@@ -7363,6 +7392,7 @@ static DWORD WINAPI Worker(LPVOID) {
     bool low_health = GetPrivateProfileIntW(L"LinkRuntime", L"LowHealth", 0, path) == 1;
     const bool low_health_shop_fix = GetPrivateProfileIntW(L"LinkRuntime", L"LowHealthShopFlagFix", 1, path) == 1;
     g_cmb_shop_flag_fix = GetPrivateProfileIntW(L"LinkRuntime", L"CombatShopFlagFix", 1, path) == 1;
+    link_runtime::shield::shop_flag_fix = g_cmb_shop_flag_fix;   // parry input, rear shield and ocarina follow the same switch
     Log("combat shop_flag_fix=%u (CombatShopFlagFix)", g_cmb_shop_flag_fix ? 1U : 0U);
     bool trace = GetPrivateProfileIntW(L"LinkRuntime", L"TraceKnife", 0, path) == 1;
     link_runtime::chapter::Config chapter_settings;

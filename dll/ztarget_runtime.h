@@ -1238,9 +1238,12 @@ inline bool Start(uint32_t image,const wchar_t* ini,bool(*busy_fn)(),Logger log,
         if(lock_sound){
             wchar_t dir[MAX_PATH]{};const bool path_ok=paths::Copy(dir,ini)==0;
             wchar_t* slash=path_ok?std::wcsrchr(dir,L'\\'):nullptr;if(slash)slash[1]=0;
-            const unsigned volume=GetPrivateProfileIntW(L"ZTarget",L"LockSoundVolumePercent",70,ini);
-            const unsigned loaded=slash?voices.Load(dir,volume<=100?volume:70):0;
-            log("ZTarget lock sounds loaded=%u/2 volume=%u (link_ztarget_lock.wav / link_ztarget_unlock.wav)",loaded,volume<=100?volume:70);
+            // Missing or out of range: 30, the shipped value (24-oct: at 70 the release rang like a loud bell).
+            const unsigned volume_raw=GetPrivateProfileIntW(L"ZTarget",L"LockSoundVolumePercent",30,ini);
+            const unsigned volume=volume_raw<=100?volume_raw:30;
+            if(volume!=volume_raw)log("ZTarget LockSoundVolumePercent=%u invalid (0..100); using %u",volume_raw,volume);
+            const unsigned loaded=slash?voices.Load(dir,volume):0;
+            log("ZTarget lock sounds loaded=%u/2 volume=%u (link_ztarget_lock.wav / link_ztarget_unlock.wav)",loaded,volume);
             if(!loaded)lock_sound=false;
         }
     }

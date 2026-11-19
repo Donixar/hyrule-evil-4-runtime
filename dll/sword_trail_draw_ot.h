@@ -127,6 +127,10 @@ inline uint32_t base=0,global_slot=0;inline Natives natives;
 inline thread_binding::Binding owner;   // the submitting game thread (skills-fix-01: handed over once it exited)
 inline bool have_generation=false;inline uint32_t last_generation=0;inline unsigned slot_index=0;
 inline FrameData ring[kRing];
+// The additive strip (Zelda's ray) has its own guard and slots: her partner's beam is submitted before Link's ribbon in
+// the same generation, and a shared guard dropped the ribbon and the tracers (SameGeneration) while the beam showed.
+inline bool have_add=false;inline uint32_t last_add=0;inline unsigned slot_add=0;
+inline FrameData ring_add[kRing];
 inline std::atomic<unsigned> frames_drawn{0},quads{0},reg_fails{0},draw_fails{0},restore_missing{0},reg_wrong_thread{0},
     reg_failed{0},reg_refused{0},restore_skipped{0},batch_closed{0},reg_behind{0},reg_near{0},reg_clamped{0};
 inline Stats Snapshot(){
@@ -143,7 +147,7 @@ inline int FormatStats(char* out,size_t size,unsigned spins,unsigned samples,uns
         s.restore_skipped,s.batch_closed,s.reg_behind,s.reg_near,s.reg_clamped);
 }
 inline void Start(uint32_t image_base,uint32_t global,const Natives& n){
-    base=image_base;global_slot=global;natives=n;owner.Reset();have_generation=false;
+    base=image_base;global_slot=global;natives=n;owner.Reset();have_generation=have_add=false;
     ready.store(true,std::memory_order_release);
 }
 inline bool Emitted(const gx::Api& a,const FrameData& d,const float view[12],Progress& progress,int dst=gx::kDstInvSrcAlpha){
@@ -201,9 +205,11 @@ inline Result Submit(const core::Quad* q,int n,const core::Style& st,int dst=gx:
     if(!thread_binding::Serves(owner.Take())){reg_fails.fetch_add(1);reg_wrong_thread.fetch_add(1);return Result::WrongThread;}
     uint32_t global=0,generation=0;
     if(!gx::Get(global_slot,global)||!gx::Pointer(global)||!gx::Get(global+gx::kGlobalGeneration,generation))return Result::NoGeneration;
-    if(have_generation&&generation==last_generation)return Result::SameGeneration;
-    have_generation=true;last_generation=generation;
-    FrameData& d=ring[slot_index++%kRing];
+    const bool add=dst==gx::kDstOne;   // one node per generation and blend
+    bool& have=add?have_add:have_generation;uint32_t& last=add?last_add:last_generation;
+    if(have&&generation==last)return Result::SameGeneration;
+    have=true;last=generation;
+    FrameData& d=add?ring_add[slot_add++%kRing]:ring[slot_index++%kRing];
     if(!Build(q,n,st,d)){d.quads=0;reg_fails.fetch_add(1);reg_failed.fetch_add(1);return Result::Failed;}
     d.generation=generation;d.dst=dst;
     switch(RegisterNode(natives,global,&d,&Draw,d.v,d.quads*4,d.centre)){

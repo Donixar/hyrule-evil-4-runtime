@@ -139,6 +139,10 @@ inline uint32_t base=0,global_slot=0;inline ot::runtime::Natives natives;
 inline thread_binding::Binding owner;   // the submitting game thread (skills-fix-01: handed over once it exited)
 inline bool have_generation=false;inline uint32_t last_generation=0;inline unsigned slot_index=0;
 inline ot::FrameData ring[ot::kRing];
+// Zelda's hand star (zelda_light_runtime.h HandStar) has its own guard and slots: the partner's cast runs before Link's
+// ChargeFrame in the same generation, and a shared guard dropped his charge glow while her star showed.
+inline bool have_star=false;inline uint32_t last_star=0;inline unsigned slot_star=0;
+inline ot::FrameData ring_star[ot::kRing];
 inline std::atomic<unsigned> frames_drawn{0},quads{0},reg_fails{0},draw_fails{0},restore_missing{0},restore_skipped{0},batch_closed{0},
     reg_refused{0},reg_behind{0},reg_near{0},reg_clamped{0};
 inline Stats Snapshot(){
@@ -146,7 +150,7 @@ inline Stats Snapshot(){
         batch_closed.load(),reg_refused.load(),reg_behind.load(),reg_near.load(),reg_clamped.load()};
 }
 inline void Start(uint32_t image_base,uint32_t global,const ot::runtime::Natives& n){
-    base=image_base;global_slot=global;natives=n;owner.Reset();have_generation=false;
+    base=image_base;global_slot=global;natives=n;owner.Reset();have_generation=have_star=false;
     ready.store(true,std::memory_order_release);
 }
 // OT callback (table 17): the trail's fault handling (sword_trail_draw_ot.h Draw), with the additive blend. No blend
@@ -177,15 +181,16 @@ inline void __cdecl Draw(void* data){
 // This frame's glow, once per native generation (pG+0x530C). The view is the native one at the submit. WrongThread,
 // Failed (non-finite input or no view) and Refused (0xFFFF at the RegisterNode point) count as reg_fails; Empty (both
 // alphas 0) registers nothing; Hidden (wholly behind the eye plane or within zlimit) counts in reg_behind / reg_near.
-inline Result Submit(const Look& look,const Vec3& blade_base,const Vec3& blade_tip){
+inline Result Submit(const Look& look,const Vec3& blade_base,const Vec3& blade_tip,bool hand_star=false){
     if(!ready.load(std::memory_order_acquire))return Result::NotReady;
     if(!thread_binding::Serves(owner.Take())){reg_fails.fetch_add(1);return Result::WrongThread;}
     uint32_t global=0,generation=0;
     if(!gx::Get(global_slot,global)||!gx::Pointer(global)||!gx::Get(global+gx::kGlobalGeneration,generation))return Result::NoGeneration;
-    if(have_generation&&generation==last_generation)return Result::SameGeneration;
-    have_generation=true;last_generation=generation;
+    bool& have=hand_star?have_star:have_generation;uint32_t& last=hand_star?last_star:last_generation;
+    if(have&&generation==last)return Result::SameGeneration;
+    have=true;last=generation;
     float view[12]{};gx::SehMem m;
-    ot::FrameData& d=ring[slot_index++%ot::kRing];
+    ot::FrameData& d=hand_star?ring_star[slot_star++%ot::kRing]:ring[slot_index++%ot::kRing];
     if(!m.Read(global+gx::kGlobalView,view,sizeof(view))||!Build(look,blade_base,blade_tip,view,d)){
         d.quads=0;reg_fails.fetch_add(1);return Result::Failed;
     }

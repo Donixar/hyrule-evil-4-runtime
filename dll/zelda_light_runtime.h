@@ -144,7 +144,7 @@ static void HandStar(double age,const ::sword_trail::Vec3& hand,float yaw){
     if(!g.star||!g_charge_on.load(std::memory_order_acquire))return;
     schg::Look look;look.rgb=zl::kGold;look.glow_alpha=0;look.star_alpha=g.star;look.progress=1;look.star_scale=g.scale;
     const ::sword_trail::Vec3 base{hand.x-std::sin(yaw)*1200.0,hand.y,hand.z-std::cos(yaw)*1200.0};
-    scd::runtime::Submit(look,base,hand);
+    scd::runtime::Submit(look,base,hand,true);   // her own node: never the generation of Link's charge glow
 }
 
 }  // namespace zlr

@@ -36,7 +36,13 @@ namespace layout {
 constexpr uint32_t pos = 0x94, rot_y = 0xA4, r0 = 0xFC, r1 = 0xFD, id = 0x100, hp = 0x324;
 constexpr uint32_t status2 = 0x5024, pl_life = 0x4FB4, character = 0x4FC8;   // in pG
 constexpr uint32_t caught = 0x20000000;
+constexpr uint32_t stop_flg = 0x170;                                  // in pG: Stop_flg (ocarina_freeze.h kStopFlg)
+constexpr uint32_t stop_em = 0x20000000, stop_subchar = 0x00001000;   // SPF_EM, SPF_SUBCHAR
 }
+// The world is held (the Blade Lock's or the ocarina's freeze, a native stop): a frozen Ganado never runs its damage
+// check, so a ray's record would stay pending on it and the lock's exit blow would find it taken (no stun, no kick);
+// her own move does not run either. No assessment and no ray then.
+inline bool WorldHeld(uint32_t stop_flg) { return (stop_flg & (layout::stop_em | layout::stop_subchar)) != 0; }
 
 struct Config {
     bool on = false;                     // ZeldaCompanionRay=1

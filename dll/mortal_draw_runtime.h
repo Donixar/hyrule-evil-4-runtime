@@ -142,30 +142,42 @@ public:
         act_ = Action{}; act_.active = true; act_.lease = lease; act_.start_time = now; act_.sel = sel; act_.latch = latch;
     }
     void StartFailed() { request_ = false; ++stats_.start_failed; Clear(); }
+    // A cut that met Busy retries this many more frames: the adapter drops a pending record within ttl_frames.
+    static constexpr unsigned busy_retries = damage::Adapter::ttl_frames + 1;
     bool StrikeDue(double now) const {
-        return act_.active && !act_.struck && game_clock::Reached(now - act_.start_time, double(s_.strike_tick));
+        if (!act_.active) return false;
+        if (act_.struck) return act_.retry != 0;  // a Busy cut waits for the adapter's one slot
+        return game_clock::Reached(now - act_.start_time, double(s_.strike_tick));
     }
     // The cut, once per action. `target` is filled by the caller (identity,
     // actor, from); its facts callback decides same_identity. `lethal_cap`:
     // target::LethalCap of the revalidated target (0 = none), the HP limit a
     // lethal cut on a heavy target keeps (16-oct); an ordinary cut ignores it.
     Effect Strike(const Snapshot& snap, damage::Adapter& adapter, const damage::HitTarget& target, int lethal_cap = 0) {
-        if (!act_.active || act_.struck) return Effect::None;
-        act_.struck = true; ++stats_.strikes;
-        const Decision d = Step(policy_, snap, Event::StrikeFrame, policy_.token);
-        stats_.last_effect = d.effect;
-        if (d.effect == Effect::LethalStrike) ++stats_.lethal;
-        else if (d.effect == Effect::OrdinaryStrike) ++stats_.ordinary;
-        else ++stats_.no_effect;
-        if (!s_.damage || (d.effect != Effect::LethalStrike && d.effect != Effect::OrdinaryStrike)) return d.effect;
+        if (!act_.active || (act_.struck && !act_.retry)) return Effect::None;
+        if (!act_.struck) {
+            act_.struck = true; ++stats_.strikes;
+            const Decision d = Step(policy_, snap, Event::StrikeFrame, policy_.token);
+            act_.effect = stats_.last_effect = d.effect;
+            if (d.effect == Effect::LethalStrike) ++stats_.lethal;
+            else if (d.effect == Effect::OrdinaryStrike) ++stats_.ordinary;
+            else ++stats_.no_effect;
+            if (!s_.damage || (d.effect != Effect::LethalStrike && d.effect != Effect::OrdinaryStrike)) return d.effect;
+            act_.retry = busy_retries + 1;
+        }
+        // The policy decides once, at the strike frame; a retry only publishes that decision.
+        --act_.retry;
         if (!act_.hit) act_.hit = adapter.Issue();
         stats_.last_token = act_.hit;
-        const damage::Kind kind = damage::KindFor(d.effect);
+        const damage::Kind kind = damage::KindFor(act_.effect);
         damage::Status st = adapter.NativeHit(target, kind == damage::Kind::Lethal ? lethal_cap : 0, kind, act_.hit);
         if (st == damage::Status::OverCap) st = adapter.NativeHit(target, 0, damage::Kind::Ordinary, act_.hit);
         stats_.last_status = st;
         if (st == damage::Status::Published) { ++stats_.published; act_.published = true; }
-        return d.effect;
+        // Busy: another caller's hit (the partner's ray, a riposte) holds the adapter's one slot and the token
+        // is still usable, so the cut publishes on a later frame. Any other answer is final.
+        if (st != damage::Status::Busy) act_.retry = 0;
+        return act_.effect;
     }
     // Once per frame: confirms the published hit (Applied or anything else).
     void Settle(damage::Adapter& adapter) {
@@ -194,6 +206,8 @@ public:
 private:
     struct Action {
         bool active = false, struck = false, published = false, settled = false;
+        unsigned retry = 0;            // publish attempts left for a cut that met Status::Busy
+        Effect effect = Effect::None;  // the policy's decision at the strike frame
         uint64_t lease = 0, hit = 0;
         double start_time = 0;
         target::Selection sel;

@@ -178,7 +178,7 @@ function Get-GameFile([string]$Relative) {
 
 function Test-Game([string]$Path) {
     if (-not $Path) { return $false }
-    return ([IO.Directory]::Exists((Join-Path $Path 'BIO4')) -and [IO.File]::Exists((Join-Path $Path 'Bin32\bio4.exe')))
+    return ([IO.Directory]::Exists([IO.Path]::Combine($Path, 'BIO4')) -and [IO.File]::Exists([IO.Path]::Combine($Path, 'Bin32\bio4.exe')))
 }
 
 function Find-Game {
@@ -209,7 +209,7 @@ function Find-Game {
     $libraries = New-Object System.Collections.ArrayList
     foreach ($root in @($roots | Sort-Object -Unique)) {
         [void]$libraries.Add($root)
-        $vdf = Join-Path $root 'steamapps\libraryfolders.vdf'
+        $vdf = [IO.Path]::Combine($root, 'steamapps\libraryfolders.vdf')
         if (-not [IO.File]::Exists($vdf)) { continue }
         try {
             $content = [IO.File]::ReadAllText($vdf)
@@ -222,17 +222,17 @@ function Find-Game {
     }
     $Script:SteamRoots = @($libraries | Sort-Object -Unique)
     foreach ($library in $Script:SteamRoots) {
-        $acf = Join-Path $library 'steamapps\appmanifest_254700.acf'
+        $acf = [IO.Path]::Combine($library, 'steamapps\appmanifest_254700.acf')
         if ([IO.File]::Exists($acf)) {
             try {
                 $match = [regex]::Match([IO.File]::ReadAllText($acf), '"installdir"\s+"([^"\r\n]+)"')
                 if ($match.Success -and $match.Groups[1].Value -notmatch '[\\/:]' -and $match.Groups[1].Value -ne '..') {
-                    $candidate = Join-Path $library ('steamapps\common\' + $match.Groups[1].Value)
+                    $candidate = [IO.Path]::Combine($library, 'steamapps\common\' + $match.Groups[1].Value)
                     if (Test-Game $candidate) { return @{ path = $candidate; discovery = 'steam_library_manifest' } }
                 }
             } catch { Add-Warning 'Could not read a Steam appmanifest_254700.acf.' }
         }
-        $candidate = Join-Path $library 'steamapps\common\Resident Evil 4'
+        $candidate = [IO.Path]::Combine($library, 'steamapps\common\Resident Evil 4')
         if (Test-Game $candidate) { return @{ path = $candidate; discovery = 'steam_library_default' } }
     }
     Add-Warning 'Steam RE4 (app 254700) was not found. Run again with -GamePath pointing to its game root.'

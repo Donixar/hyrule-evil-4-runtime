@@ -121,6 +121,9 @@ static void CompanionFrame(double now_ms,uint32_t room,uint32_t link_player){
     }
     const auto g=CmbGet<uint32_t>(g_cmb_global_slot);
     if(!link_runtime::IsPointer(g))return;
+    // The world held (Stop_flg SPF_EM/SPF_SUBCHAR: the Blade Lock, the ocarina): a frozen Ganado keeps her record pending
+    // and the lock's exit blow then finds it taken (no stun, no kick). A cast in progress is dropped, nothing is assessed.
+    if(zc::WorldHeld(CmbGet<uint32_t>(g+zc::layout::stop_flg))){CompanionEnd("world_held");return;}
     const bool caught=g_comp_caught.Update((CmbGet<uint32_t>(g+zc::layout::status2)&zc::layout::caught)!=0,now_ms);
     const bool normal=ok&&zc::StateAllowed(r[0],r[1])&&zc::Finite3(feet)&&std::isfinite(yaw);
     const bool carried=ok&&caught&&zc::StateAllowed(r[0],r[1],true)&&zc::Finite3(feet)&&std::isfinite(yaw);

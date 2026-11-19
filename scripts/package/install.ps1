@@ -406,7 +406,9 @@ function New-GameDirectory([string]$Dir) {
 
 function Test-GameFolder([string]$Path) {
     if (-not $Path) { return $false }
-    return ([System.IO.Directory]::Exists((Join-Path $Path 'BIO4')) -and (Test-File (Join-Path $Path 'Bin32\bio4.exe')))
+    # [IO.Path]::Combine, not Join-Path: Join-Path throws on a drive letter that does not exist (a stale Steam library)
+    try { return ([System.IO.Directory]::Exists([System.IO.Path]::Combine($Path, 'BIO4')) -and (Test-File ([System.IO.Path]::Combine($Path, 'Bin32\bio4.exe')))) }
+    catch { return $false }
 }
 
 function Find-Game {
@@ -422,12 +424,12 @@ function Find-Game {
         $steam = (Get-ItemProperty -LiteralPath 'HKCU:\Software\Valve\Steam' -Name SteamPath -ErrorAction Stop).SteamPath
         if ($steam) {
             $steam = $steam -replace '/', '\'
-            [void]$candidates.Add((Join-Path $steam 'steamapps\common\Resident Evil 4'))
-            $vdf = Join-Path $steam 'steamapps\libraryfolders.vdf'
+            [void]$candidates.Add([System.IO.Path]::Combine($steam, 'steamapps\common\Resident Evil 4'))
+            $vdf = [System.IO.Path]::Combine($steam, 'steamapps\libraryfolders.vdf')
             if (Test-File $vdf) {
                 foreach ($match in [regex]::Matches([System.IO.File]::ReadAllText($vdf), '"path"\s+"([^"]+)"')) {
                     $library = $match.Groups[1].Value -replace '\\\\', '\'
-                    [void]$candidates.Add((Join-Path $library 'steamapps\common\Resident Evil 4'))
+                    try { [void]$candidates.Add([System.IO.Path]::Combine($library, 'steamapps\common\Resident Evil 4')) } catch { }
                 }
             }
         }
@@ -832,7 +834,9 @@ function Invoke-Install {
             continue
         }
         if (-not (Test-File $f.Target)) {
-            if ($patchMode -and $fromSha.ContainsKey($f.Path)) { [void]$conflicts.Add($f.Path) }
+            # An interrupted patch may have deleted this target just before its verified copy took its place:
+            # on resume it is still pending (copied again from the patch), as in a full install.
+            if ($patchMode -and $fromSha.ContainsKey($f.Path) -and -not ($resume -and $state.status -ne 'complete')) { [void]$conflicts.Add($f.Path) }
             continue
         }
         $f.Current = Get-Sha256 $f.Target
@@ -954,11 +958,12 @@ function Invoke-Install {
     $userIniCopy = $null
     if ($null -ne $userIni) {
         $userIniCopy = Join-Path $backupRoot ('link_runtime.ini.' + $Script:Patch.Manifest.from_version + '-user')
+        # The name may already hold an earlier edit (the patch run again, or the same version reinstalled): in both
+        # modes the new edit gets its own copy. A short hash keeps the name well under MAX_PATH (PowerShell 5.1 has no long paths).
+        if ((Test-File $userIniCopy) -and (Get-Sha256 $userIniCopy) -ne $userIni.Current) {
+            $userIniCopy += '.' + $userIni.Current.Substring(0, 12)
+        }
         if ($MergeUserIni) {
-            if ((Test-File $userIniCopy) -and (Get-Sha256 $userIniCopy) -ne $userIni.Current) {
-                # A short hash keeps the name well under MAX_PATH (Windows PowerShell 5.1 has no long paths).
-                $userIniCopy += '.' + $userIni.Current.Substring(0, 12)
-            }
             Say ('  Se conservan tus valores y comentarios del INI y se agregan las claves nuevas. Tu copia previa queda en ' + $userIniCopy + '.') `
                 ('Your INI values and comments are preserved and missing keys are added. Your previous copy is kept as ' + $userIniCopy + '.') 'Yellow'
         } else {

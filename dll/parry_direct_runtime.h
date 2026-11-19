@@ -103,6 +103,7 @@ struct FollowSlot {
     bool kick = false;
     double game_last = NAN;   // the cart run's continuity (game time of the last contact)
     bool bridged = false;     // a sphere sample of this kick was already followed (one log line per kick)
+    double game_start = NAN;  // game time of the block (the age bound of the kick, bats and tree follow-ups)
 };
 // The continuity of a blocked cart run (hunt-findings P2-2, 1-nov): contacts at most 6 frames of game time apart (the
 // old 100 ms at 60 FPS), with no cap on the whole run. It was 100 ms of wall clock: a hitched frame or the pause menu
@@ -125,6 +126,12 @@ inline bool Expired(const FollowSlot& s, const When& now) {
                game_clock::Exceeded(now.game - s.game_last, kCartGapFrames);
     const uint64_t gap = s.kick ? general::Follow::kSwingGapMs : 100;
     const uint64_t age = s.kick ? general::Follow::kSwingMaxMs : 500;
+    // The same bounds in 60 Hz frames of game time when it is known: on the wall clock a pause or the case after a
+    // block expired the follow-up and the rest of that attack landed. A plain-ms When keeps the wall clock.
+    if (std::isfinite(now.game) && std::isfinite(s.game_last) && std::isfinite(s.game_start))
+        return now.game + game_clock::kEpsilon < s.game_last ||
+               game_clock::Exceeded(now.game - s.game_last, double(gap) * 60.0 / 1000.0) ||
+               game_clock::Exceeded(now.game - s.game_start, double(age) * 60.0 / 1000.0);
     return now.ms < s.last || now.ms - s.last > gap || now.ms - s.start > age;
 }
 struct Follows {
@@ -161,7 +168,7 @@ struct Follows {
             if (!slots[i].armed || Expired(slots[i], now)) {slot = i; break;}
             if (slots[i].start < slots[slot].start) slot = i;
         }
-        slots[slot] = {true, c.route, c.actor, context, resource, now.ms, now.ms, kick, now.game, false};
+        slots[slot] = {true, c.route, c.actor, context, resource, now.ms, now.ms, kick, now.game, false, now.game};
     }
 };
 // Sources: When Clock() = {Now() ms, Game() frames}.

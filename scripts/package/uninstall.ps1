@@ -232,7 +232,9 @@ function Remove-UpdaterLeftovers([string]$BackupRoot) {
 
 function Test-GameFolder([string]$Path) {
     if (-not $Path) { return $false }
-    return ([System.IO.Directory]::Exists((Join-Path $Path 'BIO4')) -and (Test-File (Join-Path $Path 'Bin32\bio4.exe')))
+    # [IO.Path]::Combine, not Join-Path: Join-Path throws on a drive letter that does not exist (a stale Steam library)
+    try { return ([System.IO.Directory]::Exists([System.IO.Path]::Combine($Path, 'BIO4')) -and (Test-File ([System.IO.Path]::Combine($Path, 'Bin32\bio4.exe')))) }
+    catch { return $false }
 }
 
 function Find-Game {
@@ -248,12 +250,12 @@ function Find-Game {
         $steam = (Get-ItemProperty -LiteralPath 'HKCU:\Software\Valve\Steam' -Name SteamPath -ErrorAction Stop).SteamPath
         if ($steam) {
             $steam = $steam -replace '/', '\'
-            [void]$candidates.Add((Join-Path $steam 'steamapps\common\Resident Evil 4'))
-            $vdf = Join-Path $steam 'steamapps\libraryfolders.vdf'
+            [void]$candidates.Add([System.IO.Path]::Combine($steam, 'steamapps\common\Resident Evil 4'))
+            $vdf = [System.IO.Path]::Combine($steam, 'steamapps\libraryfolders.vdf')
             if (Test-File $vdf) {
                 foreach ($match in [regex]::Matches([System.IO.File]::ReadAllText($vdf), '"path"\s+"([^"]+)"')) {
                     $library = $match.Groups[1].Value -replace '\\\\', '\'
-                    [void]$candidates.Add((Join-Path $library 'steamapps\common\Resident Evil 4'))
+                    try { [void]$candidates.Add([System.IO.Path]::Combine($library, 'steamapps\common\Resident Evil 4')) } catch { }
                 }
             }
         }

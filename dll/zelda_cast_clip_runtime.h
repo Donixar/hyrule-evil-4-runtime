@@ -7,6 +7,7 @@
 // our same work, a foreign work wins. Release gives the slot back to what was there at install, by compare-exchange.
 #include "zelda_cast_clip.h"
 #include "native_pins.h"
+#include "secondary_slot.h"   // blend_history::Reset (arm-fix-01)
 #include <windows.h>
 #include <cstring>
 
@@ -26,6 +27,7 @@ struct Memory {
         __try { std::memcpy(reinterpret_cast<void*>(a), p, n); return true; }
         __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     }
+    bool Read32(uint32_t a, uint32_t& v) { return Read(a, &v, 4); }   // secondary_slot::blend_history::Reset walks the parts
 };
 inline uint32_t base = 0;
 inline unsigned char* fcv = nullptr;
@@ -97,13 +99,17 @@ inline bool SeqFrame(const Layer& l, double& out) {
     if (!std::isfinite(f)) return false;
     out = f; return true;
 }
-// The slot back to what was there at install (only if it is still ours).
+// The slot back to what was there at install (only if it is still ours). A hand-back to the neck's work clears the
+// parts' flipped key histories (arm-fix-01, secondary_slot.h): our 385-key tracks leave indices past the neck clip's keys.
 inline void Release(Layer& l) {
     if (!l.on) return;
     l.on = false;
     const float zero = 0.f; std::memcpy(l.work + work::weight, &zero, 4);
+    bool given = false;
     __try {
-        InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(l.model + kSecondary), LONG(l.previous), LONG(l.Work()));
+        given = InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(l.model + kSecondary), LONG(l.previous),
+                                           LONG(l.Work())) == LONG(l.Work());
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (given && l.previous) { Memory m; link_runtime::secondary_slot::blend_history::Reset(m, l.model); }
 }
 }  // namespace link_runtime::zelda_cast_clip::runtime

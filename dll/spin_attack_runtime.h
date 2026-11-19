@@ -1477,7 +1477,7 @@ static void SwordDecide(mortal::dispatch::Runtime& run,void* player){
         clip.strike_tick,knife?1U:0U,travel,request.kind==SwordKind::Ending&&g_cmb.ending_leap?(request.target.locked?" prefer=lock":" prefer=near"):"");
 }
 static bool CmbResident(const wchar_t*,const wchar_t*,size_t,const char*,unsigned char*&);
-// The clip's fcv/seq (resident, SHA-pinned); ready only once its voice also loaded (SwordLoad / SwordPrepare).
+// The clip's fcv/seq (resident, SHA-pinned); SwordLoad marks it ready. The voice is optional there: no WAV or no playback device = a silent action.
 static bool SwordLoadClip(const wchar_t* directory,const sword::assets::Clip& spec,SwordClip& clip){
     wchar_t name[96]{};
     if(link_runtime::paths::Format(name,L"link_%ls.fcv",spec.name)<0)return false;
@@ -1492,8 +1492,8 @@ static bool SwordLoadVoice(const wchar_t* directory,const sword::assets::Clip& s
     return link_runtime::paths::Format(path,L"%lslink_%ls_voice.wav",directory,spec.voice?spec.voice:spec.name)>=0&&voice.Load(path,35,spec.voice_sha);
 }
 static bool SwordLoad(const wchar_t* directory,const sword::assets::Clip& spec,SwordClip& clip,AlertVoice& voice){
-    if(!SwordLoadClip(directory,spec,clip)||!SwordLoadVoice(directory,spec,voice))return false;
-    clip.ready=true;return true;
+    if(!SwordLoadClip(directory,spec,clip))return false;
+    if(!SwordLoadVoice(directory,spec,voice))Log("Sword voice silent: link_%ls_voice.wav missing or changed, or no audio device (the action still runs)",spec.voice?spec.voice:spec.name);clip.ready=true;return true;   // the voice never gates the clip: AlertVoice::Play returns false when unloaded
 }
 static void SwordPrepare(const wchar_t* directory,bool dispatch_up,bool move_up){
     if(!g_cmb.SwordActions())return;

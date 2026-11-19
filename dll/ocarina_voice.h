@@ -39,6 +39,12 @@ inline size_t FadeTail(const int16_t* pcm,size_t total_frames,unsigned channels,
     }
     return n;
 }
+// A recorded song replay plays on the device's wall clock, but the flow that waits for its end (ReplayFlow) counts the
+// game steps of the player dispatch, and no dispatch runs under the pause menu, the case, a load or the title. The game
+// thread stamps each dispatch; the worker holds the recording while the stamp is older than this. Tick counts in ms,
+// wrap-safe; a stamp newer than `now` (the worker read its clock first) is fresh.
+constexpr uint32_t kBeatStaleMs = 250;
+inline bool BeatStale(uint32_t now_ms,uint32_t beat_ms){const uint32_t age=now_ms-beat_ms;return age>kBeatStaleMs&&age<0x80000000u;}
 class NoteConsumer {
     uint64_t handled=0; bool sounding=false;
 public:
