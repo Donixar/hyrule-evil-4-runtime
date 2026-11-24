@@ -9,6 +9,7 @@ namespace link_runtime::sword_actions {
 struct Input {
     uint64_t frame=0;double time=0;uint32_t scene=0,player=0,weapon=0;
     bool valid=false,safe=false,knife=false,knife_edge=false,fire=false,fire_edge=false;
+    bool knife_wait=false;   // not safe only because of the knife's own transition (ChargeWait): spin::Charge keeps a press seen here
 };
 inline bool SameContext(const Input& a,const Input& b) {return a.scene==b.scene&&a.player==b.player&&a.weapon==b.weapon;}
 // spin-fix-01: a queued request (Spin released, Back Slice tapped) waits in the arbiter until the player's dispatch
@@ -29,6 +30,10 @@ inline bool PendingRoutine(uint32_t routine,bool knife,bool start_routine){
     const uint32_t r2=(routine>>16)&0xFF;
     return r2!=2&&(r2<=1||!knife);
 }
+// The knife's own transition frames a press may fall on: the native put-away (r1 0x0B, r2 3; 280-670 ms after every
+// release, and after every clip started from the hold) and the normal routine's one-frame entry step 0x00000000.
+// Nothing charges or starts on them, but a knife press seen there used to be lost for the whole hold.
+inline bool ChargeWait(uint32_t routine){return routine==0||((routine&0xFFFF)==0x0B00&&((routine>>16)&0xFF)==3);}
 enum class Keep {Ok,Invalid,Priority,Occupied,Routine,Scene,Player,Weapon,Expired};
 inline const char* KeepName(Keep k){
     static const char* const n[]={"ok","invalid","native_priority","occupied","routine","scene","player","weapon","expired"};
@@ -161,19 +166,27 @@ public:
 namespace link_runtime::spin_attack {
 enum class Event {None,Charging,Charged,Released,Cancelled};
 class Charge {
-    sword_actions::Input previous_;bool known_=false,armed_=false,charging_=false,charged_=false;double start_=0;
+    sword_actions::Input previous_;bool known_=false,armed_=false,charging_=false,charged_=false,latched_=false;double start_=0;
 public:
     bool Active() const{return charging_;}
-    void Cancel(){charging_=charged_=false;armed_=false;}
+    void Cancel(){charging_=charged_=false;armed_=latched_=false;}
     Event Step(const sword_actions::Input& s) {
-        if(known_&&s.frame==previous_.frame&&sword_actions::SameContext(s,previous_)&&s.valid&&s.safe)return Event::None;
+        if(known_&&s.frame==previous_.frame&&sword_actions::SameContext(s,previous_)&&s.valid&&(s.safe||s.knife_wait))return Event::None;   // a repeated put-away frame keeps the latch
         const bool broken=!known_||!s.valid||!s.safe||!std::isfinite(s.time)||s.time<previous_.time-game_clock::kEpsilon||
             s.frame!=previous_.frame+1||!sword_actions::SameContext(s,previous_);
         const bool was=charging_;
-        if(broken){Cancel();known_=s.valid;previous_=s;armed_=s.valid&&s.safe&&!s.knife;return was?Event::Cancelled:Event::None;}
+        if(broken){
+            // Unsafe only for the knife's own transition (knife_wait) on a contiguous frame of the same context: a fresh
+            // press seen there stays latched while the key is down, and a key seen up keeps the next press fresh.
+            // Any other unsafe frame (offer, own clip, parry reaction, attack) drops both, as before.
+            const bool hold=known_&&s.valid&&s.knife_wait&&std::isfinite(s.time)&&s.time>=previous_.time-game_clock::kEpsilon&&
+                s.frame==previous_.frame+1&&sword_actions::SameContext(s,previous_);
+            const bool latch=hold&&s.knife&&(latched_||(armed_&&s.knife_edge)),arm=hold&&!s.knife;
+            Cancel();known_=s.valid;previous_=s;armed_=arm||(s.valid&&s.safe&&!s.knife);latched_=latch;return was?Event::Cancelled:Event::None;}
         previous_=s;
-        if(!s.knife){const bool release=charging_&&game_clock::Reached(s.time-start_,60.0);charging_=charged_=false;armed_=true;return release?Event::Released:was?Event::Cancelled:Event::None;}
-        if(!charging_&&armed_&&s.knife_edge){armed_=false;charging_=true;start_=s.time;return Event::Charging;}
+        if(!s.knife){const bool release=charging_&&game_clock::Reached(s.time-start_,60.0);charging_=charged_=false;latched_=false;armed_=true;return release?Event::Released:was?Event::Cancelled:Event::None;}
+        // A press latched during the put-away starts here, on the first safe frame, with the whole second still ahead.
+        if(!charging_&&(latched_||(armed_&&s.knife_edge))){armed_=latched_=false;charging_=true;start_=s.time;return Event::Charging;}
         if(charging_&&!charged_&&game_clock::Reached(s.time-start_,60.0)){charged_=true;return Event::Charged;}
         return Event::None;
     }

@@ -1,6 +1,7 @@
 #pragma once
 #include "parry_direct_routes.h"
 #include "game_clock.h"
+#include "parry_direct_clock.h"
 #include <cmath>
 
 namespace link_runtime::parry::direct {
@@ -57,7 +58,7 @@ template <class Mem> bool ReadActor(Mem& m, uint32_t base, Route route, uint32_t
         uint8_t id = 0, latch = 0;
         return a.routine[1] == 0xE && shield::Range(who, 0xA57) &&
             m.Read(who + 0x908, &a.attachment, 4) && shield::Range(a.attachment, 0x101) &&
-            m.Read(a.attachment + 0x100, &id, 1) && id == 0x49 &&
+            m.Read(a.attachment + 0x100, &id, 1) && id == 0x59 &&  // Steam's SetTree and em2bSearchTree
             m.Read(a.attachment + 0xF8, &a.attachment_guid, 4) &&
             m.Read(who + 0xA56, &latch, 1) && !latch;
     }
@@ -91,7 +92,9 @@ inline bool Same(const ResourceStamp& a, const ResourceStamp& b) {
 struct When {
     uint64_t ms = 0;
     double game = NAN;
+    uint64_t generation = 0, menu = 0;
     When(uint64_t wall = 0, double game_time = NAN) : ms(wall), game(game_time) {}
+    When(uint64_t wall, FollowTime stamp) : ms(wall), game(stamp.game), generation(stamp.generation), menu(stamp.menu) {}
 };
 struct FollowSlot {
     bool armed = false;
@@ -104,6 +107,7 @@ struct FollowSlot {
     double game_last = NAN;   // the cart run's continuity (game time of the last contact)
     bool bridged = false;     // a sphere sample of this kick was already followed (one log line per kick)
     double game_start = NAN;  // game time of the block (the age bound of the kick, bats and tree follow-ups)
+    uint64_t generation = 0, menu = 0;
 };
 // The continuity of a blocked cart run (hunt-findings P2-2, 1-nov): contacts at most 6 frames of game time apart (the
 // old 100 ms at 60 FPS), with no cap on the whole run. It was 100 ms of wall clock: a hitched frame or the pause menu
@@ -121,6 +125,8 @@ inline bool SameCart(const Actor& armed, const Actor& current) {
     return Same(armed, normalized);
 }
 inline bool Expired(const FollowSlot& s, const When& now) {
+    if (s.generation != now.generation || now.game == kUnknownFollowTime ||
+        s.game_start == kUnknownFollowTime || s.game_last == kUnknownFollowTime) return true;
     if (s.route == Route::Cart)   // game time only; an unknown or backwards clock ends the run (fail to native damage)
         return !std::isfinite(now.game) || !std::isfinite(s.game_last) || now.game + game_clock::kEpsilon < s.game_last ||
                game_clock::Exceeded(now.game - s.game_last, kCartGapFrames);
@@ -143,6 +149,10 @@ struct Follows {
     // matched (optional): the slot that matched.
     bool Match(const Contact& c, const input::Sample& context, const When& now, const ResourceStamp& resource = {},
                bool kick_only = false, FollowSlot** matched = nullptr) {
+        if (now.game == kUnknownFollowTime) {
+            Retire(c.actor.owner);
+            return false;
+        }
         for (auto& s : slots) {
             if (!s.armed) continue;
             if (Expired(s, now) ||
@@ -155,6 +165,7 @@ struct Follows {
             }
             s.last = now.ms;
             s.game_last = now.game;
+            s.menu = now.menu;
             s.context.frame = context.frame;
             if (c.route == Route::Cart && CartFinal(c.actor)) s.armed = false;
             if (matched) *matched = &s;
@@ -163,12 +174,13 @@ struct Follows {
         return false;
     }
     void Arm(const Contact& c, const input::Sample& context, const When& now, const ResourceStamp& resource = {}, bool kick = false) {
+        if (now.game == kUnknownFollowTime) return;
         unsigned slot = 0;
         for (unsigned i = 0; i < std::size(slots); ++i) {
             if (!slots[i].armed || Expired(slots[i], now)) {slot = i; break;}
             if (slots[i].start < slots[slot].start) slot = i;
         }
-        slots[slot] = {true, c.route, c.actor, context, resource, now.ms, now.ms, kick, now.game, false, now.game};
+        slots[slot] = {true, c.route, c.actor, context, resource, now.ms, now.ms, kick, now.game, false, now.game, now.generation, now.menu};
     }
 };
 // Sources: When Clock() = {Now() ms, Game() frames}.
@@ -195,7 +207,7 @@ template <class Sources> bool FollowKick(Sources& s, const Candidate& candidate,
     if (candidate.outer_caller - s.ImageBase() != 0x15585F || c.route != Route::Krauser || !c.actor.owner ||
         c.actor.owner != candidate.producer_esi || !KickRoutine(c.actor)) return false;
     ResourceStamp resource{};
-    if (s.Blocked() || !s.Resource(resource) || !s.Safe()) return false;
+    if ((s.Blocked() && general::HardBlocked(s, 0)) || !s.Resource(resource) || !s.Safe()) return false;   // press-free, as Run
     return following.Match(c, context, Clock(s), resource, true, matched);
 }
 struct Result : line::Outcome {bool follow = false;};
@@ -203,7 +215,9 @@ template <class Sources> Result Run(Sources& s, const Contact& c, const input::S
     Result o;
     ResourceStamp resource{};
     o.reason = line::Reason::InputBlocked;
-    if (s.Blocked()) {following = {}; return o;}
+    // A sword action or the Mortal Draw refuses a new press (Decide below), not the follow-up of a contact already
+    // blocked: a Ctrl+tap parry starts the Shield Bash on its release, mid cart run. A hard block still clears all.
+    if (s.Blocked() && general::HardBlocked(s, 0)) {following = {}; return o;}
     // Resource validates the same Link model even during draw, without borrowing
     // another press or requiring matrices that were absent at the approved contact.
     s.Pose();
@@ -242,6 +256,8 @@ inline uint32_t image_base = 0;
 inline general::Runtime* runtime = nullptr;
 inline __declspec(thread) bool busy = false, tainted = false, fresh_effects = false;
 inline __declspec(thread) Follows follows;
+inline SharedFollowClock pad_clock;
+inline FollowTime (*direct_game_now)(const input::Sample&) = nullptr;
 using Decision = bool(__cdecl*)(const Contact&);
 inline Decision decision = nullptr;
 inline void(__cdecl* on_block)() = nullptr;
@@ -268,7 +284,7 @@ struct NativeSources : line::NativeSources {
     bool resource_known = false;
     NativeSources(general::Runtime& r, const Contact& c, const input::Sample& ctx) : line::NativeSources(r), contact(c), context(ctx) {}
     // Game time in 60 Hz frames (the runtime's game clock); without it the logic frame counter (= game time at 60 FPS).
-    double Game() {return r.game_now ? r.game_now() : double(context.frame);}
+    FollowTime Game() {return direct_game_now ? direct_game_now(context) : FollowTime{r.game_now ? r.game_now() : double(context.frame)};}
     bool Resource(ResourceStamp& out) {
         general::Memory m;
         sword::reader::Observation found{};
@@ -291,7 +307,8 @@ struct NativeSources : line::NativeSources {
             ReadActor(m, image_base, contact.route, contact.actor.owner, again) && Same(contact.actor, again) &&
             input::Read(m, r.access, fresh) && fresh.valid && fresh.gameplay &&
             input::Context(context, fresh) && context.frame == fresh.frame &&
-            input::Context(context, input::state.sample) && Resource(current);
+            // While Blocks() the input state is cleared on every update (input::Update): only a follow-up gets this far.
+            (input::Blocks() || input::Context(context, input::state.sample)) && Resource(current);
     }
 };
 inline void ShareTierTwo(general::Runtime& r, const Candidate& candidate, const general::Applied& applied) {
@@ -359,7 +376,23 @@ inline bool __cdecl Resolve(const Contact& c) {
         }
     }
     NativeSources s{*runtime, c, context};
+    FollowSlot prior{};
+    for (const auto& slot : follows.slots) {
+        if (slot.armed && slot.generation && slot.actor.owner == c.actor.owner && slot.route == c.route) {
+            prior = slot;
+            break;
+        }
+    }
     const auto o = direct::Run(s, c, context, follows);
+    if (prior.armed) {
+        const FollowTime stamp=s.Game();
+        if (stamp.generation==prior.generation && stamp.menu!=prior.menu)
+            general::Log("parry direct resume route=%s owner=0x%08X frame=%u follow=%u age60=%.3f gap60=%.3f same_actor=%u same_context=%u resource_read=%u same_resource=%u reason=%u pad_frame=%u epoch=%llu",
+            kSpecs[static_cast<unsigned>(c.route)].name, c.actor.owner, context.frame, o.follow ? 1U : 0U,
+            stamp.game - prior.game_start, stamp.game - prior.game_last, Same(prior.actor, c.actor) ? 1U : 0U,
+            input::Context(prior.context, context) ? 1U : 0U, s.resource_known ? 1U : 0U,
+            s.resource_known && Same(prior.resource, s.resource) ? 1U : 0U, static_cast<unsigned>(o.reason),stamp.pad_frame,stamp.generation);
+    }
     if (!o.cancel) {
         PassReason why = PassReason::Window;
         if (tainted) why = PassReason::Reentry;

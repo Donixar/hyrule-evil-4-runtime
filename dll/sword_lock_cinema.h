@@ -163,7 +163,8 @@ struct Summary {
     unsigned ticks = 0, release_ticks = 0, pushes = 0, shakes = 0;
     float in_ms = -1, release_ms = 0, max_shake = 0, max_push = 0, max_weight = 0;
     unsigned probe_pulls = 0, snaps = 0;
-    float side = 0, dist = 0;
+    float side = 0, dist = 0;          // framing at the opening
+    float end_side = 0;               // the last side owned by the duel camera
 };
 class Director {
 public:
@@ -222,7 +223,7 @@ public:
     float weight() const {return weight_.x;}
     const Summary& summary() const {return s_;}
     uint32_t closed() const {return closed_;}
-    // The side chosen at the hold's start (+1 / -1; 0 = not yet).
+    // The current side (+1 / -1; 0 before the opening pose is chosen).
     float side() const {return side_;}
     void SetSide(float s) {side_ = s;}
 private:
@@ -234,6 +235,7 @@ private:
     }
     void Finish(End why, bool released) {
         if (s_.end == End::None) s_.end = why;
+        s_.end_side = side_;
         s_.released = released; closed_ = s_.id; done_ = s_; pending_ = true; phase_ = Phase::Off;
     }
     Phase phase_ = Phase::Off;
@@ -596,9 +598,9 @@ private:
 
 inline int Format(char* out, size_t n, const Summary& s) {
     return std::snprintf(out, n, "id=%u end=%s released=%u ticks=%u release_ticks=%u release_ms=%.0f in_ms=%.0f pushes=%u shakes=%u "
-        "max_shake=%.1f max_push=%.0f max_weight=%.3f probe_pulls=%u snaps=%u side=%.0f dist=%.0f", s.id, EndName(s.end),
+        "max_shake=%.1f max_push=%.0f max_weight=%.3f probe_pulls=%u snaps=%u side=%.0f dist=%.0f end_side=%.0f", s.id, EndName(s.end),
         s.released ? 1U : 0U, s.ticks, s.release_ticks, double(s.release_ms), double(s.in_ms), s.pushes, s.shakes, double(s.max_shake),
-        double(s.max_push), double(s.max_weight), s.probe_pulls, s.snaps, double(s.side), double(s.dist));
+        double(s.max_push), double(s.max_weight), s.probe_pulls, s.snaps, double(s.side), double(s.dist), double(s.end_side));
 }
 
 // ---- the cinema bars' owner ---------------------------------------------------------------------------------------

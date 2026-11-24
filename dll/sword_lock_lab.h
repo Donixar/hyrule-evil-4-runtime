@@ -233,7 +233,7 @@ inline uint16_t ControlsAll(uint32_t keys) {
 // 0x567EFF: byte 0x806F39, STA_SUB_SCRN, STA_TITLE, card), where Enter, Esc and the arrows are KEY_OK|KEY_B,
 // KEY_CANCEL|KEY_EV_CANCEL and KEY_L/KEY_R. live: the real keys reached Key_btn (pG readable, input not suspended, no
 // SPF_KEY KeyClear). sscrn_request: Status_flg[2] kSscrnRequest (inventory, map or shop about to open).
-struct PadContext {bool readable = false, menus = false, live = false, sscrn_request = false;};
+struct PadContext {bool readable = false, menus = false, live = false, sscrn_request = false, duel_menu = false;};
 inline constexpr PadContext kGameplay{true, false, true, false};
 inline PadContext ContextOf(const ckd::Context& c) {
     PadContext p; p.readable = true;
@@ -241,6 +241,8 @@ inline PadContext ContextOf(const ckd::Context& c) {
               (c.status3 & ckd::layout::kCardTask);
     p.live = c.global && !c.suspended && !(c.stop & ckd::layout::kSpfKey);
     p.sscrn_request = (c.status2 & slp::native::kSscrnRequest) != 0;
+    p.duel_menu = c.global && !c.suspended && !(c.status2 & ckd::layout::kStaTitle) && !(c.status3 & ckd::layout::kCardTask) &&
+                  (c.menu_input || (c.status0 & ckd::layout::kStaSubScrn));
     return p;
 }
 // Reads only. An unreadable frame gives PadContext{}: masked, never fed, never a release.
@@ -259,6 +261,14 @@ template <class Mem> PadContext ReadContext(Mem& m, uint32_t base) {
 }
 // The duel pauses (sd::Input::paused) on a menu or a sub-screen request, and on a frame it cannot read.
 inline bool Paused(const PadContext& p) {return !p.readable || p.menus || p.sscrn_request;}
+// SubScreenCall checks the player's routine before its timer, key and task. Only forward a case press for the
+// same loan whose original routine passed that native check. Other callers and the map retain their native result.
+inline constexpr uint32_t kCaseQueryReturn = 0x36921F;
+inline bool BorrowedCaseQuery(uint32_t return_rva, uint32_t pressed, uint64_t eligible_lease, uint64_t active_lease) {
+    const uint32_t keys = uint32_t(sg::key::kSscrn | sg::key::kMap);
+    return return_rva == kCaseQueryReturn && (pressed & keys) == uint32_t(sg::key::kSscrn) &&
+           eligible_lease && eligible_lease == active_lease;
+}
 // What the game must see after PadRead. write: on/trg differ from the real words (only clears, never sets a bit).
 struct PadOut {bool write = false; uint32_t on = 0, trg = 0; bool released = false; uint32_t held = 0;};
 class Mask {
@@ -524,6 +534,13 @@ public:
     PadOut Pad(uint32_t on, uint32_t trg, const PadContext& ctx = kGameplay) {
         if (Holding() && !ctx.menus && ctx.live) pad_.Feed(on, trg);
         return mask_.Apply(on, trg, ctx);
+    }
+    // PadRead runs while the player hook is suspended. Exclude verified menu time and discard pre-menu flanks.
+    void HoldMenuClock(double now) {
+        if (stage_ != Stage::Duel || now < last_) return;
+        t0_ += now - last_;
+        last_ = now;
+        in_ = pad_.Take(0, true);
     }
     // One probe tick while the world is held. Returns the duel's events (0 when no game time passed: the second call
     // of a frame keeps the presses for the next one).

@@ -35,7 +35,14 @@ inline void SetMortalBlocks(bool blocks) {mortal_blocks.store(blocks,std::memory
 // no reader until it is seen released, through the duel's Key_btn mask.
 inline std::atomic<bool> sword_lock_blocks{false};
 inline void SetSwordLockBlocks(bool blocks) {sword_lock_blocks.store(blocks,std::memory_order_release);}
-inline bool Blocks() {return OcarinaBlocks()||mortal_blocks.load(std::memory_order_acquire)||sword_lock_blocks.load(std::memory_order_acquire);}
+// Published by the sword actions (SwordLifecycle: spin, Ending Blow, Back Slice, Shield Bash, backflip) while their clip
+// owns Link. Nothing is consumed meanwhile (Blocks()), but the button is still tracked: a press made inside a short clip
+// arms with its own timestamp and can parry the hit that lands right after the clip (it still expires after ParryWindowMs).
+inline std::atomic<bool> sword_action_blocks{false};
+inline void SetSwordActionBlocks(bool blocks) {sword_action_blocks.store(blocks,std::memory_order_release);}
+// Drops(): the gates that also forget the button (ocarina, Mortal Draw, Blade Lock duel). Blocks(): every gate.
+inline bool Drops() {return OcarinaBlocks()||mortal_blocks.load(std::memory_order_acquire)||sword_lock_blocks.load(std::memory_order_acquire);}
+inline bool Blocks() {return Drops()||sword_action_blocks.load(std::memory_order_acquire);}
 struct State {
     defense::ParryWindow window;
     Sample sample;
@@ -52,7 +59,7 @@ inline void Begin(State& s,const Sample& p,uint64_t now,uint32_t duration) {
     }
 }
 inline void Update(State& s,const Sample& p,uint64_t now,uint32_t duration) {
-    if(Blocks()) {s={};return;}
+    if(Drops()) {s={};return;}   // a sword action keeps tracking the button (sword_action_blocks)
     if(!p.valid||!p.gameplay||!Coherent(p)||!Duration(duration)||!s.known||now<s.time||
        !Context(s.sample,p)||duration!=s.duration||
        (p.frame!=s.sample.frame&&p.frame!=s.sample.frame+1U)||
@@ -68,7 +75,7 @@ inline void Update(State& s,const Sample& p,uint64_t now,uint32_t duration) {
     s.sample=p;s.time=now;
 }
 inline bool Consume(State& s,const Sample& fresh,uint64_t now,bool other_gates_qualified) {
-    if(Blocks()) {s={};return false;}
+    if(Blocks()) {if(Drops())s={};return false;}   // a sword action refuses without forgetting the press
     if(!s.known||!fresh.valid||!fresh.gameplay||!Context(s.sample,fresh)||fresh.frame!=s.sample.frame||
        !Coherent(fresh)||fresh.on!=s.sample.on||fresh.trg!=s.sample.trg||!(fresh.on&0x800)||now<s.time) {s={};return false;}
     return defense::ConsumeParry(s.window,now,other_gates_qualified);

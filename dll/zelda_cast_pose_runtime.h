@@ -150,7 +150,9 @@ inline bool Tick(Scene& s) {
     return true;
 }
 struct Rig { uint32_t part[kChain]{}; Mat local[kChain]; Vec add_rot[kChain]{}; unsigned pending_mask=0; };
-inline bool ReadRig(const Scene& s,Rig& rig,Failure* failure=nullptr) {
+// chain=false (the clip's frames): the TP clip keys the arm's translations too (live 20-nov: bone 10 at -113 mm), so its
+// lengths are pinned only at Begin, before the clip moves them; weight 0 keeps the locals as the clip left them.
+inline bool ReadRig(const Scene& s,Rig& rig,Failure* failure=nullptr,bool chain=true) {
     rig=Rig{};
     if(failure) *failure=Failure{};
     uint8_t count=0; uint32_t p=s.parts; Vec scale{};
@@ -187,6 +189,7 @@ inline bool ReadRig(const Scene& s,Rig& rig,Failure* failure=nullptr) {
         }
         if(i+1<kChain && !Read(p+0xF4,p)) return Reject(failure,"rig_part_%d_next",int(i));
     }
+    if(!chain) return true;
     // Ashley's first arm chain, in mm. Root/torso translations may be animated.
     const unsigned bones[]={5,7,8,9,10};
     const Vec expected[]={{-10.431f,178.774f,-36.68f},{-122.038f,10.762f,1.848f},
@@ -215,7 +218,7 @@ inline void WorldAt(void* self,uintptr_t caller) {
     Failure failure; PoseDiagnostic pose_problem;
     if(eased) anchor_ang.y=zcc::EaseYaw(own_yaw,face_yaw,timeline.Age(now_ms));
     const Mat root=Euler(anchor_ang.x,anchor_ang.y,anchor_ang.z,anchor_pos);
-    if(!ReadRig(s,rig,&failure)) {
+    if(!ReadRig(s,rig,&failure,!clip_mode)) {
         // The clip owns the arm: a rig this reader does not accept (a blended frame) only skips the anchor this frame.
         if(clip_mode) { if(!clip_rig_logged&&log) { clip_rig_logged=true; LogFailure("clip_rig_skip",failure); } world_original(self); return; }
         Cancel(failure.reason,&failure); world_original(self); return;
@@ -293,7 +296,7 @@ inline void __cdecl RenderDetour(void* self) {
     if(!SceneNow(s) || reinterpret_cast<uintptr_t>(self)!=s.player) return;
     hand_known=false;
     if(!Read(s.player+0x154,a) || !Read(s.player+0x158,b) || !std::isfinite(a*b) || a*b<=0 ||
-       !ReadRig(s,rig) || !Read(rig.part[10]+0x0C,m) || !Rigid(m)) return;
+       !ReadRig(s,rig,nullptr,!clip_mode) || !Read(rig.part[10]+0x0C,m) || !Rigid(m)) return;
     hand=Position(m); hand_scene=s; hand_stamp=GetTickCount64(); hand_known=true; ++drawn;
 }
 } // namespace detail
@@ -353,7 +356,7 @@ inline bool HandWorld(float out[3]) {
     using namespace detail;
     Scene s;
     if(!out || !OwnedThread() || !hand_known ||
-       !SceneNow(s) || !Same(s,hand_scene) || uint32_t(s.frame-hand_scene.frame)>1 || GetTickCount64()-hand_stamp>250) return false;
+       !SceneNow(s) || !Same(s,hand_scene) || uint32_t(s.frame-hand_scene.frame)>1) return false;   // 19-nov: no wall-clock bound (a >250 ms hitch or the pause menu dropped the ray)
     out[0]=hand.x; out[1]=hand.y; out[2]=hand.z; return true;
 }
 inline bool Install(uintptr_t image_base, void(*logger)(const char*, ...)) {

@@ -132,6 +132,9 @@ inline Pick Assess(const World& w, const Config& c) {
 // again and again (the cooldown alone would let a long carry draw a ray every 8-15 s).
 constexpr unsigned kRearmFrames = 30;
 constexpr double kAssessMs = 50.0;   // 30 assessments = 1.5 s without the situation
+// A wind-up that never released its ray (she was lifted or hit, the world was held) may be retried this long after it
+// began: the 8-15 s are spent by a ray, not by a dropped cast; the hold only keeps a flickering state from twitching her arm.
+constexpr double kWindupHoldMs = 1000.0;
 class Latch {
     Situation s_ = Situation::None; uint32_t target_ = 0; bool fired_ = false; unsigned absent_ = 0;
 public:
@@ -166,6 +169,8 @@ public:
         return now >= ready_;
     }
     void Arm(double now, unsigned min_s, unsigned max_s) { last_ = now; ready_ = now + Draw(min_s, max_s); armed_ = true; }
+    // A wind-up began: a short fixed wait until the ray leaves (Arm then) or the cast is dropped (nothing else is spent).
+    void Hold(double now, double ms) { last_ = now; ready_ = now + ms; armed_ = true; }
     double ReadyAt() const { return ready_; }
 };
 

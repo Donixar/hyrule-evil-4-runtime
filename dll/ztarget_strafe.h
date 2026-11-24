@@ -10,23 +10,35 @@ inline float StrafeSpeed(unsigned percent,bool given){
     const float s=float(percent)/100.f;return s>=kStrafeSpeedMin&&s<=kStrafeSpeedMax?s:kStrafeSpeedDefault;
 }
 struct Config {bool enabled=false,observe=false,qualified=false;float speed=1.f;};
+struct GuardClip {uint32_t work=0,motion=0,sequence=0;};
 struct Sample {
     uint32_t actor=0,frame=0,epoch=0,routine=0,motion_flags=0,secondary=0,motion=0,sequence=0,motion_table=0;uint64_t identity=0,keys=0;
     uint16_t attrs=0;Vec pos{},target{};float yaw=0,dt=0;
     bool safe=false,focused=false,held=false,walk_motion=false;
     uint32_t neck=0,neck_left=0,neck_right=0,secondary_motion=0,secondary_sequence=0,secondary_flags=0;
     uint16_t secondary_attrs=0;float secondary_weight=0;
+    GuardClip guard{};
 };
 // Walk installs the native neck work even when its blend weight is zero. At zero,
-// both secondary root motion and secondary Core are skipped by MotionMove. Never
-// admit an active layer (including parry), or mutate its pointer/weight/flags.
+// both secondary root motion and secondary Core are skipped by MotionMove. The
+// active shield guard and guard-hit clips are pinned upper-body clips with no
+// root channel. Require their exact work, motion and sequence from the guard.
 inline bool RootOnly(const Sample& s){
     // SSE DAZ may compare a nonzero subnormal as zero; MotionMove uses x87.
     // Match the native exact-zero branch without changing the caller's FP state.
     uint32_t weight_bits=0;std::memcpy(&weight_bits,&s.secondary_weight,sizeof(weight_bits));
+    if(s.guard.work&&s.secondary==s.guard.work&&s.guard.motion&&s.guard.sequence&&
+       s.secondary_motion==s.guard.motion&&s.secondary_sequence==s.guard.sequence&&
+       !s.secondary_attrs&&!(s.secondary_flags&0xF0000000)&&
+       (weight_bits&0x80000000)==0&&weight_bits<=0x3F800000)return true;
     return !s.secondary||(uint64_t(s.actor)+0x474==s.secondary&&s.neck&&s.secondary_motion&&
         (s.secondary_motion==s.neck_left||s.secondary_motion==s.neck_right)&&s.secondary_sequence==0&&
         s.secondary_attrs==5&&(s.secondary_flags&0xF0000000)==0x80000000&&(weight_bits&0x7FFFFFFFU)==0);
+}
+inline bool SkipGuardRoot(const Sample& s, bool strafe) {
+    return (strafe||s.keys==1)&&s.safe&&s.focused&&s.held&&s.identity&&s.walk_motion&&(s.routine&0xFFFF)==0x100&&
+        (s.attrs&1)&&!(s.motion_flags&0x40000000)&&s.guard.work&&s.secondary==s.guard.work&&
+        s.secondary_weight>0.f&&RootOnly(s);
 }
 struct Output {Vec pos{};float yaw=0;};
 class Controller {

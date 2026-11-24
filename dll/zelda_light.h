@@ -212,18 +212,23 @@ inline int SoftStreak(const core::Vec3& p, const core::Vec3& q, double w, uint8_
 }
 
 class Beam {
-    spin_bullets::Ray ray_{}; double t0_ = 0; bool on_ = false; uint32_t room_ = 0, player_ = 0;
+    spin_bullets::Ray ray_{}; double t0_ = 0, last_frame_ms_ = 0; bool on_ = false; uint32_t room_ = 0, player_ = 0;
 public:
     void Fire(double now, core::Vec3 from, core::Vec3 to, uint32_t room, uint32_t player) {
-        ray_ = {from, to}; t0_ = now; room_ = room; player_ = player;
+        ray_ = {from, to}; t0_ = last_frame_ms_ = now; room_ = room; player_ = player;
         on_ = core::Finite(from) && core::Finite(to) && spin_bullets::Length(ray_) > 1.0;
     }
     bool Live(double now) const {
-        return on_ && now >= t0_ && now - t0_ < spin_bullets::Length(ray_) / kSpeed + kFadeMs;
+        return on_ && now >= last_frame_ms_ && now - t0_ < spin_bullets::Length(ray_) / kSpeed + kFadeMs;
     }
     int Frame(double now, uint32_t room, uint32_t player, core::Quad* out, int at, int max) {
-        if (room != room_ || player != player_) on_ = false;
-        if (!Live(now) || !out) return at;
+        // Continue can reuse the room and player address and replay the same stretch of game time.
+        if (room != room_ || player != player_ || !Live(now)) {
+            on_ = false;
+            return at;
+        }
+        last_frame_ms_ = now;
+        if (!out) return at;
         const double len = spin_bullets::Length(ray_), age = now - t0_, arrive = len / kSpeed;
         const double fade = age <= arrive ? 1.0 : 1.0 - (age - arrive) / kFadeMs;
         if (!(fade > 0)) return at;

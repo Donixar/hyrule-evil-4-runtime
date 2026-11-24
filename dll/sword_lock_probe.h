@@ -237,6 +237,17 @@ public:
     void RequestRelease() {if (state_ == State::Frozen) release_due_ = true;}
     bool release_requested() const {return release_due_;}
 
+    // The player hook stops during OPTIONS and the case. PadRead keeps seeing the native frame counter.
+    // Bridge only the menu frames we actually observed, and discard that evidence on focus loss or a broken chain.
+    bool ObserveMenuFrame(uint32_t frame, bool menu, bool foreground) {
+        if (!Holding() || !cfg_.external_release || cfg_.menu_abandons) return false;
+        if (!foreground) menu_interrupted_ = true;
+        if (!menu || menu_interrupted_) return false;
+        if (Gap(frame, menu_seen_ ? menu_frame_ : frame_)) {menu_interrupted_ = true; return false;}
+        menu_seen_ = true; menu_frame_ = frame;
+        return true;
+    }
+
     // Every probe tick while Frozen or Releasing. in_decide: the dispatch decide (the lease can start or be cancelled).
     Action Step(const World& w, bool in_decide) {
         Action a;
@@ -246,6 +257,7 @@ public:
                 abandon_ = a.abandon; state_ = State::Abandoned; abandon_t_ = w.readable ? w.now : -1; ++stats_.abandoned; return a;
             }
             frame_ = w.frame;
+            menu_seen_ = menu_interrupted_ = false;
             const double t = w.now - t0_;
             if (!lease_started_ && !lease_given_up_) {
                 if (game_clock::Reached(t, Frames(kLeaseWaitMs))) {lease_given_up_ = true; a.lease_gave_up = true;}
@@ -279,7 +291,7 @@ public:
         using namespace native;
         if (!w.readable) return Abandon::Unreadable;
         if (w.player != player_ || w.global != global_ || (w.room & 0xFFFF) != room_) return Abandon::Load;
-        if (Gap(w.frame)) return Abandon::Gap;
+        if (Gap(w.frame) && (!menu_seen_ || menu_interrupted_ || Gap(w.frame, menu_frame_))) return Abandon::Gap;
         if (w.link_hp <= 0 || (w.status0 & kStaDiedemo)) return Abandon::LinkDead;
         if (w.stop & kSpfActBtn) return Abandon::Qte;
         const uint8_t r0 = static_cast<uint8_t>(w.link_routine & 0xFF);
@@ -316,20 +328,24 @@ private:
     unsigned taken_ = 0, lease_tries_ = 0;
     bool lease_started_ = false, lease_given_up_ = false, lease_lost_ = false, first_taken_ = false, watch_cut_ = false;
     bool release_due_ = false;
+    bool menu_seen_ = false, menu_interrupted_ = false;
+    uint32_t menu_frame_ = 0;
     int hp_release_ = 0, hp_min_ = 0;
     Refuse refuse_ = Refuse::None;
     Abandon abandon_ = Abandon::None;
     Cool cool_[kOwners]{};
     Stats stats_;
 
-    bool Gap(uint32_t frame) const {
-        const int32_t d = static_cast<int32_t>(frame - frame_);   // wraps like the counter
+    bool Gap(uint32_t frame) const {return Gap(frame, frame_);}
+    static bool Gap(uint32_t frame, uint32_t previous) {
+        const int32_t d = static_cast<int32_t>(frame - previous);   // wraps like the counter
         return d < 0 || d > kMaxGapTicks;
     }
     void Clear() {
         owner_ = serial_ = owned_ = player_ = global_ = room_ = frame_ = release_frame_ = 0;
         queued_ = t0_ = release_t_ = lease_ms_ = 0; abandon_t_ = -1; taken_ = lease_tries_ = 0;
         lease_started_ = lease_given_up_ = lease_lost_ = first_taken_ = watch_cut_ = release_due_ = false;
+        menu_seen_ = menu_interrupted_ = false;
         hp_release_ = hp_min_ = 0; refuse_ = Refuse::None; abandon_ = Abandon::None;
     }
     void Drop(Refuse r) {refuse_ = r; state_ = State::Idle; ++stats_.refused;}

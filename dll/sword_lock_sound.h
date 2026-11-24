@@ -20,6 +20,7 @@
 // Every time is the duel's game time (game_clock), the same at 60 and 165 FPS.
 // Tests: tests/native/test_sword_lock_sound.cpp (scripts/test_sword_lock_sound.bat).
 #include "sword_lock_duel.h"
+#include "parry_sword_contact.h"
 #include <cstdint>
 #include <cwchar>
 
@@ -146,4 +147,13 @@ inline const char* SparkName(Spark s) {
 }
 inline Spark SparkOnTick(uint32_t ev) {return (ev & sd::kEvHit) ? Spark::Hit : Spark::None;}
 inline Spark SparkOnRelease(sd::Result r) {return r == sd::Result::Win ? Spark::Win : Spark::None;}
+struct SparkLocation {parry::sword::Vec3 point;bool on_blade;};
+// A successful break is a duel input, with no new native collision sample. Center the
+// burst on the visible blade in its current pose, even when the cinematic separates the fighters.
+template<class ReadBlade>
+inline SparkLocation SparkAt(Spark kind,parry::sword::Vec3 opened,ReadBlade&& read){
+    parry::sword::Blade blade{};
+    if(kind!=Spark::Hit||!read(blade))return {opened,false};
+    return {{(blade.base.x+blade.tip.x)*0.5,(blade.base.y+blade.tip.y)*0.5,(blade.base.z+blade.tip.z)*0.5},true};
+}
 }  // namespace link_runtime::sword_lock::sound

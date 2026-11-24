@@ -210,8 +210,8 @@ inline void(__cdecl* g_original)() = nullptr;   // MinHook trampoline of PadRead
 // Run after each PadRead, menus included, in this order (H1c "Cableado" 1: the Blade Lock lab duel reads and masks
 // Key_btn_on/Key_btn_trg before anything else sees them, then HudMenuFrame; 2-nov: the TP hearts drop their units in
 // the case, where the player frame that pauses them does not run). A null slot is skipped. Set by the DLL; must not throw.
-enum After : unsigned { kAfterDuel = 0, kAfterHud = 1, kAfterCount = 2 };
-inline void(*g_after[kAfterCount])() = {nullptr, nullptr};
+enum After : unsigned { kAfterDuel = 0, kAfterHud = 1, kAfterDirectClock = 2, kAfterCount = 3 };
+inline void(*g_after[kAfterCount])() = {};
 struct LiveMemory {
     bool Read(uint32_t at, void* out, size_t n) {
         __try { std::memcpy(out, reinterpret_cast<const void*>(static_cast<uintptr_t>(at)), n); return true; }

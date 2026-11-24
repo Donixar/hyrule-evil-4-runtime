@@ -235,6 +235,9 @@ public:
         Record live;
         if (!native_.record || !native_.record(native_.context, e.actor, live)) { Finish(Outcome::Lost); return r; }
         r.mismatch = Mismatch(expect_, live);
+        // cDmgInfo::move (0x1AEFA0) may spend one whole game tick before this calc.
+        if (r.mismatch == kTimer && expect_.timer == layout::knife_timer &&
+            live.timer == layout::knife_timer - 1) r.mismatch = 0;
         if (r.mismatch) { Finish(Outcome::Superseded); return r; }  // our record is gone: native amount
         r.owned = true; r.token = token_; r.kind = kind_;
         // Dead target or negative evaluation: the native amount passes through and

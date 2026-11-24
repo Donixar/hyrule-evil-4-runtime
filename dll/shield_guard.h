@@ -254,6 +254,10 @@ public:
     float Weight() const { return Active() ? last_ : 0.f; }
     uint32_t Work() const { return work_; }
     Clip clip() const { return clip_; }
+    bool StrafeClip(uint32_t player) const {
+        return player && player==player_ && !lent_now_ && clip_!=Clip::Break &&
+            (phase_==Phase::In || phase_==Phase::Hold);
+    }
     const LayerStats& stats() const { return stats_; }
     const LayerHandBack& last_exit() const { return exit_; }
     // The guard pose is up: blocks count. The ramp-in counts from half weight; the break clip never does.
@@ -303,12 +307,14 @@ public:
             // resumes in the window still take the old path.
             const uint32_t cur = port.Secondary(player_);
             const bool freed = !cur || cur == player_ + kNeckWorkOffset || (w.image_base && cur == w.image_base + kStanceWorkRva);
-            if (freed && w.wanted && clip_ == Clip::Guard && (phase_ == Phase::In || phase_ == Phase::Hold) &&
+            // 19-nov: after a blocked hit clip_ is Hit until the next install; the detach ends the hit clip too, so it
+            // resumes as the guard (before, the first locomotion detach after a block dropped the shield for the cooldown)
+            if (freed && w.wanted && (clip_ == Clip::Guard || clip_ == Clip::Hit) && (phase_ == Phase::In || phase_ == Phase::Hold) &&
                 resumes_ < config_.resume_limit) {
                 uint32_t work = 0;
                 if (port.Install(player_, Clip::Guard, work) && work && port.Secondary(player_) == work) {
                     if (resume_window_ <= 0) resume_window_ = config_.contest_window;
-                    ++resumes_; ++stats_.resumed; work_ = work; previous_ = cur; Write(port, last_); return;
+                    ++resumes_; ++stats_.resumed; work_ = work; previous_ = cur; clip_ = Clip::Guard; Write(port, last_); return;
                 }
             }
             ++stats_.lost_owner; Lost(); return;                          // unexplained native detach or the neck

@@ -416,6 +416,15 @@ public:
         To(Phase::Idle);
         return true;
     }
+    // A pending effect belongs to the room and life it was played in: its wait only advances on player dispatches,
+    // and none run through a death, Continue or a door's load. The runtime drops it when that scene changed.
+    bool DropEffect(Host& h, const char* why) {
+        if (phase_ != Phase::Effect) return false;
+        char text[64]; std::snprintf(text, sizeof(text), "cancelled (%s)", why && *why ? why : "load");
+        h.SongLog(Line(text), 2);
+        To(Phase::Idle);
+        return true;
+    }
     void OnEnded(uint64_t token, int reason_stowed, Host& h) {
         staff_.Close();
         if (phase_ == Phase::Idle || phase_ == Phase::Effect || token != token_) return;

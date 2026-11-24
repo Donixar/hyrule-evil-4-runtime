@@ -136,6 +136,8 @@ static void CompanionFrame(double now_ms,uint32_t room,uint32_t link_player){
         if(CompanionHand(partner,hand)){g_comp_hand=hand;g_comp_have_hand=true;}
         double entries=0;const bool known=g_comp_cast.Clip()&&zcr::SeqFrame(g_comp_layer,entries);
         if(g_comp_cast.FireDue(now_ms,g_comp_cast.Clip()&&link_runtime::zelda_cast_clip::ReleaseDue(known,entries,age))){
+            // Spent at the release: the latch still holds this cast's trigger (nothing is assessed while a cast runs).
+            g_comp_latch.Fired();g_comp_cool.Arm(now_ms,g_comp_cfg.cooldown_min_s,g_comp_cfg.cooldown_max_s);
             if(!g_comp_have_hand)CmbLog("zelda_companion no_hand: the ray is dropped");
             else CompanionFire(now_ms,room,link_player,feet,yaw);
         }
@@ -170,13 +172,15 @@ static void CompanionFrame(double now_ms,uint32_t room,uint32_t link_player){
     const ::sword_trail::Vec3 from=have?hand: ::sword_trail::Vec3{feet[0],feet[1]+1100.0,feet[2]},to{e.x,e.y+spb::kChestY,e.z};
     ::sword_trail::Vec3 stop{};
     if(BulletWall(from,to,stop)!=BulletSeg::Clear)return;
-    g_comp_latch.Fired();g_comp_cool.Arm(now_ms,g_comp_cfg.cooldown_min_s,g_comp_cfg.cooldown_max_s);
+    // The trigger and the 8-15 s are spent when the ray leaves (the FireDue branch), not here: a wind-up dropped before its
+    // release (she is lifted or hit, the world is held) must not cost the rescue ray. Only a short hold against wind-up spam.
+    g_comp_cool.Hold(now_ms,zc::kWindupHoldMs);
     const auto& t=found.items[e.tag];
     g_comp_partner=partner;g_comp_target=t.pointer;g_comp_identity=t.identity;g_comp_situation=pick.situation;
     g_comp_hand=hand;g_comp_have_hand=have;
     const bool clip=zcr::Ready()&&zcr::Install(g_comp_layer,partner,0);
     g_comp_cast.Begin(now_ms,clip);
-    CmbLog("zelda_companion cast situation=%s target=0x%08X r=%u/0x%02X d_zelda=%.0f link_hp=%d caught=%u clip=%u next_in=%.0fms",
+    CmbLog("zelda_companion cast situation=%s target=0x%08X r=%u/0x%02X d_zelda=%.0f link_hp=%d caught=%u clip=%u retry_in=%.0fms",
         zc::SituationName(pick.situation),t.pointer,e.r0,e.r1,double(zc::Flat(feet,e)),w.link_hp,caught?1U:0U,clip?1U:0U,g_comp_cool.ReadyAt()-now_ms);
 }
 }  // namespace zlr

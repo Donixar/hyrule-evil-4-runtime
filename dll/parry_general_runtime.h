@@ -34,7 +34,7 @@ struct Runtime {
     bool deflect = false;       // thrown deflect route pinned
     Follow follow;              // game thread
     Grace grace;                // game thread; window set from ParryGraceMs before the resolver is installed
-    double (*game_now)() = nullptr;   // game time in 60 Hz frames (game_clock.h); null = no grace window
+    double (*game_now)() = nullptr;   // game time in 60 Hz frames (game_clock.h); null = no grace window, follow-ups on the wall clock
     Counters counters;
     uint64_t last_pass[32]{};   // game thread: 1/s per reason (and per producer verdict)
 };
@@ -47,6 +47,8 @@ struct NativeSources {
     bool Live(size_t i) {return i < kProducerCount && r.code.live[i];}
     bool Descriptor(uint32_t attack, general::Descriptor& d) {Memory m; return m.Read(attack, &d, sizeof(d));}
     bool Blocked() {return input::Blocks();}
+    // The ocarina and the Blade Lock duel refuse the follow-ups too; a sword action or the Mortal Draw only a new press.
+    bool HardBlocked() {return input::OcarinaBlocks() || input::sword_lock_blocks.load(std::memory_order_acquire);}
     bool Pose() {sword::epoch::Stamp stamp{}; pose_ok = sword::epoch::AtContact(pose, stamp); return pose_ok;}
     bool Guard(bool refresh_input) {
         // Observe never refreshes or consumes real input. Active still consumes through the
@@ -83,13 +85,40 @@ struct NativeSources {
         if (ChainsawProducer(ret)) return ChainsawOwner(m, ret, c.producer_esi);   // em10CsawHitCk: ESI
         return thrown::Identify(m, r.access.image_base, c, ret, object) ? object : 0;
     }
+    uint32_t KrauserBlade(const Candidate& c, Swing& swing) {
+        const uint32_t owner = c.producer_esi;
+        if (!shield::Range(owner, 0x328)) return 0;
+        Memory m;
+        uint32_t kind[2]{}, parts = 0, guid = 0, motion = 0;
+        uint8_t state[6]{};
+        int16_t hp[2]{};
+        float cursor = 0;
+        if (!m.Read(owner, kind, sizeof(kind)) || kind[0] != r.access.image_base + 0x7127CC ||
+            (kind[1] & 0x201) != 1 || !m.Read(owner + 0xFC, state, sizeof(state)) ||
+            state[4] != 0x39 || state[5] != 2 || state[0] != 1 || state[1] < 0x27 || state[1] > 0x2A ||
+            !m.Read(owner + 0x324, hp, sizeof(hp)) || hp[0] <= 0 || hp[0] > hp[1] ||
+            !m.Read(owner + 0xF4, &parts, 4) || !shield::Range(parts, 4) ||
+            !m.Read(owner + 0xF8, &guid, 4) || !guid ||
+            !m.Read(owner + 0x1D8, &motion, 4) || !shield::Range(motion, 4) ||
+            !m.Read(owner + 0x1FC, &cursor, 4) || !std::isfinite(cursor) || cursor < 0) return 0;
+        swing = {true, {state[0], state[1]}, parts, guid, motion, cursor};
+        return owner;
+    }
     // The owner's cEm routine r0/r1 ([em+0xFC], [em+0xFD]; the r1 dispatch byte, gigante_tree_guard.h): same
     // values as at the block = still that attack (chain/flail follow-up, parry_general_block.h Follow).
     bool Routine(uint32_t owner, uint8_t (&out)[2]) {Memory m; return owner && m.Read(owner + 0xFC, out, 2);}
-    uint64_t Now() {return GetTickCount64();}
+    uint64_t Now() {return GetTickCount64();}   // wall clock: line:: and direct:: read the press age with it (tier 2: FollowSources)
     bool Refresh() {return input::RefreshAtContact();}
     bool Consume() {return input::ConsumeCurrent(true);}
     bool Peek() {return input::PeekCurrent();}
+};
+// The clock of tier 2's follow-ups (r.follow, r.grace.swings): game time when the runtime has it (FollowMs), so a
+// pause, the case or a hitch after a block no longer ends the blocked swing's follow-up. Game thread only.
+inline uint64_t FollowNow(const Runtime& r) {return FollowMs(r.game_now != nullptr, r.game_now ? r.game_now() : 0.0, GetTickCount64());}
+// general::Decide's sources: only its Now() changes (NativeSources::Now stays the wall clock for the press age).
+struct FollowSources : NativeSources {
+    explicit FollowSources(Runtime& rt) : NativeSources{rt} {}
+    uint64_t Now() {return FollowNow(r);}
 };
 // Copied log lines (game thread -> worker).
 struct Line {char text[320];};
@@ -126,7 +155,7 @@ inline void OpenGraceAfterCommit(Runtime& r, uint32_t serial) {
 inline Applied Resolve(Runtime& r, const Candidate& c, bool handoff) {
     Applied a;
     InterlockedIncrement(&r.counters.candidates);
-    NativeSources s{r};
+    FollowSources s{r};   // the follow-ups' clock is game time (FollowNow)
     Outcome o;
     const bool grace_on = GraceOn(r);
     const double game_now = grace_on ? r.game_now() : 0;

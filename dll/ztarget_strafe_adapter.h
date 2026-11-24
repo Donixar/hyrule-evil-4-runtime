@@ -7,6 +7,7 @@ struct Context {
     bool live=false,enabled=false,observe=false,face_target=false,qualified=false,thread=false,dispatch_clear=false,busy=false;
     bool focused=false,focus_lost=false,held=false,lock_held=false,lock_active=false,waiver=false;
     bool neutral=false;float neutral_yaw=0;   // neutral Z-target (ztarget.h Neutral): strafe around a virtual target
+    GuardClip guard{};
 };
 inline bool Enabled(const Context& c){return c.base&&c.player&&c.snapshot&&c.live&&c.enabled&&!c.observe&&
     c.face_target&&c.qualified&&c.thread;}
@@ -16,6 +17,7 @@ template<class Mem>bool Read(const Context& c,Mem& m,Sample& out){
     if(!ReadFrame(m,c.base,f)||f.player!=c.player||uint64_t(f.player)+0x7E0>0x100000000ULL)return false;
     Sample s;s.actor=f.player;s.frame=f.frame;s.epoch=c.epoch;s.routine=f.routine;s.keys=f.keys;s.pos=f.pos;s.yaw=f.yaw;s.dt=f.dt;
     s.focused=c.focused&&!c.focus_lost;
+    s.guard=c.guard;
     s.safe=c.dispatch_clear&&!c.busy&&Safe(f)&&SameScene(*c.snapshot,f)&&uint32_t(f.frame-c.snapshot->frame)<=1;
     uint32_t table=0,fcv=0,seq=0,normal_fcv=0,normal_seq=0,damaged_fcv=0,damaged_seq=0;
     if(!Get(m,f.player+0x46C,table)||!table||uint64_t(table)+0x18C>0x100000000ULL||
@@ -51,6 +53,7 @@ inline bool Equal(const Sample& a,const Sample& b){
         a.neck==b.neck&&a.neck_left==b.neck_left&&a.neck_right==b.neck_right&&
         a.secondary_motion==b.secondary_motion&&a.secondary_sequence==b.secondary_sequence&&
         a.secondary_flags==b.secondary_flags&&a.secondary_attrs==b.secondary_attrs&&a.secondary_weight==b.secondary_weight&&
+        a.guard.work==b.guard.work&&a.guard.motion==b.guard.motion&&a.guard.sequence==b.guard.sequence&&
         a.identity==b.identity&&a.keys==b.keys&&a.attrs==b.attrs&&Equal(a.pos,b.pos)&&Equal(a.target,b.target)&&
         a.yaw==b.yaw&&a.dt==b.dt&&a.safe==b.safe&&a.focused==b.focused&&a.held==b.held&&a.walk_motion==b.walk_motion;
 }

@@ -1438,23 +1438,52 @@ static void StartEm3fAttackTimer(const wchar_t* ini){
 namespace swk=link_runtime::sword_lock::lab;
 static swk::Config g_swk_cfg;                  // [Combat] SwordLock* keys, read with the other lab keys before this runs
 static uint64_t CaseKeyNow(){return GetTickCount64();}
+static bool CmbStaggerClockRequested();
+static std::atomic<bool> g_stagger_pad_clock{false};
+static void DirectClockPad(){
+    namespace d=link_runtime::parry::direct;
+    namespace ck=link_runtime::case_key_debounce;
+    ck::LiveMemory memory; d::FollowFrame frame{};
+    if(!d::ReadFollowFrame(memory,ck::g_base,frame))frame={};
+    d::pad_clock.Publish(frame);
+}
+static link_runtime::parry::direct::FollowTime DirectContactTime(const link_runtime::parry::input::Sample& context){
+    namespace d=link_runtime::parry::direct;
+    namespace ck=link_runtime::case_key_debounce;
+    ck::LiveMemory memory; d::FollowFrame frame{};
+    if(!d::ReadFollowFrame(memory,ck::g_base,frame)||context.global!=frame.global||context.room!=frame.room||context.frame!=frame.frame)
+        return {};
+    return d::pad_clock.AtContact(frame);
+}
 static void StartCaseKeyDebounce(const wchar_t* ini){
     namespace ck=link_runtime::case_key_debounce;
+    namespace d=link_runtime::parry::direct;
     const swk::HookPlan plan=swk::PadHook(GetPrivateProfileIntW(L"LinkRuntime",L"CaseKeyDebounce",1,ini)==1,g_swk_cfg);
-    if(!plan.install){Log("case_key_debounce installed=0 reason=off");return;}
+    const bool direct_clock=g_gen.settings.mode==link_runtime::parry::general::Mode::Active&&
+        (d::requested[static_cast<unsigned>(d::Route::Bats)]||d::requested[static_cast<unsigned>(d::Route::Cart)]||
+         (g_gen.settings.bosses&&(d::requested[static_cast<unsigned>(d::Route::Krauser)]||d::requested[static_cast<unsigned>(d::Route::Tree)])));
+    const bool stagger_clock=CmbStaggerClockRequested();
+    if(!plan.install&&!direct_clock&&!stagger_clock){Log("case_key_debounce installed=0 reason=off");return;}
     unsigned ms=GetPrivateProfileIntW(L"LinkRuntime",L"CaseKeyDebounceMs",ck::kDefaultMs,ini);
     if(!ck::ValidMs(ms)){Log("CaseKeyDebounceMs=%u invalid (0..%u); %u used",ms,ck::kMaxMs,ck::kDefaultMs);ms=ck::kDefaultMs;}
     const uint32_t base=reinterpret_cast<uint32_t>(GetModuleHandleW(nullptr));
     MH_STATUS s=MH_Initialize();
     if(s!=MH_OK&&s!=MH_ERROR_ALREADY_INITIALIZED){Log("case_key_debounce installed=0 reason=minhook_%s",MH_StatusToString(s));return;}
     ck::g_line=&GiganteTreeLine;ck::g_now=&CaseKeyNow;ck::g_debounce=plan.debounce;
+    if(direct_clock||stagger_clock)ck::g_after[ck::kAfterDirectClock]=&DirectClockPad;
     OcaPatchMem m;uint32_t bad=0;
     const ck::Verdict v=ck::Install(m,base,ms,bad,[](void* target,void* detour,void** original){
         if(MH_CreateHook(target,detour,original)!=MH_OK)return false;
         if(MH_EnableHook(target)==MH_OK)return true;
         MH_RemoveHook(target);return false;});
+    if(direct_clock&&v==ck::Verdict::Installed)d::direct_game_now=&DirectContactTime;
+    if(direct_clock)Log("parry direct follow_clock=%s",v==ck::Verdict::Installed?"shared_pad":"legacy_unavailable");
+    if(stagger_clock){
+        g_stagger_pad_clock.store(v==ck::Verdict::Installed,std::memory_order_release);
+        Log("mortal draw stagger_clock=%s",v==ck::Verdict::Installed?"shared_pad":"legacy_unavailable");
+    }
     if(v==ck::Verdict::Installed&&!plan.debounce)Log("case_key_debounce installed=0 reason=off pad_hook=1 base=0x%X hook=0x%X "
-        "(CaseKeyDebounce=0: the PadRead hook runs for [Combat] SwordLock=1 only, no TAB debounce)",base,ck::rva::kPadRead);
+        "(CaseKeyDebounce=0: PadRead runs without TAB debounce)",base,ck::rva::kPadRead);
     else if(v==ck::Verdict::Installed)Log("case_key_debounce installed=1 base=0x%X hook=0x%X key=0x%X debounce_ms=%u max_latch_ms=%u clock=real",
         base,ck::rva::kPadRead,ck::layout::kKeySscrn,ms,static_cast<unsigned>(ck::kMaxLatchMs));
     else Log("case_key_debounce installed=0 reason=%s pin=0x%X base=0x%X",ck::Name(v),bad,base);
@@ -1858,6 +1887,7 @@ static ocr::LeaseRoute g_oca_route;   // armed before TryStartClip: Started is p
 static ocr::KnifeLatch g_oca_knife;
 static bool g_oca_native=false,g_oca_alt_knife_logged=false;
 static uint32_t g_oca_session_player=0;
+static ocr::SheatheWatch g_oca_sheathe;   // a pending sheathe request must not outlive a hit, a grab, a death or a load
 static bool g_oca_unmount_pending=false,g_oca_lease_lost=false,g_oca_stopping=false,g_oca_nopose_done=false;
 static bool OcaOwnsLease(){return g_oca_run&&g_oca_run->active&&g_oca_route.Token()&&g_oca_run->lease.token==g_oca_route.Token();}
 static uint32_t OcaRead(uint32_t address){uint32_t v=0;LocalMemory m;return m.Read32(address,v)?v:0;}
@@ -1919,6 +1949,23 @@ static OcaSongHost g_oca_song_host;
 namespace ostf=link_runtime::ocarina::staff;
 using OcaSongFlow=ostf::ReplayFlow<OcaSongHost,osg::Melody,osg::Song>;
 static OcaSongFlow g_oca_song;
+// A pending song effect keeps the load epoch, player object and room it was earned in (17-nov review): its wait only
+// advances on player dispatches, so a death + Continue or a door's load delivered it in the next life or room.
+struct OcaEffectScene {uint32_t epoch=0,player=0,room=0;};
+static OcaEffectScene g_oca_effect_scene;
+static OcaEffectScene OcaEffectSceneNow(){
+    OcaEffectScene s;s.epoch=g_oca_epoch.Current();s.player=OcaRead(g_oca_player_slot);
+    const uint32_t global=OcaRead(g_oca_global_slot);
+    s.room=link_runtime::IsPointer(global)?OcaRead(global+oca::freeze_layout::kRoomId)&0xFFFFu:0xFFFFu;
+    return s;
+}
+// Game thread, every player dispatch, before the flow ticks: another scene drops the effect (logged), never runs it.
+static void OcaSongSceneGuard(){
+    if(g_oca_song.phase()!=ostf::Phase::Effect)return;
+    const OcaEffectScene now=OcaEffectSceneNow();
+    if(now.epoch!=g_oca_effect_scene.epoch||now.player!=g_oca_effect_scene.player||now.room!=g_oca_effect_scene.room)
+        g_oca_song.DropEffect(g_oca_song_host,"load");
+}
 static bool g_oca_staff_on=false;
 static unsigned char* g_oca_staff_block=nullptr;
 static const OcaFile kOcaStaffBlock={L"link_ocarina_staff.eff",672,"886af2cd6cdcc5b446f4692837d3cebab8fefc8028a568b0729ae03c21874385"};
@@ -1984,6 +2031,10 @@ struct OcaHost {
             return (routine&0xFF)==0&&(((routine>>8)&0xFF)==0||((routine>>8)&0xFF)==0x0B);  // standing or knife ready
         }
         if(g_oca_session_player&&player!=g_oca_session_player)return false;
+        // Sheathing has no lease or freeze to lose: a gap in the player dispatch (damage, grab, death, load, pause)
+        // or another Link drops the request, so the ocarina never comes out later by itself.
+        if(g_oca_session.state()==oca::State::Sheathing&&
+           g_oca_sheathe.Broken(player,static_cast<uint32_t>(GetTickCount()),g_oca_beat.load(std::memory_order_acquire)))return false;
         LocalMemory m;link_runtime::HealthState health;
         if(!link_runtime::low_health::ReadHealth(m,g_oca_player_slot,g_oca_global_slot,link_runtime::shield::shop_flag_fix,health)||!health.eligible)return false;
         return !(g_oca_cfg.pose&&g_oca_lease_lost);
@@ -1996,7 +2047,7 @@ struct OcaHost {
         const bool knife=link_runtime::IsPointer(info)&&(OcaRead(info+oca::mount_layout::kFlags)&oca::mount_layout::kVisible);
         return knife||(g_oca_cfg.pose&&!mortal::dispatch::NormalIdleRoutine(OcaRead(player+0xFC)));
     }
-    void RequestSheathe(){g_oca_knife.Hold();g_oca_alt_knife_logged=false;OcaRecordPush(1,"sheathe requested",0,0,0,g_oca_session.token());}
+    void RequestSheathe(){g_oca_knife.Hold();g_oca_alt_knife_logged=false;g_oca_sheathe.Arm(OcaRead(g_oca_player_slot));OcaRecordPush(1,"sheathe requested",0,0,0,g_oca_session.token());}
     bool FreezeBegin(){
         g_oca_knife.Hold();g_oca_session_player=OcaRead(g_oca_player_slot);
         if(!g_oca_cfg.freeze)return true;
@@ -2084,7 +2135,9 @@ struct OcaHost {
         g_oca_session_player=0;g_oca_lease_lost=false;g_oca_chain.Reset();
         // b = last notes of the session (NoteHistory::Packed: note+1 per nibble, oldest lowest).
         OcaRecordPush(1,"ended",static_cast<int>(reason),g_oca_session.history().Size(),g_oca_session.history().Packed(),token);
+        const bool pending=g_oca_song.phase()==ostf::Phase::Effect;   // an effect already waiting keeps its own scene
         g_oca_song.OnEnded(token,reason==oca::Reason::Stowed?1:0,g_oca_song_host);
+        if(!pending&&g_oca_song.phase()==ostf::Phase::Effect)g_oca_effect_scene=OcaEffectSceneNow();
     }
     void PlayNote(uint64_t token,int8_t note){
         const bool pushed=g_oca_cfg.notes&&g_oca_notes.Push(token,note);
@@ -2107,6 +2160,7 @@ static bool OcaCombatSongAllowed(const char*& why){
     if(!out&&(g_oca_freeze.Active()||g_oca_unmount_pending||g_oca_weapon_pending)){why="song blocked: ocarina release pending";return false;}
     if(g_oca_run&&g_oca_run->active&&!OcaOwnsLease()){why="song blocked: sword lease";return false;}
     ImageMem m;sav::Rules rules;rules.enemies=false;rules.aware=false;rules.waive_player=out;rules.player_r0_only=true;
+    rules.shop_flag_fix=link_runtime::shield::shop_flag_fix;   // the ocarina opens past a latched STA_INTO_SHOP: its songs must too
     const sav::Result r=sav::Allowed(m,g_oca_base,rules);
     if(r.block==sav::Block::None)return true;
     why=sav::WhySong(r.block);return false;
@@ -2116,7 +2170,8 @@ bool OcaSongHost::SongAllowed(osg::Song song,const char*& why){
     if(!g_oca_save_ok){why="serenity blocked: save pins";return false;}
     const bool out=g_oca_session.state()!=oca::State::Idle;
     if(!out&&(g_oca_freeze.Active()||g_oca_unmount_pending||g_oca_weapon_pending)){why="serenity blocked: ocarina release pending";return false;}
-    ImageMem m;sav::Rules rules;rules.waive_player=out;const sav::Result r=sav::Allowed(m,g_oca_base,rules);
+    ImageMem m;sav::Rules rules;rules.waive_player=out;rules.shop_flag_fix=link_runtime::shield::shop_flag_fix;   // same read as the ocarina's gates
+    const sav::Result r=sav::Allowed(m,g_oca_base,rules);
     if(r.block==sav::Block::None)return true;
     why=sav::Why(r.block);
     if(r.enemy&&(r.block==sav::Block::EnemyNear||r.block==sav::Block::EnemyAware)){
@@ -2223,6 +2278,7 @@ static void __cdecl OcarinaDecide(mortal::dispatch::Runtime& run,void* player){
     if(g_oca_song.WantStow())events.stow=true;   // Serenity replayed: the session runs its own exit
     ocr::Frame(g_oca_session,g_oca_host,events,false,GameStep(g_oca_global_slot));
     if(g_oca_session.state()==oca::State::Playing)g_oca_song.OnOpen(g_oca_session.token());
+    OcaSongSceneGuard();   // a load or a new Link since the stow: the pending effect is dropped
     g_oca_song.Tick(g_oca_song_host,false,GameStep(g_oca_global_slot));
     OcaStaffPaint(gameplay);
     g_oca_beat.store(static_cast<uint32_t>(GetTickCount()),std::memory_order_release);   // last: this dispatch's stop requests are already posted
@@ -2239,6 +2295,7 @@ static void __cdecl OcarinaDecide(mortal::dispatch::Runtime& run,void* player){
 static void __cdecl OcarinaObserve(mortal::dispatch::Runtime& run,void*){
     g_oca_run=&run;
     ocr::Frame(g_oca_session,g_oca_host,{},true,GameStep(g_oca_global_slot));
+    OcaSongSceneGuard();   // a load or a new Link since the stow: the pending effect is dropped
     g_oca_song.Tick(g_oca_song_host,true,GameStep(g_oca_global_slot));
     OcaStaffPaint(false);   // native frames: units and texture freed
     g_oca_beat.store(static_cast<uint32_t>(GetTickCount()),std::memory_order_release);   // last: this dispatch's stop requests are already posted
@@ -2265,6 +2322,7 @@ namespace prx=link_runtime::parry::reaction;
 namespace prp=link_runtime::parry::riposte;
 namespace nhp=link_runtime::native_hitpart;
 static cmb::Config g_cmb;
+static bool CmbStaggerClockRequested(){return g_cmb.md_contextual||g_cmb.md_observe;}
 static cmb::Plan g_cmb_plan;
 static uint32_t g_cmb_base=0,g_cmb_player_slot=0,g_cmb_global_slot=0;
 static bool g_cmb_pinned=false;
@@ -2309,6 +2367,19 @@ static uint32_t CmbFrame(){const uint32_t g=CmbGet<uint32_t>(g_cmb_global_slot);
 // Scene epoch for the target tracker: a new room (global+4FAC) or a new player object.
 static mtg::Tracker g_cmb_tracker;
 static mtg::StaggerWindow g_cmb_stagger;   // parry -> step behind -> Mortal Draw (game thread)
+static bool CmbStaggerTime(uint64_t& milliseconds,uint64_t& generation){
+    namespace d=link_runtime::parry::direct;
+    namespace ck=link_runtime::case_key_debounce;
+    if(!g_stagger_pad_clock.load(std::memory_order_acquire)){
+        milliseconds=link_runtime::parry::general::FollowNow(g_gen);generation=0;return true;
+    }
+    ck::LiveMemory memory;d::FollowFrame frame{};
+    if(!d::ReadFollowFrame(memory,ck::g_base,frame))return false;
+    const auto stamp=d::pad_clock.AtContact(frame);
+    if(!stamp.generation)return false;
+    milliseconds=static_cast<uint64_t>(stamp.game*(1000.0/60.0)+0.5);generation=stamp.generation;
+    return true;
+}
 static uint32_t g_cmb_room=0xFFFFFFFF,g_cmb_scene_player=0,g_cmb_epoch=0;
 static void CmbScene(uint32_t player){
     const uint32_t g=CmbGet<uint32_t>(g_cmb_global_slot);
@@ -2531,6 +2602,15 @@ struct GuardPort {
     void SetWeight(uint32_t work,float w){CmbMem m;m.Write(work+0xC8,&w,4);}
     uint16_t Status(uint32_t work){return CmbGet<uint16_t>(work+0x42);}
 };
+static link_runtime::ztarget::strafe::GuardClip GuardStrafeClip(uint32_t player){
+    if(!g_sg_on||!g_sg_layer||!g_sg_layer->StrafeClip(player))return {};
+    const unsigned clip=static_cast<unsigned>(g_sg_layer->clip());
+    const bool fk=g_sg_running==sg::ClipVariant::Fk;
+    const auto* fcv=fk?g_sg_fcv_fk[clip]:g_sg_fcv[clip];
+    const auto* seq=fk?g_sg_seq_fk[clip]:g_sg_seq[clip];
+    if(!fcv||!seq)return {};
+    return {reinterpret_cast<uint32_t>(g_sg_work),reinterpret_cast<uint32_t>(fcv),reinterpret_cast<uint32_t>(seq+4)};
+}
 struct GuardNative {   // shield_guard.h PrepareVariant: calcModelAddr 25CB50, getBoundingBox 25D120 (kOcarinaMount pins)
     bool CalcModelAddr(uint32_t bin){
         __try{reinterpret_cast<void(__cdecl*)(uint32_t)>(g_cmb_base+0x25CB50)(bin);return true;}__except(EXCEPTION_EXECUTE_HANDLER){return false;}
@@ -2809,7 +2889,7 @@ struct GuardSources {
     uint32_t Owner(const link_runtime::parry::Candidate& c){return base.Owner(c);}
     bool Routine(uint32_t owner,uint8_t (&out)[2]){return base.Routine(owner,out);}
     bool OwnerPosition(uint32_t owner,float (&out)[3]){link_runtime::parry::general::Memory m;return m.Read(owner+0x94,out,12)&&std::isfinite(out[0])&&std::isfinite(out[2]);}
-    uint64_t Now(){return GetTickCount64();}
+    uint64_t Now(){return link_runtime::parry::general::FollowNow(g_gen);}   // 19-nov: the follow window runs on game time, as tier 2's FollowSources (sweep 3)
 };
 static bool GuardResolve(const link_runtime::parry::Candidate& c){
     namespace g=link_runtime::parry::general;
@@ -3004,8 +3084,11 @@ static void CmbArbiterExit(bool pre,mctx::Sample sample,bool census_own){
     if(player)CmbScene(p.player);
     sample.player_free=player&&p.facts.player_free;sample.sword_sheathed=player&&p.facts.sword_sheathed;
     SwordArbiter(sample,player,p);
-    g_cmb_stagger.Tick(GetTickCount64());
-    g_cmb_sel=player&&p.facts.gameplay?mtg::Select(m,g_cmb_base,g_cmb_tracker,p.pos,CmbTargetConfig(),mtg::Line{},&g_cmb_stagger):mtg::Selection{};
+    uint64_t stagger_ms=0,stagger_generation=0;
+    const bool stagger_ready=g_cmb_md&&CmbStaggerTime(stagger_ms,stagger_generation);
+    if(stagger_ready)g_cmb_stagger.Tick(stagger_ms,stagger_generation);
+    g_cmb_sel=player&&p.facts.gameplay?mtg::Select(m,g_cmb_base,g_cmb_tracker,p.pos,CmbTargetConfig(),mtg::Line{},
+        stagger_ready?&g_cmb_stagger:nullptr):mtg::Selection{};
     if(g_cmb.hitpart_observe&&g_cmb_sel.found&&g_cmb_sel.identity!=g_cmb_hp_identity){
         g_cmb_hp_identity=g_cmb_sel.identity;CmbObserveHitPart(g_cmb_sel.pointer,"mortal_target");
     }
@@ -3219,7 +3302,7 @@ static void CmbPump(uint32_t frame,const CmbPlayer& p,bool player){
     if(g_rip){
         CmbScene(player?p.player:0);
         if(!player||!p.facts.gameplay||p.damaged)g_rip->Cancel(g_cmb_adapter);   // damage/grab/death/scene: withdraw only
-        else {CmbRipostePort port;g_cmb_caller=CmbCaller::Riposte;g_rip->Pump(GetTickCount64(),port,g_cmb_adapter);g_cmb_caller=CmbCaller::None;}
+        else {CmbRipostePort port;g_cmb_caller=CmbCaller::Riposte;g_rip->Pump(link_runtime::parry::general::FollowNow(g_gen),port,g_cmb_adapter);g_cmb_caller=CmbCaller::None;}
     }
     CmbStats(frame);
 }
@@ -3437,6 +3520,45 @@ static int CmbPushMove(void* model){
 static bool SwaCarryOwns(void* model);
 static int SwaCarryMove(void* model);
 #endif
+struct GuardRootBlend {
+    uint32_t player=0;
+    float weight=0.f;
+};
+static thread_local GuardRootBlend g_sg_root;
+static void RestoreGuardRoot(){
+    if(!g_sg_root.player)return;
+    std::memcpy(g_sg_work+0xC8,&g_sg_root.weight,sizeof(g_sg_root.weight));
+    g_sg_root={};
+}
+static bool SuspendGuardRoot(uint32_t player){
+    namespace zt=link_runtime::ztarget::runtime;
+    if(g_sg_root.player||zt::strafe_player!=player)return false;
+    link_runtime::ztarget::strafe::Sample s;
+    if(!zt::StrafeRead(nullptr,s)||s.actor!=player||s.secondary!=reinterpret_cast<uint32_t>(g_sg_work)||
+       !link_runtime::ztarget::strafe::SkipGuardRoot(s,zt::strafe_transport.controller.Active()))return false;
+    g_sg_root={player,s.secondary_weight};
+    constexpr float zero=0.f;
+    std::memcpy(g_sg_work+0xC8,&zero,sizeof(zero));
+    return true;
+}
+static int CmbGuardWalkMove(void* model){
+    const DWORD error=GetLastError();
+    const bool suspended=SuspendGuardRoot(reinterpret_cast<uint32_t>(model));
+    SetLastError(error);
+    if(!suspended)return g_cmb_move_original(model);
+    // MotionMove blends the absolute secondary into the root before primary Core even
+    // when that clip has no root channel. The guard's weight belongs to the later arm blend.
+    __try{return g_cmb_move_original(model);}
+    __finally{RestoreGuardRoot();}
+}
+static void __cdecl GuardStrafeBeforeCore(void* model,void* work,void* camera,uintptr_t caller){
+    const uint32_t player=reinterpret_cast<uint32_t>(model);
+    if(g_sg_root.player==player&&player&&caller==g_cmb_base+0x262DFF&&
+       reinterpret_cast<uint32_t>(work)==player+0x1D8&&!camera){
+        RestoreGuardRoot();
+    }
+    link_runtime::ztarget::runtime::StrafeCore(model,work,camera,caller);
+}
 static int __cdecl CmbMoveDetour(void* model){
     const bool player=model&&reinterpret_cast<uint32_t>(model)==CmbGet<uint32_t>(g_cmb_player_slot);
     if(player){
@@ -3449,7 +3571,7 @@ static int __cdecl CmbMoveDetour(void* model){
     // Magnet first, then the leap: exclusive by lease kind.
     if(!CmbMagnetOwns(model))return CmbLeapOwns(model)?CmbLeapMove(model):CmbBackOwns(model)?CmbBackMove(model):
         CmbFlipOwns(model)?CmbFlipMove(model):CmbLeapSettleOwns(model)?CmbLeapMove(model):
-        g_push.Active()?CmbPushMove(model):g_cmb_move_original(model);
+        g_push.Active()?CmbPushMove(model):CmbGuardWalkMove(model);
     CmbMem m;mmag::Vec2 before;float yaw_before=0.f;
     const bool have_before=mmag::ReadPlayer(m,reinterpret_cast<uint32_t>(model),before,yaw_before);
     const int result=g_cmb_move_original(model);
@@ -3476,8 +3598,13 @@ static void CombatCommitted(const link_runtime::parry::Candidate& candidate,LONG
     CmbLog("parry commit serial=%ld owner=0x%08X owner_id=0x%X reaction=%u riposte=%u",serial,owner,id|uint32_t(type)<<8,g_rx?1U:0U,g_rip?1U:0U);
     if(g_cmb.hitpart_observe&&owner!=g_cmb_hp_owner){g_cmb_hp_owner=owner;CmbObserveHitPart(owner,"parry_owner");}
     if(g_rx)g_rx->OnCommitted(static_cast<uint32_t>(serial),id|uint32_t(type)<<8);
-    if(g_rip){g_rip_id=id;g_rip_type=type;g_rip->OnCommitted(static_cast<uint32_t>(serial),owner,id,type,GetTickCount64());}
-    if(g_cmb_md)g_cmb_stagger.OnCommitted(static_cast<uint32_t>(serial),owner,id,type,GetTickCount64(),CmbTargetConfig());
+    if(g_rip){g_rip_id=id;g_rip_type=type;g_rip->OnCommitted(static_cast<uint32_t>(serial),owner,id,type,link_runtime::parry::general::FollowNow(g_gen));}
+    if(g_cmb_md){
+        uint64_t stagger_ms=0,stagger_generation=0;
+        if(CmbStaggerTime(stagger_ms,stagger_generation))
+            g_cmb_stagger.OnCommitted(static_cast<uint32_t>(serial),owner,id,type,stagger_ms,CmbTargetConfig(),stagger_generation);
+        else g_cmb_stagger.Clear();
+    }
 }
 // Tier-2 block (ResolveParry, game thread): Link's reaction with its own serial space
 // (0x40000000|n, never a tier-1 commit serial). No riposte and no Mortal Draw stagger window.
@@ -3568,7 +3695,8 @@ static bool OcaCardSave(uint32_t base){
 }
 static void OcaOpenSave(){
     g_oca_save_request=false;
-    ImageMem m;const sav::Result r=sav::Allowed(m,g_oca_base);   // same frame, re-checked right before the call
+    ImageMem m;sav::Rules rules;rules.shop_flag_fix=link_runtime::shield::shop_flag_fix;   // the read SongAllowed used, or the re-check undoes it
+    const sav::Result r=sav::Allowed(m,g_oca_base,rules);   // same frame, re-checked right before the call
     if(!g_oca_save_ok||r.block!=sav::Block::None||g_oca_session.state()!=oca::State::Idle){
         OcaRecordPush(9,g_oca_save_ok?sav::Why(r.block):"serenity blocked: save pins",6);return;}
     OcaRecordPush(9,"save open",0,g_oca_base+sav::rva::kCardSaveThunk);
@@ -3908,6 +4036,10 @@ static void SwkHit();
 static bool SwkNoSwing();                       // the block's Follow has no owner routine to arm again (Refuse::NoSwing)
 #if LINK_SWORD_LOCK
 static void SwkForce(void* player);            // [Combat] SwordLockLabForce: the lab-only trigger (lab DLL only)
+static ocr::FocusLatch g_swk_menu_focus;
+using SwkCaseCheck=int(__thiscall*)(void*);
+static SwkCaseCheck g_swk_case_check=nullptr;
+static uint64_t g_swk_case_lease=0;
 static void SwsPollAudio();                     // H3: the duel's sounds on the poll thread (lab DLL only)
 static void SwdlPollAudio();                    // Dark Link's voices on the poll thread (lab DLL only)
 static void SwsvPollAudio();                    // candidate 9: the Salvador's sounds on the poll thread (lab DLL only)
@@ -3937,6 +4069,7 @@ static void PollSwordLock(){
     const unsigned dropped=g_swl_dropped.exchange(0);
     if(dropped)Log("sword_lock dropped=%u lines",dropped);
 #if LINK_SWORD_LOCK
+    if(g_swk_on.load(std::memory_order_acquire))g_swk_menu_focus.Publish(SwordForeground());
     SwsPollAudio();   // H3: inert until StartSwordLockDuel loaded the sounds
     SwdlPollAudio();  // Dark Link's voices: inert until loaded
     SwsvPollAudio();  // candidate 9: the Salvador's sounds, inert until loaded
@@ -4185,6 +4318,8 @@ static void SwlLease(mortal::dispatch::Runtime& run,const swl::World& w){
     const uint64_t token=mortal::resident_assets::ReserveToken();
 #if LINK_SWORD_LOCK
     const mortal::dispatch::Lease lease=SwaHoldLease(token);   // H2b: clip a with the lab's clips resident, else the ocarina loop
+    // Ask the game's unmodified predicate while the player is still in the routine that will be borrowed.
+    const bool could_open_case=g_swk_case_check&&g_swk_case_check(reinterpret_cast<void*>(w.player))==1;
 #else
     const mortal::dispatch::Lease lease{token,g_oca_clip[2],g_oca_clip[3],g_oca_clip[3]+4};
 #endif
@@ -4192,6 +4327,9 @@ static void SwlLease(mortal::dispatch::Runtime& run,const swl::World& w){
     const auto result=token?mortal::trial::TryStartClip(run,g_mortal_native,lease,from):mortal::trial::Attempt{mortal::trial::Status::AssetsMissing};
     const bool started=result.status==mortal::trial::Status::Started&&g_swl_lease==token;
     if(!started)g_swl_lease=0;
+#if LINK_SWORD_LOCK
+    g_swk_case_lease=started&&could_open_case?token:0;
+#endif
     g_swl.LeaseTried(started,w.now);
     if(started){
         SwlLog("sword_lock lease result=started from=%s routine=0x%08X slot_before=0x%08X slot=0x%08X after_ms=%.1f tries=%u token=%u tick=%lu",
@@ -4322,6 +4460,10 @@ static void SwlTick(mortal::dispatch::Runtime* run,void* player){
     if(begin&&(!w.readable||w.player!=reinterpret_cast<uint32_t>(player)||!SwlBegin(w)))return;   // of the current player
     // A hold the lab never ticks (its startup failed after the probe's): released on the next decide, never left frozen.
     if(!lab&&g_swl_cfg.external_release&&g_swl.Holding())g_swl.RequestRelease();
+#if LINK_SWORD_LOCK
+    if(lab&&g_swk.stage()==swk::Stage::Duel&&!g_swk_menu_focus.Take(SwordForeground()))
+        g_swl.ObserveMenuFrame(w.frame,false,false);
+#endif
     const swl::Action a=g_swl.Step(w,run!=nullptr);
 #if LINK_SWORD_LOCK
     if(a.abandon!=swl::Abandon::None&&lab)SwsvMotionRestore("abandon");   // candidate 9: his parts first (they carry the sway too)
@@ -4380,6 +4522,7 @@ static void StartSwordLock(unsigned char* base,uint32_t player_slot,uint32_t glo
 static void __cdecl PlayerFrame(void* player){
     HudFrame();
     zlr::CompanionTick();   // the partner's cast and ray keep going while Link is hit (review 30-oct)
+    zlr::CoreDraw();        // her beam and sparks on the frames CombinedDecide does not run (damage, grab, death, events)
     SwordLockFrame(player); // H0 probe: inert unless StartSwordLock succeeded ([Combat] SwordLockProbe=1)
 }
 // Master Sword Blade Lock H1a: the glyph census (sword_lock_glyphs.h; docs/idea-ambiciosa-2026-11-03.md, hito H1a).
@@ -4636,16 +4779,25 @@ static void SwsPollAudio(){
     }
     first=false;
 }
-// The native parry sparks (CORE 0x1F/0x20, parry_spark_runtime.h EmitFree) at the block's contact point, turned from
-// Link toward it as the Traba's. Cosmetic: a submission only.
+// Native parry sparks (CORE 0x1F/0x20). Each hit break samples the sword once, after this frame's cinematic motion.
 static unsigned SwsSpark(sws::Spark kind){
     if(!g_sws_cfg.sparks||kind==sws::Spark::None)return 0;
     uint32_t player=0;LocalMemory lm;float link[3]{},rot[3]{};ImageMem m;
     if(!lm.Read32(g_swl_player_slot,player)||!link_runtime::IsPointer(player)||!m.Read(player+0x94,link,sizeof(link)))return 0;
-    const float dx=g_swk_hit[0]-link[0],dy=g_swk_hit[1]-link[1],dz=g_swk_hit[2]-link[2];
+    const auto at=sws::SparkAt(kind,{g_swk_hit[0],g_swk_hit[1],g_swk_hit[2]},[](link_runtime::parry::sword::Blade& blade){
+        static link_runtime::sword_trail_log::Tracker tracker;
+        CmbMem memory;
+        if(tracker.Lease()!=g_swl.serial())return tracker.Begin(memory,SwordTrailSlots(),g_swl.serial(),blade);
+        return tracker.Sample(memory,SwordTrailSlots(),blade)!=link_runtime::sword_trail_log::Step::Failed;
+    });
+    const float pos[3]{float(at.point.x),float(at.point.y),float(at.point.z)};
+    const float dx=pos[0]-link[0],dy=pos[1]-link[1],dz=pos[2]-link[2];
     rot[0]=-std::atan2(dy,std::sqrt(dx*dx+dz*dz));rot[1]=std::atan2(dx,dz);
-    const unsigned n=link_runtime::parry::spark::EmitFree(g_gen.sparks,&g_swk_hit,&rot,1);
+    const unsigned n=link_runtime::parry::spark::EmitFree(g_gen.sparks,&pos,&rot,1);
     g_sws_sparks[static_cast<unsigned>(kind)]+=n;
+    if(kind==sws::Spark::Hit)
+        SwlLog("sword_lock duel spark kind=hit submitted=%u game_ms=%.1f tick=%lu anchor=%s xyz=%.1f,%.1f,%.1f",
+            n,g_swk.duel().game_ms(),GetTickCount(),at.on_blade?"blade":"parry",at.point.x,at.point.y,at.point.z);
     return n;
 }
 static const char* g_swk_draw_stun="-";   // candidate 3: the draw stun's shot for the end line (SwkDrawStun)
@@ -5173,7 +5325,8 @@ static bool SwcPrepare(void* self,uint32_t caller,const swcz::Matrix* matrix,con
     const double h=fresh&&g_swc_cam.Active()?double(link_runtime::game_clock::ValidDt(fr.dt))/30.0:0.0;
     g_swc_frame=fr.frame;
     g_swc_shot=g_swc_cam.Step(f,h);
-    if(!g_swc_shot.apply){SwcCamLines();return false;}
+    SwcCamLines();   // 19-nov: a new duel during the hand-back closes the old one with apply still true; log it now
+    if(!g_swc_shot.apply)return false;
     if(!g_swc_owner_ok){SwcCamAbort(swc::End::Owner);return false;}
     const swcz::Vec link=fr.pos,b{mat.v[0][3],mat.v[1][3],mat.v[2][3]};
     const swcz::Vec ncam=swc::Add(swcz::World(mat,in.campos[0]),b),nlook=swc::Add(swcz::World(mat,in.target),b);
@@ -5668,7 +5821,7 @@ static void SwkQueued(const link_runtime::parry::general::Applied& a){
     std::memcpy(g_swk_hit,a.hit,sizeof(g_swk_hit));
 }
 // The lab guard: while the world is ours (the duel and its exit slide), as the frozen owner cannot swing then, and
-// through a win's Great Spin after the world goes on: its lease blocks tier 2 (mortal_blocks), so the Follow rearmed at
+// through a win's Great Spin after the world goes on: its lease blocks tier 2 (sword_action_blocks), so the Follow rearmed at
 // the release cannot cancel the owner's resumed swing when the flash was not published (6-nov: input_blocked, 800 landed).
 static bool SwkGuarding(){return g_swl.Holding()||g_swk.Holding()||(g_sword_action.lease&&g_sword_action.request.lab_win);}
 static void SwkHit(){if(g_swk.stage()==swk::Stage::After)++g_swk_hits;}
@@ -5911,7 +6064,7 @@ static void SwkReaders(const char* at,double t_ms,uint32_t bits=swk::bits::kMask
         ps.window.down?1U:0U,ps.window.armed?1U:0U,link_runtime::parry::input::Blocks()?1U:0U,t_ms,GetTickCount());
 }
 static void SwkRearm(){
-    g_swk_follow=swk::Rearm<link_runtime::parry::general::Grace,link_runtime::parry::general::Swing>(g_gen.grace,g_swk_swing,GetTickCount64());
+    g_swk_follow=swk::Rearm<link_runtime::parry::general::Grace,link_runtime::parry::general::Swing>(g_gen.grace,g_swk_swing,link_runtime::parry::general::FollowNow(g_gen));   // the clock tier 2 reads its follow-ups on
 }
 // The world runs again (after the flash, the slide or an abandon): the parry cut dropped (the rearmed Follow must reach
 // tier 2), the held bits stay masked until released, the after watch starts; the end lines.
@@ -6232,7 +6385,10 @@ static void SwkFrame(mortal::dispatch::Runtime* run,const swl::World& w){
         return;
     case swk::Stage::Duel:{
         CmbMem m;   // read only, never written: 0x806F39, the MENUS set, a sub-screen request
-        const bool paused=swk::Paused(swk::ReadContext(m,g_swk_base));
+        const swk::PadContext ctx=swk::ReadContext(m,g_swk_base);
+        const bool paused=swk::Paused(ctx);
+        if(ctx.duel_menu&&g_swl.ObserveMenuFrame(w.frame,true,g_swk_menu_focus.Take(SwordForeground())))
+            g_swk.HoldMenuClock(w.now);
         const uint32_t ev=g_swk.Tick(w.now,paused);
         const swk::sd::Duel& d=g_swk.duel();
         g_swd_offers.Events(ev,d.last_break(),d.game_ms());   // H1d: the per-press gap and the break's feedback
@@ -6247,8 +6403,7 @@ static void SwkFrame(mortal::dispatch::Runtime* run,const swl::World& w){
             g_swsv.Tick(vf);SwsvPublish();
         }
         SwdlVoiceTick(w,paused);      // Dark Link: his strain by the band, his win / lose voice once (nothing against the Salvador)
-        if(const unsigned n=SwsSpark(sws::SparkOnTick(ev)))   // H3: a hit break's sparks on the blades
-            SwlLog("sword_lock duel spark kind=hit submitted=%u game_ms=%.1f tick=%lu",n,d.game_ms(),GetTickCount());
+        SwsSpark(sws::SparkOnTick(ev));
         const double t_ms=g_swk.ElapsedMs(w.now);
         const swk::sd::Input& in=g_swk.last_input();
         if(ev&&g_swk_cfg.log&&in.pressed)SwlLog("sword_lock duel input press=0x%X held=0x%X ev=0x%X flanks=%u phase=%s paused=%u t_ms=%.1f duel_ms=%.1f tick=%lu",
@@ -6340,9 +6495,12 @@ static void SwordLockPad(){
     CmbMem m;uint32_t on=0,trg=0;
     if(!m.Read(g_swk_base+ck::rva::kKeyOn,&on,4)||!m.Read(g_swk_base+ck::rva::kKeyTrg,&trg,4))return;
     // The MENUS binding set (a pause or a menu opened mid-duel): its Enter/Esc/arrows pass and feed nothing to the duel.
-    const swk::PadOut o=g_swk.Pad(on,trg,swk::ReadContext(m,g_swk_base));
+    const swk::PadContext ctx=swk::ReadContext(m,g_swk_base);
+    const swk::PadOut o=g_swk.Pad(on,trg,ctx);
     if(o.write){m.Write(g_swk_base+ck::rva::kKeyOn,&o.on,4);m.Write(g_swk_base+ck::rva::kKeyTrg,&o.trg,4);}
-    if(swk::Paused(swk::ReadContext(m,g_swk_base))){   // no player frame runs under a menu: SwkFrame cannot hide or silence there
+    if(g_swk.stage()==swk::Stage::Duel&&g_swl.ObserveMenuFrame(CmbFrame(),ctx.duel_menu,g_swk_menu_focus.Take(SwordForeground())))
+        g_swk.HoldMenuClock(GameNow(g_swl_global_slot));
+    if(swk::Paused(ctx)){   // no player frame runs under a menu: SwkFrame cannot hide or silence there
         if(g_swi_painter.visible())SwiPause();
         // The directors keep their state: the next duel tick publishes the loops again (or SwkEnded their silence).
         g_sws_loops.store(0,std::memory_order_release);g_swsv_loops.store(0,std::memory_order_release);g_swdl_loops.store(0,std::memory_order_release);
@@ -6416,6 +6574,22 @@ static void SwordLockDuelExit(){
             unsigned(active),unsigned(btn),unsigned(kind),unsigned(qte),stop,sel,d.duel_ms(),GetTickCount());
     }
 }
+// The native routine check rejects every r0=5, including the pose borrowed by a duel. All other SubScreenCall
+// guards (life, enable, timer, inventory key and task availability) still run in their original order.
+static int __fastcall SwkCaseCheckDetour(void* self,void*){
+    const int native=g_swk_case_check(self);
+    if(native||!g_swk_on.load(std::memory_order_acquire)||g_swk.stage()!=swk::Stage::Duel)return native;
+    const uint32_t caller=reinterpret_cast<uint32_t>(_ReturnAddress())-g_swk_base;
+    const uint32_t trg=CmbGet<uint32_t>(g_swk_base+link_runtime::case_key_debounce::rva::kKeyTrg);
+    if(!swk::BorrowedCaseQuery(caller,trg,g_swk_case_lease,g_swl_lease)||!g_swl.Holding()||!SwordForeground())return native;
+    CmbMem mem;const auto ctx=swk::ReadContext(mem,g_swk_base);
+    if(!ctx.live||swk::Paused(ctx))return native;
+    const swl::World w=SwlWorld();
+    if(!w.readable||w.player!=reinterpret_cast<uint32_t>(self)||g_swl.Judge(w)!=swl::Abandon::None||
+       !mortal::dispatch_hooks::runtime.Owns(static_cast<unsigned char*>(self)))return native;
+    SwlLog("sword_lock duel case eligible=1 owner=0x%08X token=%u tick=%lu",g_swl.owner(),static_cast<unsigned>(g_swl_lease),GetTickCount());
+    return 1;
+}
 // Worker, after StartSwordLock and the census. Logs nothing with the keys 0 (the 3.5.0 log).
 static void StartSwordLockDuel(unsigned char* base,const wchar_t* directory){
     if(!g_swk_cfg.On())return;
@@ -6432,6 +6606,15 @@ static void StartSwordLockDuel(unsigned char* base,const wchar_t* directory){
         return;
     }
     g_swk_base=b;
+    static constexpr link_runtime::native_pins::Pin case_pins[]={
+        {0x369214,"8b0d5470c500e8fbe5c9ff83f801756c"},{0x781A,"e981462700"},
+        {0x27BEA0,"80b9fc00000000751f8a81fd0000003c0675188a89fe00000080f902740a80f904740580f905752733c0c33c0b74e4"
+                  "3c0f75148a89fe00000080f902741133c080f90a0f94c0c33c0476043c1175d9b801000000c3"}};
+    // Hook only the thunk used by SubScreenCall. The pinned full predicate itself remains the game's.
+    const bool case_ready=PinsAt(b,case_pins)&&CmbHook(0x781A,reinterpret_cast<void*>(&SwkCaseCheckDetour),
+                                                       reinterpret_cast<void**>(&g_swk_case_check),"sword_lock_case");
+    if(!case_ready)g_swk_case_check=nullptr;
+    Log("sword_lock duel case hook=%u",case_ready?1U:0U);
     g_swk_offer_hook=g_cmb_arbiter_original&&PinsAt(b,link_runtime::native_pins::kMortalDrawPrompt);
     g_swk_slide_hook=g_cmb_move_original!=nullptr;
     SwaLoad(directory);   // H2b: the five clips (Bin32\sword_lock_lab or Bin32) before the duel goes live, or H1c's hold
@@ -6587,10 +6770,13 @@ static void StartHud(unsigned char* base,uint32_t player_slot,uint32_t global_sl
 }
 static void __cdecl CombinedDecide(mortal::dispatch::Runtime& run,void* player){
     UserIniApply();   // user-ini-01: a new cosmetic snapshot from the worker, before this dispatch's readers (the arbiter and the lifecycle may read the previous one for one frame: same thread, cosmetic)
-    zlr::Frame();   // Zelda's light ray: shares the freshly applied particle switch and gain
+    // (zlr::Frame runs below, after the freezes OcarinaDecide and SwordLockDecide may begin in this dispatch)
     link_runtime::sword_trail::probe::runtime::Frame();   // Task 3b probe: no-op unless SwordTrailProbe=1 started it
     if(g_oca_on.load(std::memory_order_acquire))OcarinaDecide(run,player);
     if(g_swl_on.load(std::memory_order_acquire))SwordLockDecide(run,player);   // H0 probe ([Combat] SwordLockProbe=1 only)
+    // After both: a Stop_flg hold begun in this dispatch is seen by the partner's tick (zc::WorldHeld), so her ray never
+    // leaves a record pending on a Ganado frozen this same frame (the lock's exit blow would be refused as pending).
+    zlr::Frame();   // Zelda's light ray: shares the freshly applied particle switch and gain
     if(g_oca_session.state()==oca::State::Idle&&!OcaOwnsLease()){
         SwordDecide(run,player);CombatDecide(run,player);
     }
@@ -6950,9 +7136,9 @@ static bool StartMortalTrial(unsigned char* base,unsigned size,const wchar_t* di
             auto& dispatch=mortal::dispatch_hooks::runtime;
             return mortal::dispatch_hooks::OwnedThread()&&dispatch.enabled&&!dispatch.busy&&!dispatch.current&&
                 !dispatch.active&&!dispatch.observing&&!dispatch.transitioned&&!g_oca_save_request&&
-                dispatch.Current(reinterpret_cast<void*>(actor));},&Log)){
+                dispatch.Current(reinterpret_cast<void*>(actor));},GuardStrafeClip,&Log)){
             mortal::dispatch_hooks::normal_forward=&link_runtime::ztarget::runtime::StrafeNormal;
-            mortal::dispatch_hooks::before_core=&link_runtime::ztarget::runtime::StrafeCore;
+            mortal::dispatch_hooks::before_core=&GuardStrafeBeforeCore;
         }
         status=mortal::dispatch_hooks::Observe();
         if(status!=MH_OK){Log("MortalDrawTrial hook enable failed=%s; resident state retained",MH_StatusToString(status));return false;}
@@ -7393,6 +7579,7 @@ static DWORD WINAPI Worker(LPVOID) {
     const bool low_health_shop_fix = GetPrivateProfileIntW(L"LinkRuntime", L"LowHealthShopFlagFix", 1, path) == 1;
     g_cmb_shop_flag_fix = GetPrivateProfileIntW(L"LinkRuntime", L"CombatShopFlagFix", 1, path) == 1;
     link_runtime::shield::shop_flag_fix = g_cmb_shop_flag_fix;   // parry input, rear shield and ocarina follow the same switch
+    link_runtime::ztarget::shop_flag_fix = g_cmb_shop_flag_fix;  // the Z-target frame too (lock, neutral Z, guard, lift and orbit cameras)
     Log("combat shop_flag_fix=%u (CombatShopFlagFix)", g_cmb_shop_flag_fix ? 1U : 0U);
     bool trace = GetPrivateProfileIntW(L"LinkRuntime", L"TraceKnife", 0, path) == 1;
     link_runtime::chapter::Config chapter_settings;

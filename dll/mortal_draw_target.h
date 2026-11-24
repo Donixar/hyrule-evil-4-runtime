@@ -396,13 +396,18 @@ class StaggerWindow {
 public:
     enum class End : uint8_t { None, Expired, Left, Identity, Replaced, Cleared };
     struct Stats { unsigned armed = 0, admitted = 0, expired = 0, left = 0, identity = 0, replaced = 0, ignored = 0; End last = End::None; };
-    void OnCommitted(uint32_t serial, uint32_t actor, uint8_t id, uint8_t type, uint64_t now_ms, const Config& c) {
+    void OnCommitted(uint32_t serial, uint32_t actor, uint8_t id, uint8_t type, uint64_t now_ms, const Config& c,
+                     uint64_t generation = 0) {
         if (!serial || !actor || serial == serial_) { ++stats_.ignored; return; }
         if (armed_) Finish(End::Replaced);
         serial_ = serial; actor_ = actor; id_ = id; type_ = type; identity_ = 0;
-        now_ = now_ms; until_ = now_ms + c.stagger_ms; armed_ = true; ++stats_.armed;
+        now_ = now_ms; until_ = now_ms + c.stagger_ms; generation_ = generation; armed_ = true; ++stats_.armed;
     }
-    void Tick(uint64_t now_ms) { now_ = now_ms; if (armed_ && now_ > until_) Finish(End::Expired); }
+    void Tick(uint64_t now_ms, uint64_t generation = 0) {
+        now_ = now_ms;
+        if (armed_ && generation != generation_) Finish(End::Cleared);
+        if (armed_ && now_ > until_) Finish(End::Expired);
+    }
     void Clear() { if (armed_) Finish(End::Cleared); }
     bool Armed() const { return armed_; }
     uint32_t Actor() const { return armed_ ? actor_ : 0; }
@@ -435,7 +440,7 @@ private:
     bool armed_ = false;
     uint32_t serial_ = 0, actor_ = 0;
     uint8_t id_ = 0, type_ = 0;
-    uint64_t identity_ = 0, now_ = 0, until_ = 0;
+    uint64_t identity_ = 0, now_ = 0, until_ = 0, generation_ = 0;
     Stats stats_;
 };
 

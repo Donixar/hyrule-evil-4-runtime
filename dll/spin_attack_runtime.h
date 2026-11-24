@@ -186,20 +186,20 @@ static void BackAbort(uint32_t frame,const char* why,const bks::Plan* p=nullptr)
     if(p)CmbLog("back_slice abort frame=%u reason=%s side=%d d=%.0f dy=%.0f",frame,why,p->side,double(p->d),double(p->dy));
     else CmbLog("back_slice abort frame=%u reason=%s",frame,why);
 }
-// The tap with A/D held (BashArbiter): the request SwordDecide starts on the spin's clip.
-static void BackRequest(const sword::Input& input,const CmbPlayer& p,int side){
+// The tap with A/D held (BashArbiter): the request SwordDecide starts on the spin's clip. false: refused for its target or clip (not its cooldown), the tap goes on.
+static bool BackRequest(const sword::Input& input,const CmbPlayer& p,int side){
     const uint32_t frame=static_cast<uint32_t>(input.frame);
     sword::target::Target t;mtg::Raw r;
     bool ok=BackTarget(g_back_lock,t,r);
     if(!ok)ok=BackTarget(BackCurrentLock(),t,r);
     const auto plan=bks::Decide(g_cmb.back,side,ok,{p.pos.x,p.pos.y,p.pos.z},{r.pos.x,r.pos.y,r.pos.z},g_back_have_last,g_back_last,input.time);
-    if(plan.why!=bks::Why::Ok){BackAbort(frame,bks::WhyName(plan.why),&plan);return;}
-    if(!g_sword_spin_clip.ready||!g_cmb.line_waiver){BackAbort(frame,"no_clip");return;}
+    if(plan.why!=bks::Why::Ok){BackAbort(frame,bks::WhyName(plan.why),&plan);return !bks::HandsOn(plan.why);}   // far, off level, no target: not swallowed
+    if(!g_sword_spin_clip.ready||!g_cmb.line_waiver){BackAbort(frame,"no_clip");return false;}
     t.distance=plan.d;
     g_sword_request={SwordKind::Back,input.time,input.scene,input.player,input.weapon,frame,t};
     g_sword_request.back=plan;
     CmbLog("back_slice request frame=%u side=%s actor=0x%08X id=0x%02X type=0x%02X d=%.0f dy=%.0f radius=%.0f sweep_deg=%.0f",frame,
-        side<0?"right":"left",t.pointer,t.id,t.type,double(plan.d),double(plan.dy),double(plan.radius),double(plan.sweep)*57.29578);
+        side<0?"right":"left",t.pointer,t.id,t.type,double(plan.d),double(plan.dy),double(plan.radius),double(plan.sweep)*57.29578);return true;
 }
 // ---- Backflip (backflip.h; backflip-01, 30-oct) --------------------------------------------------------------------
 namespace bfl=link_runtime::backflip;
@@ -269,7 +269,8 @@ static void BashArbiter(const sword::Input& input,bool priority,bool occupied,co
     }
     sbash::Input s;s.frame=input.frame;s.time=input.time;s.scene=input.scene;s.player=input.player;
     s.valid=input.valid&&!occupied&&!SwordBusy()&&zr::live.load(std::memory_order_acquire);
-    s.ready=!priority&&SwordChargeRoutine(p.routine,input.knife);
+    // The put-away and the entry step count for the tap's press too: its request already waits for them (PendingRoutine).
+    s.ready=!priority&&(SwordChargeRoutine(p.routine,input.knife)||sword::ChargeWait(p.routine));
     s.knife=input.knife;s.knife_edge=input.knife_edge;s.fire=input.fire||input.fire_edge;s.z=s.valid&&zr::Held();
     const auto e=g_bash_tap.Step(s);
     if(e!=sbash::Event::None&&e!=sbash::Event::Bash)
@@ -287,9 +288,9 @@ static void BashArbiter(const sword::Input& input,bool priority,bool occupied,co
     // since the press) the A/D tap is the Shield Bash, so strafing and tapping in neutral always does something.
     const bool slice=g_cmb.BackSlice()&&side&&(g_back_lock.valid||BackCurrentLock().valid);
     const auto tap=bfl::Pick(g_cmb.BackSlice(),side,slice,g_cmb.Backflip(),back);
-    if(tap==bfl::Tap::BackSlice){BackRequest(input,p,side);g_back_lock={};return;}
-    if(tap==bfl::Tap::Backflip){FlipRequest(input,p);g_back_lock={};return;}
-    if(g_cmb.BackSlice()&&side)CmbLog("back_slice no_target frame=%u side=%d: shield bash instead",static_cast<unsigned>(input.frame),side);
+    if(tap==bfl::Tap::BackSlice&&BackRequest(input,p,side)){g_back_lock={};return;}   // false: refused, the tap is not swallowed
+    if((tap==bfl::Tap::BackSlice?bfl::Pick(false,0,false,g_cmb.Backflip(),back):tap)==bfl::Tap::Backflip){FlipRequest(input,p);g_back_lock={};return;}   // a refused slice: S still flips
+    if(g_cmb.BackSlice()&&side&&tap!=bfl::Tap::BackSlice)CmbLog("back_slice no_target frame=%u side=%d: shield bash instead",static_cast<unsigned>(input.frame),side);   // a refused slice already logged its abort
     g_back_lock={};
     if(!g_cmb.ShieldBash())return;
     // spin-fix-01: with its TP clip the bash is a sword request; the push lands on the clip's impact frame (SwordDecide).
@@ -556,6 +557,8 @@ static void SwordArbiter(mctx::Sample sample,bool player,const CmbPlayer& p){
     const bool ocarina=g_oca_session.state()!=oca::State::Idle;
     SwordInterruptActive(input,priority||ocarina,ending_priority||ocarina,lab_priority||ocarina);
     input.safe=input.valid&&!priority&&!occupied&&SwordChargeRoutine(p.routine,input.knife);
+    // Unsafe only because the knife is in its own put-away or the entry step: the charge keeps a press seen here.
+    input.knife_wait=input.valid&&!priority&&!occupied&&!input.safe&&sword::ChargeWait(p.routine);
     BashArbiter(input,priority,occupied,p);   // Shield Bash (shield_bash.h): Z key held + knife tap; inert when off
     // spin-fix-01: a queued request is kept through the knife's own draw/put-away (sword::PendingRoutine) and dropped
     // with the reason named (was one context_or_native for all; every Back Slice died on its own release frame).
@@ -575,6 +578,7 @@ static void SwordArbiter(mctx::Sample sample,bool player,const CmbPlayer& p){
         }
     }
     auto charge=input;charge.safe=charge.safe&&!input.fire&&!input.fire_edge&&g_sword_request.kind==SwordKind::None;
+    charge.knife_wait=charge.knife_wait&&!input.fire&&!input.fire_edge&&g_sword_request.kind==SwordKind::None;   // an attack or a queued request still drops the press
     const auto event=g_cmb.spin_attack?g_sword_charge.Step(charge):spin::Event::None;
     if(event!=spin::Event::None)CmbLog("spin_charge frame=%u event=%u time60=%.3f",static_cast<unsigned>(sample.frame),static_cast<unsigned>(event),input.time);
     if(event!=spin::Event::None)ChargeEvent(event,input.time,input.player);   // charge-glow-01: inert unless SwordCharge is on
@@ -1208,7 +1212,7 @@ static bool SwordLifecycle(mortal::dispatch::Event event,uint64_t token){
         SwordHandBegin(token,g_sword_starting);
         SwordTrailBegin(token,g_sword_starting,g_sword_action.request.great);
         TrailBegin(token,g_sword_starting,g_sword_action.request.great,g_sword_action.request.player);
-        link_runtime::parry::input::SetMortalBlocks(true);return true;
+        link_runtime::parry::input::SetSwordActionBlocks(true);return true;   // refuses the window, keeps the button tracked
     }
     if(!token||token!=g_sword_action.lease)return g_sword_starting!=SwordKind::None;
     if(event==mortal::dispatch::Event::Started)return true;
@@ -1242,7 +1246,7 @@ static bool SwordLifecycle(mortal::dispatch::Event event,uint64_t token){
 #endif
     CmbLog("%s_end lease=%llu event=%u struck=%u published=%u applied=%u skipped=%u",SwordName(a.request.kind),token,
         static_cast<unsigned>(event),a.struck?1U:0U,a.hits.Published(),a.hits.Applied(),a.hits.Skipped());
-    a={};g_sword_charge.Cancel();link_runtime::parry::input::SetMortalBlocks(false);return true;
+    a={};g_sword_charge.Cancel();link_runtime::parry::input::SetSwordActionBlocks(false);return true;
 }
 // Leap takeoff on the start frame, after the face yaw (ending_blow_leap.h Plan): logs the plan; with
 // EndingBlowLeap=1 the leap begins and CmbMoveDetour carries Link from this frame's MotionMove on.

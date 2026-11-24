@@ -23,6 +23,7 @@ struct Fake {
     uint8_t routine[2] = {1, 0x0B};   // the owner's cEm r0/r1 ([em+0xFC], [em+0xFD])
     bool routine_ok = true;
     unsigned routine_reads = 0;
+    g::Swing blade{};
     g::Descriptor d{250.f, 8, 380, 0, 0}, second{250.f, 8, 380, 0, 0};
     bool vary = false;
     unsigned consumes = 0, peeks = 0, descriptor_reads = 0;
@@ -49,6 +50,9 @@ struct Fake {
         SawMem m{*this}; return g::ChainsawOwner(m, c.outer_caller - kBase, c.producer_esi);
     }
     bool Routine(uint32_t who, uint8_t (&out)[2]) {++routine_reads; if (!routine_ok || !who) return false; out[0] = routine[0]; out[1] = routine[1]; return true;}
+    uint32_t KrauserBlade(const p::Candidate&, g::Swing& current) {
+        current = blade; return blade.KrauserBlade() ? owner : 0;
+    }
     uint64_t Now() {return now;}
     bool Refresh() {return refresh;}
     bool Consume() {++consumes; const bool ok = press; press = false; return ok;}   // one press = one defense
@@ -240,6 +244,24 @@ static void FollowUp() {
       v.now += 60; Check(!Go(v, kRegen, late).cancel, "120 ms after the block, at the back: the gates apply (another attacker)"); }
     u.now += 16; u.At(0, 500); u.frontal = true; Check(Go(u, kRegen, follow).follow && u.consumes == 1, "unknown owner in front without the sword pose: same swing, silent follow (U3 30-oct)");
     u.now += 16; u.pose = true; Check(Go(u, kRegen, follow).follow, "unknown owner in front: still followed after the gates");
+
+    // r31c: a proven blade still lands on the far side 110 ms later, after the pose drops.
+    for (unsigned scenario = 0; scenario < 6; ++scenario) {
+        g::Follow sweep; Fake blade_source;
+        blade_source.d = blade_source.second = {200.f, 8, 1500, 0, 0};
+        blade_source.blade = {true, {1, 0x29}, 0x9349000, 29, 0x97495f0, 19.f};
+        Check(Go(blade_source, g::kKrauserBladeRet, sweep).cancel, "qualify the fresh em39 sword block");
+        blade_source.now += scenario == 5 ? 176 : 110;
+        blade_source.pose = false; blade_source.frontal = false; blade_source.At(0, -650);
+        blade_source.blade.cursor += 3.f;
+        if (scenario == 1) blade_source.blade = {};         // kick/off-phase: no blade proof, so cannot borrow its follow
+        if (scenario == 2) ++blade_source.blade.guid;       // owner pointer reused
+        if (scenario == 3) ++blade_source.blade.motion;     // a new primary motion
+        if (scenario == 4) blade_source.blade.cursor = 2;   // same routine, new animation episode
+        const auto continuation = Go(blade_source, g::kKrauserBladeRet, sweep);
+        Check(continuation.cancel == (scenario == 0) && continuation.follow == (scenario == 0) && blade_source.consumes == 1,
+              "only this blade can follow with an unseen pose and no second press");
+    }
 }
 // Chainsaw (Donald 28-oct, play-20261028/tests/04-chainsaw.log): block at 0x2C249 (power 9999, owner_id 0), then
 // 31 ms later 0x2C2CA at Link's side passed as `rear` and killed him. ESI of em10CsawHitCk is the owner now.
@@ -634,8 +656,158 @@ static void DrawGuard() {
         Check(GoGrace(d, kEm10, follow, grace, 3.0).follow, "hidden pose within 100 ms still follows the press-blocked swing");}
 }
 
+// Review 17-nov: a sword action or the Mortal Draw is a soft block (the optional source HardBlocked() says false). It
+// refuses a new press, the grace window and the draw fallback, never the press-free follow-ups of a swing already
+// blocked (a flail back mid Shield Bash passed as input_blocked and landed). The ocarina and the Blade Lock stay hard.
+// Go() takes Fake& and would hide the new source, so these cases call Run on the derived type.
+struct Soft : Fake {bool hard = false; bool HardBlocked() {return hard;}};
+static g::Outcome GoSoft(Soft& f, uint32_t ret, g::Follow& follow, g::Grace* grace = nullptr, double game_now = 0) {
+    g::Outcome o; f.follow = &follow;
+    const bool r = g::Run(f, Hit(ret), {g::Mode::Active, true, true}, follow, false, o, grace, game_now);
+    Check(r == o.cancel, "Run returns the outcome's cancel (soft block)");
+    return o;
+}
+static void SoftBlock() {
+    {   // the 28-oct flail: blocked, then the lease starts before the chain comes back behind Link
+        g::Follow follow; Soft f; f.now = 0;
+        Check(GoSoft(f, kEm10, follow).consumed && f.consumes == 1, "flail blocked with the press before the sword action");
+        f.blocked = true; f.now = 453; f.At(0, -500); f.frontal = false;
+        const auto back = GoSoft(f, kEm10, follow);
+        Check(back.cancel && back.follow && back.long_follow && back.reason == g::Reason::Blocked && f.consumes == 1,
+              "soft block: the chain back 453 ms later is still the blocked swing, no press");
+        f.now = 500; f.pose = false;
+        Check(GoSoft(f, kEm10, follow).follow && f.consumes == 1, "soft block, sword hidden by the clip: still followed by its owner");
+        f.now = 560; f.pose = true; f.At(0, 500); f.frontal = true; f.routine[1] = 0x0C; f.press = true;
+        const auto next = GoSoft(f, kEm10, follow);
+        Check(!next.cancel && next.reason == g::Reason::InputBlocked && f.consumes == 1, "soft block: the owner's next attack lands, the press is kept");
+    }
+    {   // a new swing during the lease: refused before any input is read
+        g::Follow follow; Soft f; f.blocked = true;
+        const auto o = GoSoft(f, kEm10, follow);
+        Check(!o.cancel && o.reason == g::Reason::InputBlocked && !f.consumes && !f.peeks && !follow.armed, "soft block: a new swing takes no press and arms nothing");
+    }
+    {   // the hidden-sword fallback is a press too
+        g::Follow follow; Soft f; f.blocked = true; f.pose = false; f.guard = true;
+        const auto o = GoSoft(f, kEm10, follow);
+        Check(!o.cancel && !o.pose_fallback && o.reason == g::Reason::InputBlocked && !f.guard_reads && !f.consumes && !follow.armed,
+              "soft block: no draw fallback, its guard is never read");
+    }
+    {   // the grace window admits nothing new; a swing it blocked before the lease is still followed
+        g::Follow follow; g::Grace grace; grace.Configure(200);
+        Fake a; Check(GoGrace(a, kEm10, follow, grace, 0.0).grace_opened, "press block opens the grace window");
+        Soft b; b.owner = 0x8BCFB28; b.press = false; b.blocked = true; b.now = a.now + 100;
+        const auto in = GoSoft(b, kEm10, follow, &grace, 6.0);
+        Check(!in.cancel && !in.grace && in.reason == g::Reason::InputBlocked && grace.blocked == 0 && grace.open, "soft block: a second attacker inside the grace window lands");
+        b.blocked = false; b.now += 10;
+        Check(GoSoft(b, kEm10, follow, &grace, 6.6).grace && grace.blocked == 1, "without the block the grace takes it");
+        b.blocked = true; b.now += 230;
+        const auto later = GoSoft(b, kEm10, follow, &grace, 20.4);
+        Check(later.cancel && later.follow && later.grace && grace.blocked == 1, "soft block: the grace-blocked swing's chain back is still followed");
+    }
+    {   // the ocarina and the Blade Lock refuse the follow-ups too, as does any source without HardBlocked()
+        g::Follow follow; Soft f; f.now = 0;
+        Check(GoSoft(f, kEm10, follow).consumed, "flail blocked before a hard block");
+        f.blocked = f.hard = true; f.now = 453; f.At(0, -500); f.frontal = false;
+        const auto o = GoSoft(f, kEm10, follow);
+        Check(!o.cancel && !o.follow && o.reason == g::Reason::InputBlocked && f.consumes == 1, "hard block: the armed follow-up is not consulted");
+        g::Follow plain_follow; Fake plain; plain.now = 0;
+        Check(Go(plain, kEm10, plain_follow).consumed, "flail blocked (source without HardBlocked)");
+        plain.blocked = true; plain.now = 453;
+        Check(Go(plain, kEm10, plain_follow).reason == g::Reason::InputBlocked, "a source without HardBlocked() is a hard block");
+    }
+    {   // unknown owner: only the distance follow-up, under its usual gates
+        g::Follow follow; Soft u; Check(GoSoft(u, kRegen, follow).consumed, "block a producer without an owner");
+        u.blocked = true; u.now += 16; u.At(0, -500);
+        Check(GoSoft(u, kRegen, follow).follow && u.consumes == 1, "soft block: at Link's back 16 ms after the block, the same swing");
+        g::Follow late; Soft v; Check(GoSoft(v, kRegen, late).consumed, "block (late rear check)");
+        v.blocked = true; v.now += 60; v.At(0, -500); v.frontal = false;
+        Check(GoSoft(v, kRegen, late).follow, "soft block: 60 ms, at the back: same swing");
+        v.now += 60;
+        const auto rear = GoSoft(v, kRegen, late);
+        Check(!rear.cancel && rear.reason == g::Reason::InputBlocked, "soft block: 120 ms after the block, at the back: another attacker lands");
+        g::Follow ahead; Soft w; Check(GoSoft(w, kRegen, ahead).consumed, "block (front follow-ups)");
+        w.blocked = true; w.now += 90; Check(GoSoft(w, kRegen, ahead).follow, "soft block: in front at 90 ms: same swing");
+        w.now += 90; Check(GoSoft(w, kRegen, ahead).follow, "soft block: in front at 180 ms with the sword pose: still followed by distance");
+        w.now += 90; w.pose = false;
+        const auto hidden = GoSoft(w, kRegen, ahead);
+        Check(!hidden.cancel && hidden.reason == g::Reason::InputBlocked && w.consumes == 1, "soft block: a hidden pose past 100 ms is not followed by distance");
+    }
+}
+// Review 17-nov: the runtime gives the follow-ups game time (FollowMs: 60 Hz frames as ms), so a pause, the case or a
+// hitch after a block no longer ages the blocked swing. The policy reads one clock: every step sets Fake::now from
+// (game frames, wall ms) as the runtime's FollowNow does.
+static void FollowClock() {
+    Check(g::FollowMs(false, 600.0, 5000) == 5000 && g::FollowMs(true, 600.0, 5000) == 10000 && g::FollowMs(true, 606.0, 123456789) == 10100,
+          "game time when known (wall ignored), else the wall clock");
+    Check(g::FollowMs(true, NAN, 5000) == 5000 && g::FollowMs(true, INFINITY, 5000) == 5000 && g::FollowMs(true, 0.0, 5000) == 5000 &&
+          g::FollowMs(true, -1.0, 5000) == 5000, "an unreadable game time falls back to the wall clock");
+    {   // the flail under a pause: 2 s of wall time, 453 ms of game time
+        double game = 600.0; uint64_t wall = 50000;
+        g::Follow follow; Fake f; f.now = g::FollowMs(true, game, wall);
+        Check(Go(f, kEm10, follow).consumed, "flail blocked (game clock)");
+        wall += 2000; game += 27.2; f.now = g::FollowMs(true, game, wall); f.At(0, -500); f.frontal = false;
+        const auto back = Go(f, kEm10, follow);
+        Check(back.cancel && back.follow && back.long_follow && back.follow_gap_ms == 453 && f.consumes == 1,
+              "a 2 s pause inside the chain's return: still the blocked swing, gap in game ms");
+        g::Follow old; Fake w; w.now = g::FollowMs(false, 600.0, 50000);
+        Check(Go(w, kEm10, old).consumed, "flail blocked (wall clock)");
+        w.now = g::FollowMs(false, 627.2, 52000);
+        const auto landed = Go(w, kEm10, old);
+        Check(!landed.cancel && landed.reason == g::Reason::Window && !old.armed, "on the wall clock the same pause ended the follow-up (the old behaviour)");
+    }
+    {   // unknown owner: the 100 ms gap in game time
+        double game = 600.0; uint64_t wall = 50000;
+        g::Follow follow; Fake f; f.now = g::FollowMs(true, game, wall);
+        Check(Go(f, kRegen, follow).consumed, "sweep blocked (game clock)");
+        wall += 2000; game += 1.0; f.now = g::FollowMs(true, game, wall);
+        Check(Go(f, kRegen, follow).follow, "one game frame after a 2 s pause: the same sweep");
+        game += 7.0; f.now = g::FollowMs(true, game, wall);
+        Check(!Go(f, kRegen, follow).cancel, "7 game frames (117 ms) without a contact: the short gap still ends it");
+    }
+    {   // the bounds are the same in game time: 42 / 90 frames with a known owner in its routine
+        g::Follow follow; Fake f; f.now = g::FollowMs(true, 600.0, 0);
+        Check(Go(f, kEm10, follow).consumed, "block at game frame 600");
+        for (double t = 618.0; t <= 690.0; t += 18.0) {f.now = g::FollowMs(true, t, 0); Check(Go(f, kEm10, follow).long_follow, "contacts every 18 frames up to 90 after the block");}
+        f.now = g::FollowMs(true, 708.0, 0); Check(!Go(f, kEm10, follow).cancel, "108 frames: the 1500 ms cap from the block");
+        follow = {}; Fake q; q.now = g::FollowMs(true, 600.0, 0); Check(Go(q, kEm10, follow).consumed, "fresh block");
+        q.now = g::FollowMs(true, 643.0, 0); Check(!Go(q, kEm10, follow).cancel, "43 frames with no contact: the 700 ms gap");
+        follow = {}; Fake e; e.now = g::FollowMs(true, 600.0, 0); Check(Go(e, kEm10, follow).consumed, "fresh block (boundary)");
+        e.now = g::FollowMs(true, 642.0, 0); Check(Go(e, kEm10, follow).long_follow, "42 frames: the gap includes 700 ms");
+    }
+    {   // a load rewrites the counter: the clock goes back and the follow ends
+        g::Follow follow; Fake f; f.now = g::FollowMs(true, 600.0, 0);
+        Check(Go(f, kEm10, follow).consumed, "block before a load");
+        f.now = g::FollowMs(true, 300.0, 0);
+        Check(!Go(f, kEm10, follow).cancel && !follow.armed, "game time going back ends the follow-up");
+    }
+    {   // a change of clock in mid follow ends it, either way
+        g::Follow follow; Fake f; f.now = g::FollowMs(true, 600.0, 50000);
+        Check(Go(f, kEm10, follow).consumed, "block on game time");
+        f.now = g::FollowMs(true, NAN, 50200);
+        Check(!Go(f, kEm10, follow).cancel && !follow.armed, "game time lost 200 ms later: the wall value does not continue the follow");
+        follow = {}; Fake b; b.now = g::FollowMs(false, 0.0, 50000);
+        Check(Go(b, kEm10, follow).consumed, "block on the wall clock");
+        b.now = g::FollowMs(true, 612.0, 50200);
+        Check(!Go(b, kEm10, follow).cancel && !follow.armed, "game time appearing 200 ms later does not continue it either");
+    }
+    {   // 165 FPS: ticks of 30/165, the bounds stay game time
+        link_runtime::game_clock::Clock clock; const float dt = 30.f / 165.f; uint32_t frame = 5000;
+        double now = clock.Observe(frame, dt);
+        g::Follow follow; Fake f; f.now = g::FollowMs(true, now, 0);
+        Check(Go(f, kEm10, follow).consumed, "block at 165 FPS");
+        for (int i = 0; i < 100; ++i) now = clock.Observe(++frame, dt);      // 100 ticks = 606 ms
+        f.now = g::FollowMs(true, now, 0);
+        Check(Go(f, kEm10, follow).long_follow, "100 ticks at 165 FPS (606 ms), same routine: still that swing");
+        follow = {}; Fake q; q.now = f.now; Check(Go(q, kEm10, follow).consumed, "fresh block at 165 FPS");
+        for (int i = 0; i < 120; ++i) now = clock.Observe(++frame, dt);      // 120 ticks = 727 ms
+        q.now = g::FollowMs(true, now, 0);
+        Check(!Go(q, kEm10, follow).cancel, "120 ticks at 165 FPS (727 ms) without a contact: the follow ends");
+    }
+}
+
 int main(int argc, char** argv) {
     DrawGuard(); Classes(); Thrown(); Settings(); Gates(); Handoff(); Precedence(); FollowUp(); Observe(); Faults(); GraceWindow(); ChainSwing(); TwoChains(); ChainsawSwing();
+    SoftBlock(); FollowClock();
     if (argc > 1) RealImage(argv[1]);
     std::printf("parry general block: %u checks passed\n", checks);
     return 0;

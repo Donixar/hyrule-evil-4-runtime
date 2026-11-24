@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstring>
 #include "link_runtime_health.h"
+#include "low_health.h"
 #include "native_pins.h"
 
 namespace link_runtime::save_anywhere {
@@ -100,7 +101,12 @@ inline const char* WhySong(Block b) {
 // Combat songs (17-oct): enemies=false skips the enemy scan (they are the point of the song) and
 // player_r0_only relaxes the routine check to R0 == 0 (Link standing, walking or running, not hit,
 // grabbed or in an action); every other gameplay rule still applies.
-struct Rules { float radius = 10000.0f; bool aware = true; bool waive_player = false; bool enemies = true; bool player_r0_only = false; };   // 10 m (RE4 units are mm)
+// shop_flag_fix (17-nov): read gameplay past a latched STA_INTO_SHOP (Status2 0x40000; r11c, r31d after the
+// Merchant), as the ocarina's own gates do: without it every song read "not gameplay" in rooms where the
+// ocarina opens. A real shop is still refused (SSCRN_REQUEST, suspend, stop). The runtime passes
+// CombatShopFlagFix; the default keeps the strict read.
+struct Rules { float radius = 10000.0f; bool aware = true; bool waive_player = false; bool enemies = true; bool player_r0_only = false;
+               bool shop_flag_fix = false; };   // 10 m (RE4 units are mm)
 struct Result { Block block = Block::Unreadable; uint32_t enemy = 0; uint8_t enemy_id = 0; float distance2 = 0; };
 
 inline bool IsGanado(uint8_t id) { return (id >= 0x10 && id <= 0x17) || (id >= 0x19 && id <= 0x20); }
@@ -131,7 +137,7 @@ template <class Mem> Result Allowed(Mem& mem, uint32_t base, const Rules& rules 
         !w.Read32(base + rva::kTaskArray + rva::kTaskStride + rva::kTaskStatus, task) ||
         !w.Read32(base + rva::kCurrentTask, cur)) return r;
     HealthState health;
-    if (!ReadHealth(w, pslot, gslot, health) || !health.eligible || health.player != pl || (rno & 0xFF) != 3 || (ch & 0xFF) != 0)
+    if (!low_health::ReadHealth(w, pslot, gslot, rules.shop_flag_fix, health) || !health.eligible || health.player != pl || (rno & 0xFF) != 3 || (ch & 0xFF) != 0)
         { r.block = Block::NotGameplay; return r; }
     if (stop & kSpfActBtn) { r.block = Block::ActionLock; return r; }
     if (st2 & kPartnerCaught) { r.block = Block::Partner; return r; }

@@ -22,6 +22,7 @@ inline constexpr native_pins::Pin kPins[]={
     // Both root and secondary Core skip the zero-weight layer. Keep these exact,
     // including ordered zero comparison; NaN/nonzero weights are never admitted.
     {0x262BF8,"85c00f841a010000814844000000088b8ba8020000f7414400000080d981c8000000d99dd8feffffd985d8feffffd9eedae9dfe0756ef6c4440f8be3000000"},
+    {0x262C5B,"d985d8feffffd9c083c414d9e88d8524ffffffdee150518bc88d9508ffffffd99dd4feffffd985d4feffffd91c245151d91c2452e8e2fed9ffd985d4feffffeb54"},
     {0x262C9C,"f6c4447b79"},
     {0x262E3D,"814844000000088b8ba8020000f7414400000080d981c8000000d9eedae9dfe0754bf6c4440f8b44010000"},
     {0x262EAA,"f6c4440f8bf9000000"}

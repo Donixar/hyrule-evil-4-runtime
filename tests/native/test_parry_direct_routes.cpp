@@ -490,6 +490,246 @@ static void KickGap() {
         Check(!d::Run(n, actor_contact, ctx, slots).cancel, "kick follow rejects new routines, identities, context, rear and long gaps");
     }
 }
+// Review 17-nov: a sword action or the Mortal Draw is a soft block here too (HardBlocked() false). A Ctrl+tap parry
+// starts the Shield Bash on its release: the contact already blocked keeps its follow-up through that clip, while a new
+// contact still takes no press. ComposedSources has no HardBlocked(), so every block stays hard for it (cases above).
+struct SoftSources : ComposedSources {bool HardBlocked() {return false;}};
+static void DirectSoftBlock() {
+    p::input::Sample context{};
+    d::Contact c{};
+    c.actor.owner = 0x10000;
+    {
+        SoftSources s; d::Follows f;
+        Check(d::Run(s, c, context, f).cancel && s.consumes == 1, "arm: a contact blocked before the sword action");
+        s.blocked = true; s.now += 6;
+        const auto o = d::Run(s, c, context, f);
+        Check(o.cancel && o.follow && s.consumes == 1 && f.slots[0].armed, "soft block: the blocked contact is still followed and its slot kept");
+        ++s.resource.resource;
+        Check(!d::Run(s, c, context, f).cancel && !f.slots[0].armed, "soft block: a changed Link resource still drops the follow");
+    }
+    {
+        SoftSources s; d::Follows f;
+        s.blocked = true;
+        const auto o = d::Run(s, c, context, f);
+        Check(!o.cancel && o.reason == p::line::Reason::InputBlocked && !s.consumes && s.window.armed && !f.slots[0].armed,
+              "soft block: a new contact takes no press and arms nothing");
+    }
+    {   // every block is hard without the source: the slots are cleared, so nothing follows once it ends
+        ComposedSources s; d::Follows f;
+        Check(d::Run(s, c, context, f).cancel, "arm: before a hard block");
+        s.blocked = true; s.now += 6;
+        Check(!d::Run(s, c, context, f).cancel && !f.slots[0].armed, "hard block: the slots are cleared");
+        s.blocked = false; s.now += 6;
+        Check(!d::Run(s, c, context, f).cancel && s.consumes == 1, "after a hard block the same contact needs a new press");
+    }
+    {   // the cart run of the report: blocked, then the bash clip runs over its remaining contacts
+        auto cart = CartContact(); auto ctx = context;
+        SoftSources s; d::Follows f;
+        Check(d::Run(s, cart, ctx, f).cancel, "arm: fresh frontal cart run");
+        s.blocked = true;
+        for (unsigned i = 0; i != 16; ++i) {
+            s.now += 90; s.game += 5.4; ++ctx.frame;
+            Check(d::Run(s, cart, ctx, f).follow, "soft block: the cart run stays blocked contact after contact");
+        }
+        cart.actor.routine[1] = 6; cart.actor.routine[2] = 0; s.now += 6; s.game += 0.36; ++ctx.frame;
+        Check(d::Run(s, cart, ctx, f).follow && s.consumes == 1, "soft block: the final 500-damage contact follows the armed run");
+    }
+    {   // Krauser's kick: the box block's sphere samples through the bridge
+        d::Contact kick{};
+        kick.route = d::Route::Krauser;
+        kick.actor.owner = 0x10000;
+        kick.actor.routine[0] = 1;
+        kick.actor.routine[1] = 0x2B;
+        auto sphere = Hit(0x15585F); sphere.producer_esi = kick.actor.owner;
+        SoftSources s; d::Follows f;
+        Check(d::Run(s, kick, context, f).cancel && s.consumes == 1, "arm: a kick blocked on the box");
+        s.blocked = true; s.now += 15; s.game += 0.9;
+        Check(d::FollowKick(s, sphere, kick, context, f) && s.consumes == 1, "soft block: the kick's sphere samples are still followed");
+        ComposedSources hard; d::Follows g2;
+        Check(d::Run(hard, kick, context, g2).cancel, "arm: a kick before a hard block");
+        hard.blocked = true;
+        Check(!d::FollowKick(hard, sphere, kick, context, g2), "hard block: the bridge refuses");
+    }
+}
+// The runtime's own sources: which input gates are hard. The sword actions' gate (sword_action_blocks, which keeps the
+// button tracked) and the Mortal Draw refuse only a new press; the ocarina and the Blade Lock duel refuse the
+// follow-ups too. Tier 2, its follow clock and the direct routes must agree.
+static void BlockKinds() {
+    g::Runtime r;
+    g::NativeSources tier{r};
+    g::FollowSources follow{r};
+    d::Contact c{};
+    p::input::Sample context{};
+    d::NativeSources direct{r, c, context};
+    auto kinds = [&](bool blocked, bool hard, const char* why) {
+        Check(tier.Blocked() == blocked && follow.Blocked() == blocked && direct.Blocked() == blocked, why);
+        Check(g::HardBlocked(tier, 0) == hard && g::HardBlocked(follow, 0) == hard && g::HardBlocked(direct, 0) == hard, why);
+    };
+    kinds(false, false, "no gate: nothing blocked");
+    p::input::SetSwordActionBlocks(true); kinds(true, false, "a sword action is a soft block");
+    p::input::SetSwordLockBlocks(true); kinds(true, true, "a Blade Lock over a sword action is hard");
+    p::input::SetSwordLockBlocks(false); p::input::SetSwordActionBlocks(false);
+    p::input::SetMortalBlocks(true); kinds(true, false, "the Mortal Draw is a soft block"); p::input::SetMortalBlocks(false);
+    p::input::SetOcarinaBlocks(true); kinds(true, true, "the ocarina is a hard block"); p::input::SetOcarinaBlocks(false);
+    p::input::SetSwordLockBlocks(true); kinds(true, true, "the Blade Lock duel is a hard block"); p::input::SetSwordLockBlocks(false);
+    kinds(false, false, "gates released");
+}
+// Tier 2's follow-ups read game time when the runtime has it; the press age and the direct routes keep the wall clock.
+static double fixture_game = 0;
+static double FixtureGame() {return fixture_game;}
+static d::FollowTime DirectFixtureGame(const p::input::Sample&) {return {9.5, 99, 7, 20};}
+
+struct CrossedSources : ComposedSources {
+    d::FollowFrame live{};
+    d::FollowTime Game() {return d::pad_clock.AtContact(live);}
+};
+struct PadSchedule {
+    HANDLE first = nullptr, unpause = nullptr;
+    unsigned scenario = 0;
+    d::FollowFrame sample{};
+};
+static DWORD WINAPI FixturePadThread(void* pointer) {
+    auto& job = *static_cast<PadSchedule*>(pointer);
+    auto& sample = job.sample;
+    d::pad_clock.Publish(sample);
+    SetEvent(job.first);
+    if (WaitForSingleObject(job.unpause, 5000) != WAIT_OBJECT_0) return 0;
+    // Recorded native PadRead frames. The contact thread runs no actor updates inside Options.
+    for (++sample.frame; sample.frame <= 2054844; ++sample.frame) {
+        const bool held = sample.frame >= 2054358 && sample.frame <= 2054843;
+        sample.routine = held && job.scenario != 1 ? 6 : 3;
+        sample.status[0] = held && job.scenario == 1 ? link_runtime::case_key_debounce::layout::kStaSubScrn : 0;
+        if (sample.frame == 2054480) {
+            if (job.scenario == 2) sample.routine = 4;
+            if (job.scenario == 3) continue;
+            if (job.scenario == 4) {auto backwards = sample; backwards.frame -= 10; d::pad_clock.Publish(backwards);}
+            if (job.scenario == 5) {auto room = sample; ++room.room; d::pad_clock.Publish(room);}
+            if (job.scenario == 6) d::pad_clock.Publish({});
+        }
+        d::pad_clock.Publish(sample);
+        d::pad_clock.Publish(sample); // duplicate polls on the publisher do not age twice
+    }
+    return GetCurrentThreadId();
+}
+static void DirectMenuClock() {
+    d::Contact tree{};
+    tree.route = d::Route::Tree; tree.actor.owner = 0x09257058;
+    tree.actor.attachment_guid = 31;
+    for (unsigned scenario = 0; scenario < 11; ++scenario) {
+        CrossedSources s;
+        s.live.global = 0x017AA760; s.live.room = 0x119; s.live.frame = 2054356;
+        s.live.routine = 3; s.live.dt = 30.f/165.f;
+        PadSchedule job{};
+        job.scenario = scenario; job.sample = s.live; --job.sample.frame;
+        job.first = CreateEventW(nullptr,FALSE,FALSE,nullptr);
+        job.unpause = CreateEventW(nullptr,FALSE,FALSE,nullptr);
+        Check(job.first && job.unpause, "cross-thread fixture events");
+        DWORD pad_thread = 0;
+        HANDLE worker = CreateThread(nullptr, 0, FixturePadThread, &job, 0, &pad_thread);
+        Check(worker && WaitForSingleObject(job.first,5000)==WAIT_OBJECT_0 && pad_thread!=GetCurrentThreadId(),
+            "PadRead is a different native thread");
+        p::input::Sample ctx{};
+        ctx.frame=s.live.frame;ctx.global=s.live.global;ctx.room=s.live.room;
+        d::follows = {};
+        auto armed = s.Game();
+        Check(armed.generation && armed.pad_frame+1==ctx.frame,"arm with the precise +1 native skew");
+        Check(d::Run(s,tree,ctx,d::follows).cancel && d::follows.slots[0].generation==armed.generation,
+            "fresh press saves generation on the contact worker");
+        s.pose=false; s.guard=false; s.now+=3100;
+        SetEvent(job.unpause);
+        Check(WaitForSingleObject(worker,5000)==WAIT_OBJECT_0,"PadRead completed all menu frames");
+        DWORD actual=0; GetExitCodeThread(worker,&actual);
+        CloseHandle(worker); CloseHandle(job.first); CloseHandle(job.unpause);
+        Check(actual==pad_thread,"same publisher end to end");
+        s.live.frame=2054845; ctx.frame=s.live.frame;
+        auto matched=tree;
+        if(scenario==7)++s.resource.resource;
+        if(scenario==8)++matched.actor.attachment_guid;
+        if(scenario==9)++s.live.frame;
+        if(scenario==10)++s.live.global;
+        const auto resumed=s.Game();
+        if(scenario<2){
+            Check(resumed.generation==armed.generation && resumed.menu==armed.menu+1 && resumed.pad_frame+1==ctx.frame,
+                  "paused epoch and menu crossing survive without any contact update");
+            Check(std::abs((resumed.game-armed.game)-3*link_runtime::game_clock::Step60(s.live.dt))<0.000001,
+                  "three active intervals between native block and return");
+        }
+        const auto result=d::Run(s,matched,ctx,d::follows);
+        Check(result.follow==(scenario<2) && s.consumes==1,
+              "same owner tree resource and generation only; no new press");
+        if(scenario<2)Check(d::follows.slots[0].menu==resumed.menu,"first real match consumes the diagnostic menu marker");
+    }
+    for(float dt:{1.f,0.5f,30.f/165.f}){
+        d::FollowFrame f{};
+        f.global=1234;f.room=0x119;f.frame=100;f.routine=3;f.dt=dt;
+        d::FollowClock ledger;
+        ledger.Observe(f);
+        auto exact=ledger.AtContact(f);
+        for(unsigned i=0;i<12;++i){++f.frame;ledger.Observe(f);}
+        Check(std::abs(ledger.AtContact(f).game-exact.game-12*link_runtime::game_clock::Step60(dt))<0.00001,
+              "gameplay at 30/60/165");
+        const double prior=ledger.Time();
+        ++f.frame; f.dt=0.75f;
+        const auto projected=ledger.AtContact(f);
+        ledger.Observe(f);
+        Check(std::abs(projected.game-ledger.Time())<0.000001 && std::abs(ledger.Time()-prior-link_runtime::game_clock::Step60(dt))<0.000001,
+              "published delta agrees on both sides of +1 when dt changes");
+        ++f.frame;const double next=ledger.AtContact(f).game;
+        f.routine=6;ledger.Observe(f);
+        Check(ledger.Held() && std::abs(ledger.Time()-next)<0.000001 && std::abs(next-projected.game-1.5)<0.000001,
+              "pre-menu final contact never ages backwards at the boundary");
+        f.routine=3;Check(ledger.AtContact(f).game==d::kUnknownFollowTime,"same frame opposite menu state is ambiguous");
+        ++f.frame;auto first=ledger.AtContact(f);ledger.Observe(f);
+        Check(first.game==ledger.Time() && first.menu && std::abs(first.game-next)<0.000001,"a held interval contributes zero on +1 resume");
+        auto invalid=f;invalid.frame+=2;Check(ledger.AtContact(invalid).game==d::kUnknownFollowTime,"reader cannot extrapolate two ticks");
+        --invalid.frame;invalid.status[0]=link_runtime::case_key_debounce::layout::kStaSubScrn;
+        Check(ledger.AtContact(invalid).game==d::kUnknownFollowTime,"case blocks reads even if preceding publisher was active");
+        auto valid=ledger.AtContact(f);Check(valid.generation==first.generation && valid.game==first.game,"an invalid reader cannot change the ledger");
+    }
+    d::FollowSlot old{};old.generation=19;old.game_start=0;old.game_last=2;
+    Check(d::Expired(old,{1,d::FollowTime{8,20,0,7}}), "identical time in another epoch expires");
+    Check(!d::Expired(old,{1,d::FollowTime{8,19,0,7}}) && d::Expired(old,{1,d::FollowTime{8.0011,19,0,7}}),"unchanged six-frame gap");
+    old.game_last=30;
+    Check(!d::Expired(old,{1,d::FollowTime{30,19,0,7}}) && d::Expired(old,{1,d::FollowTime{30.0011,19,0,7}}),"unchanged thirty-frame age");
+    d::Follows none{};
+    none.Arm(tree,{},{1,d::FollowTime{}});
+    Check(!none.slots[0].armed,"unreadable clock cannot arm unseen follow-up");
+
+    d::Follows separate{};
+    auto other=tree;
+    other.actor.owner+=0x1000;
+    p::input::Sample ctx{};
+    const d::When valid{1,d::FollowTime{8,19,0,7}};
+    const d::When incoherent{2,d::FollowTime{}};
+    const d::ResourceStamp resource{1,2,3,4,1};
+    separate.Arm(tree,ctx,valid,resource);
+    separate.Arm(other,ctx,valid,resource);
+    Check(!separate.Match(other,ctx,incoherent,resource),"incoherent contact fails to native damage");
+    Check(!separate.slots[1].armed && separate.Match(tree,ctx,valid,resource),
+          "incoherent contact retires its owner without discarding another owner's block");
+    Check(!separate.Match(tree,ctx,{3,d::FollowTime{8,20,0,7}},resource),
+          "coherent new generation still retires older blocks");
+}
+static void FollowRuntimeClock() {
+    g::Runtime r;
+    const uint64_t before = GetTickCount64();
+    auto wall = [&](uint64_t v) {return v >= before && v - before < 60000;};
+    Check(wall(g::FollowNow(r)), "no game clock: the follow-ups stay on the wall clock");
+    r.game_now = &FixtureGame; fixture_game = 600.0;
+    g::FollowSources follow{r};
+    g::NativeSources tier{r};
+    Check(g::FollowNow(r) == 10000 && follow.Now() == 10000, "game clock: tier 2's Decide reads game time as ms");
+    Check(wall(tier.Now()), "the press age clock stays the wall clock");
+    d::Contact c{};
+    p::input::Sample context{};
+    d::NativeSources direct{r, c, context};
+    Check(wall(direct.Now()) && direct.Game().game == 600.0, "the direct routes keep their own pair of clocks");
+    d::direct_game_now = &DirectFixtureGame;
+    Check(wall(direct.Now()) && direct.Game().game == 9.5 && follow.Now() == 10000, "dedicated clock preserves tier 2 and real press deadlines");
+    d::direct_game_now = nullptr;
+    fixture_game = 0.0;
+    Check(wall(g::FollowNow(r)) && wall(follow.Now()), "an unreadable game time falls back to the wall clock");
+}
 #ifdef DIRECT_ROUTE_FIXTURE_INCLUDED
 int DirectRoutesFixtureMain(int argc, char** argv) {
 #else
@@ -503,8 +743,12 @@ int main(int argc, char** argv) {
     CartRunFollow();
     CartGameTime();
     FollowGameTime();
+    DirectMenuClock();
     KickBoxFirst();
     KickGap();
+    DirectSoftBlock();
+    BlockKinds();
+    FollowRuntimeClock();
     ActorContracts();
     if (argc == 2) DirectPins(argv[1]);
     std::printf("parry direct routes: %u checks passed%s\n", checks, argc == 2 ? " (pinned image: route pins checked)" : " (no image: pin checks skipped)");

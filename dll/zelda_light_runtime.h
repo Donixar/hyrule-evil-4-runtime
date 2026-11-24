@@ -171,6 +171,44 @@ static bool CompanionRequested(const wchar_t* ini){
     unsigned extra=0;
     return zl::ReadConfig(get).on&&link_runtime::zelda_companion::ReadConfig(get,extra).on;
 }
+// The beam's strip for this native frame: additive, one node per generation (Submit's own guard), from Frame and CoreDraw.
+static uint32_t g_draw_frame=0xFFFFFFFFu;   // the native frame (global+0x530C) whose beam and sparks are already handled
+static void BeamDraw(double now_ms,uint32_t room,uint32_t owner,bool in_play){
+    static ::sword_trail::Quad quads[zl::kMaxBeamQuads];
+    const int n=g_beam.Frame(now_ms,room,owner,quads,0,zl::kMaxBeamQuads);
+    if(n>0){
+        const auto r=link_runtime::sword_trail::ot::runtime::Submit(quads,n,Style(),link_runtime::sword_trail::gx::kDstOne);   // additive: light
+        CmbLogV("zelda_beam quads=%d submit=%d in_play=%u",n,int(r),in_play?1U:0U);   // LogLevel 2
+    }
+}
+// The player's core (PlayerFrame, after CompanionTick) on the native frames Frame does not see: CombinedDecide runs only
+// on the Normal dispatch or an owned lease, so on the player's damage, grab, death and native event frames the ray that
+// CompanionTick fired had its sound, hand star and hit but no beam (it lives arrival + kFadeMs), and its sparks, drawn
+// only by Link's ParticlesFrame, went stale (review 17-nov). Draw only, with the gates of those two draws: no hit or
+// wall scan, no emission.
+static void CoreDraw(){
+    if(!g_on||!g_trail_on.load(std::memory_order_acquire))return;
+    const auto g=CmbGet<uint32_t>(g_cmb_global_slot);if(!link_runtime::IsPointer(g))return;
+    const uint32_t frame=CmbGet<uint32_t>(g+0x530C);
+    if(frame==g_draw_frame)return;   // Frame has this native frame, or the core already came through
+    g_draw_frame=frame;
+    const unsigned pl=CmbGet<uint32_t>(g+0x4FC8)&0xFF;const uint32_t room=TrailRoom();
+    const double now_ms=link_runtime::sword_trail_log::Ms(GameNow(g_cmb_global_slot));
+    if(g_part_on.load(std::memory_order_acquire)&&g_part_cfg.on&&g_part.Busy()){
+        uint32_t owner=0;bool show=false;
+        if(pl==0){CmbPlayer p;if(CmbReadPlayer(p)){owner=p.player;show=p.facts.gameplay;}}   // as ParticlesFrame
+        else if(pl==1){LocalMemory memory;link_runtime::HealthState health;                  // as Frame, her own segment
+            if(link_runtime::ReadHealth(memory,g_cmb_player_slot,g_cmb_global_slot,health)){owner=health.player;show=true;}}
+        if(owner){
+            const auto step=g_part.Advance(now_ms,room,owner);
+            // As ParticlesFrame: a system cleared here (room, player, time back) must drop the hit baselines too.
+            if(step!=spt::Step::Ok&&step!=spt::Step::Idle){g_part_watch.Reset();g_part_scanned=false;}
+            g_part_alive.store(g_part.Alive());
+            if(show&&g_part.Alive())link_runtime::sword_particles::draw::runtime::Submit(g_part,now_ms,g_part_cfg.gain);
+        }
+    }
+    BeamDraw(now_ms,room,pl<=1?CmbGet<uint32_t>(g_cmb_player_slot):0,false);   // another character ends it, as Frame
+}
 // Every player dispatch. Off, or the player is not Ashley in play: only the beam ends (room/player change) and nothing is read.
 static void Frame(){
     if(!g_on&&!g_cfg.probe)return;
@@ -180,6 +218,7 @@ static void Frame(){
     if(!g_on||!g_trail_on.load(std::memory_order_acquire))return;
     const double now_ms=link_runtime::sword_trail_log::Ms(GameNow(g_cmb_global_slot));
     const uint32_t link_player=pl==0?CmbGet<uint32_t>(g_cmb_player_slot):0;
+    g_draw_frame=CmbGet<uint32_t>(g+0x530C);   // this native frame's beam and sparks are drawn from the dispatch: CoreDraw skips it
     CompanionTick();   // the partner (Link as the player); the player's core may run it again this frame (deduplicated)
     LocalMemory memory;link_runtime::HealthState health;
     const bool read=pl==1&&link_runtime::ReadHealth(memory,g_cmb_player_slot,g_cmb_global_slot,health);
@@ -222,15 +261,9 @@ static void Frame(){
         g_part.Advance(now_ms,room,health.player);
         if(g_part.Alive())link_runtime::sword_particles::draw::runtime::Submit(g_part,now_ms,g_part_cfg.gain);
     }
-    if(!g_beam.Live(now_ms))return;
-    static ::sword_trail::Quad quads[zl::kMaxBeamQuads];
-    // The beam lives on through frames where the in-play gates blink (the knife press itself sets a native state bit):
-    // only a room or player change ends it.
-    const int n=g_beam.Frame(now_ms,room,read?health.player:link_player,quads,0,zl::kMaxBeamQuads);
-    if(n>0){
-        const auto r=link_runtime::sword_trail::ot::runtime::Submit(quads,n,Style(),link_runtime::sword_trail::gx::kDstOne);   // additive: light
-        CmbLogV("zelda_beam quads=%d submit=%d in_play=%u",n,int(r),zelda?1U:0U);   // LogLevel 2
-    }
+    // The knife press can briefly change the native in-play gates.
+    // The beam still follows its lifetime and the current room, owner and clock.
+    BeamDraw(now_ms,room,read?health.player:link_player,zelda);
 }
 
 // Startup (StartCombat, after SwordPrepare): the config, the sound, the needs. The trail node is checked per frame.

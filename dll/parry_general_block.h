@@ -68,8 +68,22 @@ inline const char* VerdictName(Verdict v) {
 // old 400 ms gap, and landed; the routine check still ends the follow on a new swing.
 // A hidden-pose sample of the blocked swing, unknown owner, in the parryable arc (U3 30-oct: 0 ms after the block).
 constexpr uint64_t kPoseFreeFollowMs = 100;
-struct Swing {bool known = false; uint8_t routine[2]{};};
-inline bool SameSwing(const Swing& a, const Swing& b) {return a.known && b.known && a.routine[0] == b.routine[0] && a.routine[1] == b.routine[1];}
+constexpr uint32_t kKrauserBladeRet = 0x15585F;
+struct Swing {
+    bool known = false;
+    uint8_t routine[2]{};
+    uint32_t parts = 0, guid = 0, motion = 0;   // native blade identity, populated for Krauser's sword only
+    float cursor = 0;
+    bool KrauserBlade() const {return motion != 0;}
+};
+inline bool SameSwing(const Swing& a, const Swing& b) {
+    if (!a.known || !b.known || a.routine[0] != b.routine[0] || a.routine[1] != b.routine[1] ||
+        a.KrauserBlade() != b.KrauserBlade()) return false;
+    return !a.KrauserBlade() || (a.parts == b.parts && a.guid == b.guid && a.motion == b.motion && b.cursor + .05f >= a.cursor);
+}
+template <class Sources> auto IdentifyKrauserBlade(Sources& s, const Candidate& c, Swing& swing, int)
+    -> decltype(s.KrauserBlade(c, swing)) {return s.KrauserBlade(c, swing);}
+template <class Sources> uint32_t IdentifyKrauserBlade(Sources&, const Candidate&, Swing&, long) {return 0;}
 struct Follow {
     static constexpr uint64_t kGapMs = 100, kMaxMs = 500;
     static constexpr uint64_t kSwingGapMs = 700, kSwingMaxMs = 1500;
@@ -83,13 +97,16 @@ struct Follow {
         armed = true; function = fn; owner = who; swing = who ? sw : Swing{}; std::memcpy(pos, p, sizeof(pos)); start = last = now;
     }
     bool Within(uint64_t now, bool extended) const {
-        return now >= last && now - last <= (extended ? kSwingGapMs : kGapMs) && now - start <= (extended ? kSwingMaxMs : kMaxMs);
+        const uint64_t gap = !extended ? kGapMs : swing.KrauserBlade() ? 175 : kSwingGapMs;
+        const uint64_t total = extended && !swing.KrauserBlade() ? kSwingMaxMs : kMaxMs;
+        return now >= last && now - last <= gap && now - start <= total;
     }
     // The longer chain/flail bounds: known equal owner, attacker still in the routine of the block.
     bool Extended(uint32_t who, const Swing* sw) const {return owner && who == owner && sw && SameSwing(swing, *sw);}
     // by_owner: only a match by a known, equal owner (the follow-ups that skip the pose and position gates).
     // sw: the owner's current routine (null or unknown: the short bounds only).
     bool Matches(uint32_t fn, uint32_t who, const float* p, uint64_t now, bool by_owner = false, const Swing* sw = nullptr) {
+        if (swing.KrauserBlade() && (!who || !sw || !sw->KrauserBlade())) return false;
         // A positively observed routine change ends this attack even inside the short gap.
         // Retire it permanently: returning to the same routine later is another swing.
         if (owner && who == owner && sw && swing.known && sw->known && !SameSwing(swing, *sw)) {
@@ -104,10 +121,20 @@ struct Follow {
     }
     // A match that the short bounds alone would have refused (log counter).
     bool Long(uint64_t now) const {return armed && !Within(now, false);}
-    void Touch(const float* p, uint64_t now) {std::memcpy(pos, p, sizeof(pos)); last = now;}
+    void Touch(const float* p, uint64_t now, const Swing* observed = nullptr) {
+        std::memcpy(pos, p, sizeof(pos)); last = now;
+        if (observed && swing.KrauserBlade()) swing.cursor = observed->cursor;
+    }
     // Disarms only once even the longer bounds have run out (they apply only if the routine still matches).
     void Expire(uint64_t now) {if (armed && !Within(now, owner && swing.known)) armed = false;}
 };
+// The clock the runtime gives the follow-ups (Follow, Grace::swings; every bound above stays in ms): game time in
+// 60 Hz frames (game_clock.h) as ms when it is known, else the wall clock. On the wall clock a pause, the case, a
+// hitch or a slowed game aged the blocked swing while its attacker stood still: the follow-up ran out and the rest
+// of that swing landed after the parry. A change of clock in mid follow breaks `now >= last` or the gap: it ends.
+inline uint64_t FollowMs(bool game, double frames, uint64_t wall_ms) {
+    return game && std::isfinite(frames) && frames > 0 ? static_cast<uint64_t>(frames * (1000.0 / 60.0) + 0.5) : wall_ms;
+}
 // Post-parry grace (Donald 12-oct): after a committed tier-1 parry or a press-consuming tier-2 block,
 // ParryGraceMs of GAME time (60 Hz frames of game_clock.h: the same at 60 and 165 FPS) in which another
 // qualifying frontal hit (every tier-2 gate except the press) is blocked through the tier-2 path, as part
@@ -156,7 +183,7 @@ struct Grace {
             s.Expire(now_ms);
             if (s.Matches(fn, who, p, now_ms, by_owner, sw)) {
                 if (long_follow) *long_follow = s.Long(now_ms);
-                s.Touch(p, now_ms); return true;
+                s.Touch(p, now_ms, sw); return true;
             }
         }
         return false;
@@ -213,6 +240,10 @@ template <class Mem> uint32_t ChainsawOwner(Mem& m, uint32_t ret, uint32_t esi) 
     uint8_t weapon = 0;
     return ChainsawProducer(ret) && esi && m.Read(esi + 0x7F0, &weapon, 1) && weapon == 4 ? esi : 0;
 }
+// Optional source `bool HardBlocked()`: whether a Blocked() also refuses the press-free follow-ups (the ocarina; the
+// Blade Lock duel, whose own guard takes the held owner's contacts). Sources without it: every block is hard.
+template <class S> auto HardBlocked(S& s, int) -> decltype(bool(s.HardBlocked())) {return s.HardBlocked();}
+template <class S> bool HardBlocked(S&, long) {return true;}
 // Gate order (§2.6), cheapest to irreversible. `handoff`: tier 1 consumed this very press in this
 // invocation and wrote nothing (Approved + NotCommitted), so tier 2 uses it without consuming again.
 // Sources: bool Invocation(c); uint32_t ImageBase(); bool Live(size_t); bool Descriptor(uint32_t,
@@ -235,7 +266,10 @@ template <class S> Outcome Decide(S& s, const Candidate& c, const Settings& set,
     o.reason = Reason::Producer;
     if (o.verdict != Verdict::Allowed) return o;
     o.reason = Reason::InputBlocked;
-    if (s.Blocked()) return o;
+    // A sword action or the Mortal Draw refuses a new press, not the rest of a swing already blocked: its press-free
+    // follow-ups still run (a flail back mid Shield Bash passed as input_blocked and landed). A hard block refuses both.
+    const bool blocked = s.Blocked();
+    if (blocked && HardBlocked(s, 0)) return o;
     const bool posed = s.Pose();
     const bool located = s.Front(c, o.front);
     const uint64_t now = s.Now();
@@ -251,7 +285,7 @@ template <class S> Outcome Decide(S& s, const Candidate& c, const Settings& set,
         if (!follow.Matches(o.function, o.owner, o.front.sample, now, by_owner, &swing)) return false;
         o.follow = true; o.reason = Reason::Blocked; o.long_follow = follow.Long(now);
         o.follow_gap_ms = now - follow.last; o.follow_age_ms = now - follow.start;
-        if (set.mode == Mode::Active) {follow.Touch(o.front.sample, now); o.cancel = true;}
+        if (set.mode == Mode::Active) {follow.Touch(o.front.sample, now, &swing); o.cancel = true;}
         return true;
     };
     auto follow_up = [&](bool by_owner) {
@@ -264,12 +298,21 @@ template <class S> Outcome Decide(S& s, const Candidate& c, const Settings& set,
     };
     if (located) {
         o.owner = s.Owner(c);
-        if (o.owner) swing.known = s.Routine(o.owner, swing.routine);
+        if (o.ret_rva == kKrauserBladeRet) o.owner = IdentifyKrauserBlade(s, c, swing, 0);
+        if (o.owner && !swing.known) swing.known = s.Routine(o.owner, swing.routine);
         if (follow_up(true)) return o;
         // Same swing, unknown owner, wherever it lands (Krauser r31c, Donald 31-oct: blocked, then 15-32 ms later the
         // arm sweep sampled at Link's side/back and landed 1000). A distance follow-up of the press-blocked swing within
         // kPoseFreeFollowMs of the block skips the pose and rear gates; later ones still go through them.
         if (follow.armed && now >= follow.start && now - follow.start <= kPoseFreeFollowMs && follow_only(false)) return o;
+    }
+    if (blocked) {
+        // Only the distance follow-up is left, under its usual gates (parryable arc; a hidden pose only within
+        // kPoseFreeFollowMs of the block). Never the grace window, the draw fallback or a press.
+        if (located && Parryable(o.front) &&
+            (posed ? follow_up(false) : follow.armed && now >= follow.start && now - follow.start <= kPoseFreeFollowMs && follow_only(false))) return o;
+        o.reason = Reason::InputBlocked;
+        return o;
     }
     o.reason = Reason::Pose;
     if (!posed) {

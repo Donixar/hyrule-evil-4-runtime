@@ -132,7 +132,7 @@ static void ActorFor(d::Route route) {
     if (route == d::Route::Tree) {
         actor[0xFD] = 0xE;
         std::memcpy(actor + 0x908, &parts, 4);
-        fixture_tree[0x100] = 0x49;
+        fixture_tree[0x100] = 0x59;  // Steam SetTree and em2bSearchTree agree on this ID.
     }
 }
 static void TransportAll() {
@@ -225,6 +225,18 @@ static void TransportAll() {
             actor[0x101] = 0;
             RunExercise();
             Check(damages == 6, "truck type zero never reaches policy");
+        }
+        if (route == d::Route::Tree) {
+            fixture_tree[0x100] = 0x49;
+            const unsigned calls = decisions;
+            RunExercise();
+            Check(damages == 6 && decisions == calls && actor[0xA56] == 1,
+                  "an attachment outside Steam's tree ID executes native damage");
+            ActorFor(route);
+            std::memset(actor + 0x908, 0, sizeof(uint32_t));
+            RunExercise();
+            Check(damages == 7 && decisions == calls && actor[0xA56] == 1,
+                  "a missing held tree executes native damage");
         }
         Check(MH_DisableHook(site) == MH_OK && MH_RemoveHook(site) == MH_OK, "remove only fixture hook");
         hook.active = 0;

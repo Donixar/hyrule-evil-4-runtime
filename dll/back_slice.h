@@ -107,6 +107,9 @@ inline const char* WhyName(Why w) {
     static const char* const n[] = {"ok", "off", "no_side", "no_lock", "far", "height", "cooldown", "busy", "bad_input"};
     return n[unsigned(w)];
 }
+// A refused press spends the tap only on the Back Slice's own cooldown. Without a target to circle (none, too far,
+// off level) the caller hands the tap on: the Backflip with S held, else the Shield Bash (backflip.h Pick).
+inline bool HandsOn(Why w) { return w != Why::Ok && w != Why::Cooldown; }
 struct Plan {
     Why why = Why::Off;
     float d = 0, dy = 0, radius = 0, theta0 = 0, sweep = 0;   // sweep: signed, -side * pi

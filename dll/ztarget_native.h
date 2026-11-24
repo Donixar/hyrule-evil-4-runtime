@@ -2,6 +2,7 @@
 #include "ztarget.h"
 #include "native_pins.h"
 #include "link_runtime_health.h"
+#include "low_health.h"
 namespace link_runtime::ztarget {
 namespace rva {constexpr uint32_t front=0x19F410,hit=0x19C880,hit_return=0x19E226,ctrl=0x8702D0,qfps=ctrl+0x278,global=0x806F3C,player=0x857054;}
 struct Frame {
@@ -50,10 +51,15 @@ inline const char* FaceUnsafeName(Unsafe u){
     return n[unsigned(u)];
 }
 template<class Mem,class T> bool Get(Mem& m,uint32_t address,T& value){return m.Read(address,&value,sizeof(value));}
+// STA_INTO_SHOP (status2 0x40000) can stay latched in play after the Merchant (r11c, r31d): the shared ReadHealth then
+// reads every frame as not healthy, a hard release (no lock, no neutral Z, no shield guard, dead Ending Blow and Back
+// Slice cameras). CombatShopFlagFix=1 (absent = 1) reads past that one bit, as the combat skills do; a real shop or
+// case is still gated by SSCRN_REQUEST/SUSPEND/STOP. Set once at startup from the INI.
+inline bool shop_flag_fix=true;
 template<class Mem> bool ReadFrameOnce(Mem& m,uint32_t base,Frame& f){
     struct Words {Mem& m;bool Read32(uint32_t a,uint32_t& v){return Get(m,a,v);}} words{m};
     HealthState health;
-    if(!ReadHealth(words,base+rva::player,base+rva::global,health)||!Get(m,base+rva::global,f.global))return false;
+    if(!low_health::ReadHealth(words,base+rva::player,base+rva::global,shop_flag_fix,health)||!Get(m,base+rva::global,f.global))return false;
     f.player=health.player;f.healthy=health.eligible;
     return Get(m,f.global+0x530C,f.frame)&&Get(m,f.global+0x70,f.dt)&&Get(m,f.global+0x4FAC,f.room)&&
         Get(m,f.global+0x4FC8,f.costume)&&Get(m,f.player+0x94,f.pos)&&Get(m,f.player+0xA4,f.yaw)&&

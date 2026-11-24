@@ -72,9 +72,9 @@ inline std::atomic<unsigned> hit_unsafe{0},hit_busy{0},hit_unfocused{0},hit_latc
 // when it differs from the last one logged, at most once per second; a safe frame (null) re-arms it. Game thread.
 struct UnsafeLog {
     const char* last=nullptr;uint32_t at=0;bool any=false;
-    bool Step(const char* reason,uint32_t now_ms){
+    bool Step(const char* reason,uint32_t now_ms,bool cancelled_resume=false){
         if(!reason){last=nullptr;return false;}
-        if((last&&!std::strcmp(last,reason))||(any&&now_ms-at<1000))return false;
+        if(!cancelled_resume&&((last&&!std::strcmp(last,reason))||(any&&now_ms-at<1000)))return false;
         last=reason;at=now_ms;any=true;return true;
     }
 };
@@ -109,9 +109,10 @@ inline voice::Pair voices;
 // The Pick order, skipping candidates whose line is blocked (marked not visible for this frame): at most kTries
 // native tests per press or switch. -1 = none (or the current one only).
 constexpr unsigned kTries=4;
-template<class Line> int PickClear(Line line,Vec player,int current,int direction){
+template<class Line> int PickClear(Line line,Vec player,int current,int direction,bool* had_candidate=nullptr){
     for(unsigned i=0;i<kTries;++i){
         const int n=Pick(pool.candidates,pool.count,current,direction);
+        if(i==0&&had_candidate)*had_candidate=n>=0&&n!=current;
         if(n<0||n==current)return -1;
         const los::Result r=line(player,pool.candidates[n].raw.pos);
         if(r==los::Result::Clear)return n;
@@ -226,6 +227,7 @@ inline void PublishPad(bool connected,bool focused,uint16_t buttons_now,int16_t 
 }
 inline strafe::Transport strafe_transport;
 inline bool(*strafe_clear)(uint32_t)=nullptr;
+inline strafe::GuardClip(*strafe_guard)(uint32_t)=nullptr;
 inline thread_local uint32_t strafe_player=0;
 inline std::atomic<unsigned> strafe_poses{0},strafe_entries{0},strafe_releases{0},strafe_faults{0};
 inline strafe::adapter::Context StrafeContext(){
@@ -233,6 +235,7 @@ inline strafe::adapter::Context StrafeContext(){
     c.pool=&pool;c.locked=&locked;c.live=live.load(std::memory_order_acquire);c.enabled=strafe_transport.controller.config.enabled;
     c.observe=observe;c.face_target=face_target;c.qualified=strafe_transport.controller.config.qualified;
     c.thread=game_thread.load()==GetCurrentThreadId();c.dispatch_clear=strafe_clear&&strafe_clear(strafe_player);
+    if(c.dispatch_clear&&c.thread&&strafe_guard)c.guard=strafe_guard(strafe_player);
     c.busy=Busy();c.focused=Focus();c.focus_lost=focus_lost.load();c.held=Held();
     c.lock_held=controller.held;c.lock_active=controller.phase==Phase::Locked;c.waiver=Admitted();
     c.neutral=NeutralNow();c.neutral_yaw=neutral.yaw;return c;
@@ -261,9 +264,9 @@ inline void __cdecl StrafeCore(void* player,void* work,void* camera,uintptr_t ca
 }
 // Called after shared dispatch preparation and before it is enabled. Gate stays disabled
 // until ZTarget.Start has also qualified camera/input/FaceTarget. Observe never calls here.
-inline bool PrepareStrafe(uint32_t image,bool(*clear)(uint32_t),Logger log){
+inline bool PrepareStrafe(uint32_t image,bool(*clear)(uint32_t),strafe::GuardClip(*guard)(uint32_t),Logger log){
     Memory m;if(!clear||!strafe::native::Qualify(m,image)){log("ZTarget strafe disabled: motion/collision pins failed");return false;}
-    strafe_clear=clear;strafe_transport.ports={nullptr,&StrafeRead,&StrafeRoutine,&StrafePose};
+    strafe_clear=clear;strafe_guard=guard;strafe_transport.ports={nullptr,&StrafeRead,&StrafeRoutine,&StrafePose};
     strafe_transport.controller.config={true,false,true,strafe_transport.controller.config.speed};
     const auto status=strafe::native::PrepareGate(reinterpret_cast<void*>(image+0x3634FA),strafe_transport,true);
     if(status!=MH_OK){strafe_transport.controller.config={};log("ZTarget strafe disabled: gate_prepare=%s",MH_StatusToString(status));return false;}
@@ -410,6 +413,10 @@ inline void PlayerNative(){
 }
 // Previous Begin's lock input sources and the last release reason not yet logged (game thread).
 inline bool prev_key=false,prev_pad=false;inline const char* input_end=nullptr;
+// A lock press the controller could not take (a soft-unsafe frame, a frame gap, or a suspension the key was up for):
+// Controller::Begin keeps Suspended until the key goes up, so that press did nothing for as long as it was held.
+// Kept here and taken on the first safe frame with a view. Key up, a hard release, a scene or no frame drop it.
+inline bool press_kept=false;
 // Revalidate failed: the same live Ganado beyond the hold range/height (out_of_range) or anything else (target_lost).
 inline bool OutOfRange(const Candidate& lock,Vec player){
     if(lock.index>=pool.count)return false;
@@ -453,17 +460,23 @@ inline void Begin(){
     const ButtonState key=buttons.Read(focus,pad::LockHeld(key_now,pad_enabled,pad_mode,toggle_now,ps.hold),
         (GetAsyncKeyState('V')&0x8000)!=0,ps.stick,!same);
     if(!read){if(have_snapshot){++epoch;pool.Reset(epoch);}have_snapshot=false;knife_latch={};resume={};guard={};Suspend();
+        press_kept=false;controller.held=key.hold;   // a key down through an unreadable frame is not a kept press
+        
         RecordNeutral(neutral.Step(controller.phase,false,0.f,epoch,false,true),"no_frame");return;}
     const bool safe=CameraSafe(f)&&focus&&!Busy();
     const bool scene=have_snapshot&&!SameScene(snapshot,f);
     if(scene){++epoch;pool.Reset(epoch);have_view=false;resume={};guard={};}
     snapshot=f;have_snapshot=true;input={safe,key.hold,f.frame,epoch,f.dt};
     KnifeLatchAge(f);
+    const bool cancelled_resume=hard&&ResumePending();
     if(hard||!key.hold){resume={};guard={};}
+    // The lock input down while the controller does not hold it: a new press. Hard frames are never safe, so
+    // Controller::Begin marks the key held on them and a press made during aim, fire, an event or death never counts.
+    if(hard||!key.hold||scene)press_kept=false;else if(!controller.held)press_kept=true;
     if(hard)neutral.resume=false;
     if(!safe){KnifeLatchCapture(f);const Phase old=controller.phase;controller.Begin(input,false);NoteGap(f.frame);locked={};have_view=false;
         const char* why_unsafe=!focus?"focus":unsafe_why!=Unsafe::None?UnsafeName(unsafe_why):"busy";
-        if(unsafe_log.Step(why_unsafe,GetTickCount()))RecordUnsafe(why_unsafe,f.frame);
+        if(unsafe_log.Step(why_unsafe,GetTickCount(),cancelled_resume))RecordUnsafe(why_unsafe,f.frame);
         RecordNeutral(neutral.Step(controller.phase,key.hold,f.yaw,epoch,!hard,hard),why_unsafe);
         if(old!=controller.phase)RecordState(why_unsafe);return;}
     unsafe_log.Step(nullptr,0);
@@ -505,11 +518,16 @@ inline void Begin(){
         controller.phase=Phase::Recenter;controller.held=true;controller.filter.Reset();controller.release_s=0;why="neutral_resume";
         guard.active=0;resumes.fetch_add(1);
     }
+    // A kept press with nothing to resume is taken as a fresh press. It waits for the view (there is none on the first
+    // safe frame after an unsafe one): without it the pick sees nobody and goes neutral, which never acquires.
+    if(press_kept&&controller.phase==Phase::Suspended&&key.hold&&!ResumePending()&&!neutral.resume&&view.valid){
+        controller.phase=Phase::Idle;controller.held=false;}
     const bool press=key.hold&&!controller.held&&controller.phase!=Phase::Suspended;
     if(press){
         guard={};
-        const bool any=Pick(pool.candidates,pool.count,-1,0)>=0;
-        const int picked=admitted?PickClear(&LineTo,f.pos,-1,0):-1;
+        bool any=false;
+        const int picked=admitted?PickClear(&LineTo,f.pos,-1,0,&any):-1;
+        if(!admitted)any=Pick(pool.candidates,pool.count,-1,0)>=0;
         locked=picked>=0?pool.candidates[picked]:Candidate{};
         if(locked.identity)los_hold.Start(locked.identity,f.frame);
         else if(any){los_refused.fetch_add(1);why="no_los";}
@@ -526,6 +544,7 @@ inline void Begin(){
         }
     }
     controller.Begin(input,locked.identity!=0);NoteGap(f.frame);
+    if(controller.phase!=Phase::Suspended)press_kept=false;   // taken, or nothing was pending; a frame gap keeps it one more frame
     if(controller.phase!=Phase::Locked){locked={};los_hold.Reset();}
     // The lock held kChurnSeconds since it came back: no churn.
     if(controller.Active()&&controller.held&&guard.active<kChurnSeconds&&(guard.active+=seconds)>=kChurnSeconds)guard.streak=0;

@@ -191,6 +191,21 @@ public:
     }
 };
 
+// A sheathe request (Session Sheathing) holds no lease and no freeze, and its 2 s budget only counts
+// player-dispatch frames. Link's damage, grab and death routines skip the dispatch, so the request
+// would survive them and the ocarina would come out by itself afterwards. Armed with the request;
+// Broken once Link is another object or the dispatch went silent (beat_ms: GetTickCount stamp of
+// the previous dispatch). Unsigned difference, so a GetTickCount wrap is not a gap.
+class SheatheWatch {
+    uint32_t player_ = 0;
+public:
+    static constexpr uint32_t kGapMs = 250;   // same bound as ocarina_voice.h kBeatStaleMs
+    void Arm(uint32_t player) { player_ = player; }
+    bool Broken(uint32_t player, uint32_t now_ms, uint32_t beat_ms) const {
+        return player != player_ || now_ms - beat_ms > kGapMs;
+    }
+};
+
 // One ocarina frame on either handler path (review I4). native=true: a native event, door or
 // cutscene owns the player this frame (dispatch observe). The Host's pending work (FreezeEnd
 // retry, freeze Poll, unmount retry) runs first, then the session ticks with no input and the
